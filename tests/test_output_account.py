@@ -1,0 +1,195 @@
+"""OutputAccountAdapter with fakes, no network (plan Task D)."""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace as NS
+
+import discord
+import pytest
+
+from relay.adapter.output_account import AccountMismatch, OutputAccountAdapter
+from relay.supervisor.outputs_model import OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved
+
+USER, GUILD, CHAN = 7, 1, 2
+
+
+class FakeOut:
+    negotiated_video_codec = "H264"
+
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+        self.connected = True
+
+    def is_connected(self) -> bool:
+        return self.connected
+
+    def play(self, source) -> None:
+        self.calls.append(("play", source))
+
+    def stop(self) -> None:
+        self.calls.append("out.stop")
+
+    async def disconnect(self, force=False) -> None:
+        self.calls.append("out.disconnect")
+
+
+class FakeVc:
+    session_id = "sess"
+
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+
+    def is_connected(self) -> bool:
+        return True
+
+    async def create_stream(self, **kw):
+        self.calls.append(("create_stream", kw))
+        return FakeOut(self.calls)
+
+    async def disconnect(self, force=False) -> None:
+        self.calls.append("vc.disconnect")
+
+
+class FakeChannel:
+    def __init__(self, calls: list) -> None:
+        self.calls = calls
+
+    async def connect(self, **kw):
+        self.calls.append(("connect", kw))
+        return FakeVc(self.calls)
+
+
+class FakeClient:
+    def __init__(self, calls: list, uid: int = USER, login_error: Exception | None = None) -> None:
+        self.calls = calls
+        self.user = NS(id=uid)
+        self.login_error = login_error
+        self.ready = asyncio.Event()
+
+    async def start(self, token: str) -> None:
+        if self.login_error:
+            raise self.login_error
+        self.ready.set()
+        await asyncio.Event().wait()
+
+    async def wait_until_ready(self) -> None:
+        await self.ready.wait()
+
+    def get_guild(self, gid: int):
+        return NS(get_channel=lambda cid: FakeChannel(self.calls))
+
+    async def close(self) -> None:
+        self.calls.append("client.close")
+
+
+def make(**client_kw):
+    calls: list = []
+    events: list = []
+    a = OutputAccountAdapter(
+        USER, GUILD, CHAN, events.append, lambda *a, **k: None,
+        decodable={"H264"}, client_factory=lambda: FakeClient(calls, **client_kw),
+    )
+    return a, calls, events
+
+
+def test_login_failure_emits_auth_rejected() -> None:
+    async def go():
+        a, calls, events = make(login_error=discord.LoginFailure("bad"))
+        await a.start("tok")
+        assert events == [OutAuthRejected(USER)]
+        assert "client.close" in calls
+
+    asyncio.run(go())
+
+
+def test_wrong_account_is_rejected() -> None:
+    async def go():
+        a, calls, events = make(uid=99)
+        with pytest.raises(AccountMismatch):
+            await a.start("tok")
+        assert events == []
+
+    asyncio.run(go())
+
+
+def test_publish_and_end_order() -> None:
+    async def go():
+        a, calls, events = make()
+        await a.start("tok")
+        codec = await a.publish(5, 30, "SRC")
+        assert codec == "H264"
+        assert events == [OutJoined(USER, 5, "sess"), OutReady(USER, 5, "H264")]
+        connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
+        assert connect["self_mute"] is True and connect["reconnect"] is False and connect["timeout"] == 15
+        cs = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "create_stream")
+        assert cs["reconnect"] is False and cs["timeout"] == 15
+        assert ("play", "SRC") in calls
+        calls.clear()
+        await a.end()
+        assert calls == ["out.stop", "out.disconnect", "vc.disconnect"]
+        calls.clear()
+        await a.end()  # idempotent
+        assert calls == []
+        await a.close()
+        assert "client.close" in calls
+
+    asyncio.run(go())
+
+
+def test_voice_observed_before_super() -> None:
+    order: list = []
+
+    class Base:
+        async def on_voice_state_update(self, data) -> None:
+            order.append("super")
+
+    events: list = []
+
+    def emit(e) -> None:
+        order.append("emit")
+        events.append(e)
+
+    a = OutputAccountAdapter(USER, GUILD, CHAN, emit, lambda *a, **k: None, decodable={"H264"})
+    cls = a._make_parent_cls(Base)
+
+    async def go():
+        await cls().on_voice_state_update({"session_id": "s", "channel_id": "2"})
+        await cls().on_voice_state_update({"session_id": "s", "channel_id": None})
+
+    asyncio.run(go())
+    assert order == ["emit", "super", "emit", "super"]
+    assert events == [OutVoiceObserved(USER, "s", 2), OutVoiceObserved(USER, "s", None)]
+
+
+def test_dropped_stream_emits_out_health(monkeypatch) -> None:
+    monkeypatch.setattr("relay.adapter.output_account.HEALTH_POLL_S", 0.01)
+
+    async def go():
+        a, calls, events = make()
+        await a.start("tok")
+        await a.publish(5, 30, "SRC")
+        await asyncio.sleep(0.05)
+        assert OutHealth(USER, 5, False) not in events
+        a._out.connected = False
+        await asyncio.sleep(0.05)
+        assert events.count(OutHealth(USER, 5, False)) == 1
+        await a.end()
+
+    asyncio.run(go())
+
+
+def test_end_stops_health_watch(monkeypatch) -> None:
+    monkeypatch.setattr("relay.adapter.output_account.HEALTH_POLL_S", 0.01)
+
+    async def go():
+        a, calls, events = make()
+        await a.start("tok")
+        await a.publish(5, 30, "SRC")
+        out = a._out
+        await a.end()
+        out.connected = False
+        await asyncio.sleep(0.05)
+        assert not any(isinstance(e, OutHealth) for e in events)
+
+    asyncio.run(go())

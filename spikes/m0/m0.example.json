@@ -1,0 +1,10 @@
+{
+  "guild_id": "GUILD_ID",
+  "target_user_id": "TARGET_USER_ID",
+  "voice_channel_id": "VOICE_CHANNEL_ID",
+  "expected_relay_user_id": "RELAY_USER_ID",
+  "token_file": "../../secrets/relay.token",
+  "output_accounts": [
+    {"user_id": "EXTRA_RELAY_USER_ID", "token_file": "../../secrets/relay2.token"}
+  ]
+}

@@ -1,0 +1,64 @@
+# Example only: IDs below are dummy numeric strings; replace with real snowflakes.
+schema_version: 1
+
+discord:
+  expected_relay_user_id: "100000000000000001"
+  guild_id: "100000000000000002"
+  target_user_id: "100000000000000003"
+  allowed_voice_channel_id: "100000000000000004"
+  ingest_credential: relay-token   # credential name of the account that watches the target
+  ingest_publishes: true           # the ingest account also publishes its own Go Live
+  output_accounts: []              # extra publish-only accounts, at most 9, e.g.:
+  #  - {user_id: "100000000000000005", credential: relay-token-2}
+
+authorization:
+  agreement_ref: "local-agreement-record"
+  excluded_viewer_ids: []
+
+codecs:
+  parent_codecs: auto_decode
+  watch_codecs: auto_decode
+  output_codec: H264
+  output_rids: 1
+  video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
+  hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
+
+quality:
+  mode: auto                 # auto | fixed
+  max_width: 1920            # max_* only used in auto; 1080p60 validated live (G2b, 2026-11-01)
+  max_height: 1080
+  max_fps: 60
+  fixed_width: 1920          # fixed_* only used in fixed
+  fixed_height: 1080
+  fixed_fps: 60
+  video_bitrate_kbps: 8000   # 20000 caused Discord error 2003 on a shared uplink (G2b)
+  audio_bitrate_kbps: 128
+  approved_profile_manifest: "manifests/verified-profiles.json"
+
+audio:
+  enabled: true
+  source: target_stream_only
+
+runtime:
+  start_debounce_ms: 500
+  idle_voice_grace_seconds: 30
+  hold_recovery_timeout_seconds: 15
+  connect_timeout_seconds: 15
+  first_media_timeout_seconds: 10
+  retry_delays_seconds: [1, 2, 4, 8, 15]
+  retry_cooldown_seconds: 60
+  keyframe_interval_seconds: 2
+  feedback_idr_min_interval_ms: 500
+  repeated_rejection_limit: 3
+  recording_enabled: false
+
+liveness:
+  source_dead_timeout_seconds: null   # must be the value measured in M0 before enabling
+  verified_capability_manifest: "manifests/verified-capabilities.json"
+
+storage:
+  state_directory: "/var/lib/discord-relay"
+
+logging:
+  level: INFO
+  include_media: false

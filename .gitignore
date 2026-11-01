@@ -1,0 +1,27 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Editors
+.idea/
+.vscode/
+
+# Secrets and local configuration (never commit)
+secrets/
+*.token
+.env
+config.yaml
+spikes/m0/m0.json
+manifests/verified-profiles.json
+
+# Runtime output
+state/
+spikes/m0/out/
+
+# Private design documents
+docs/

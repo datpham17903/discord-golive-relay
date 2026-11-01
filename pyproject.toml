@@ -1,0 +1,28 @@
+[project]
+name = "discord-golive-relay"
+version = "0.1.0"
+description = "Relay one consenting user's Discord Go Live to one or more relay accounts: watch once, encode once, publish many times"
+readme = "README.md"
+requires-python = ">=3.10"
+# discord.py-self is pinned by git commit and discord-native-voice is installed
+# with --no-deps; see manifests/build-manifest.json and manifests/requirements.lock.txt.
+dependencies = [
+    "av==19.0.2",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+relayctl = "relay.control.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["relay*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
