@@ -21,6 +21,9 @@ _ACCOUNT_KEYS = {"fatal_latch", "quarantine_incarnation", "consecutive_rejection
 _QUARANTINE_KEYS = {"owner_id", "stream_key", "incarnation", "since"}
 
 
+# Windows refuses os.replace while another handle has the file open.
+_RETRY_REPLACE = sys.platform == "win32"
+
 class StateCorrupt(Exception):
     """state.json exists but is unreadable or has an unknown shape; never auto-reset."""
 
@@ -150,7 +153,7 @@ class StateStore:
                 os.replace(tmp, self._path)
                 return
             except PermissionError:
-                if sys.platform != "win32" or attempt == 49:
+                if not _RETRY_REPLACE or attempt == 49:
                     raise
                 time.sleep(0.01)
 

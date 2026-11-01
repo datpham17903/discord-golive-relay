@@ -202,7 +202,7 @@ def test_replace_retries_on_windows_permission_error(tmp_path: Path, monkeypatch
             raise PermissionError("held open")
         real(src, dst)
 
-    monkeypatch.setattr("relay.control.state.sys.platform", "win32")
+    monkeypatch.setattr("relay.control.state._RETRY_REPLACE", True)
     monkeypatch.setattr("relay.control.state.os.replace", flaky)
     store = StateStore(tmp_path)
     assert store.update(lambda s: replace(s, desired_enabled=True)).revision == 1
