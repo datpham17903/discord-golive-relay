@@ -978,7 +978,7 @@
         "RESUME replay ordering (no gateway drop occurred)",
         "stop/start with stream key reuse while in voice"
       ],
-      "log": "spikes/m0/out/g1-20261101-192829.jsonl"
+      "log": "scripts/m0/out/g1-20261101-192829.jsonl"
     },
     "G2a": {
       "date": "2026-11-01",
@@ -997,7 +997,7 @@
         "viewer join latency",
         "DAVE epoch change with viewers joining/leaving (G4)"
       ],
-      "log": "spikes/m0/out/g2a-20261101-*.jsonl"
+      "log": "scripts/m0/out/g2a-20261101-*.jsonl"
     },
     "G2b": {
       "date": "2026-11-01",
@@ -1019,7 +1019,7 @@
         "A/V sync with flash/beep",
         "slow-viewer (1.5 Mbps) behaviour"
       ],
-      "logs": "spikes/m0/out/g2b-console*.txt"
+      "logs": "scripts/m0/out/g2b-console*.txt"
     },
     "G2c": {
       "date": "2026-11-01",
@@ -1036,7 +1036,7 @@
         "per-account kick/move -> quarantine live",
         "50+ viewers"
       ],
-      "logs": "spikes/m0/out/g2c-console*.txt"
+      "logs": "scripts/m0/out/g2c-console*.txt"
     }
   }
 }

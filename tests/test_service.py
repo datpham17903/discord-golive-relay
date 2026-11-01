@@ -10,15 +10,15 @@ from pathlib import Path
 
 import pytest
 
-from relay.config import load_config
-from relay.control.state import StateStore
-from relay.media.h264 import is_idr
-from relay.media.slate import build_slate
-from relay.service import Service
-from relay.supervisor.model import (
+from golive_relay.config import load_config
+from golive_relay.control.state import StateStore
+from golive_relay.media.h264 import is_idr
+from golive_relay.media.slate import build_slate
+from golive_relay.service import Service
+from golive_relay.supervisor.model import (
     GatewaySnapshot, OpenGate, RelayState, SetRejections, SourceProgress, SourceStream, TargetVoice,
 )
-from relay.worker.messages import Configure, EgressVideo, SetOutput, WorkerEvent
+from golive_relay.worker.messages import Configure, EgressVideo, SetOutput, WorkerEvent
 
 ROOT = Path(__file__).resolve().parent.parent
 CANVAS = (64, 64)
@@ -268,7 +268,7 @@ class FakeOutAdapter:
         self.calls.append("start")
 
     async def publish(self, g, fps, source):
-        from relay.supervisor.outputs_model import OutJoined, OutReady
+        from golive_relay.supervisor.outputs_model import OutJoined, OutReady
 
         self.calls.append("publish")
         self.events(OutJoined(self.acct.user_id, g, "out-sess"))
@@ -283,7 +283,7 @@ class FakeOutAdapter:
 
 
 def test_output_account_fans_out_and_stops_with_gate_closed(tmp_path, slate, source_gop):
-    from relay.supervisor.outputs_model import OutputAccount
+    from golive_relay.supervisor.outputs_model import OutputAccount
 
     env = Env(tmp_path, slate, source_gop)
     uid = 424242
@@ -324,7 +324,7 @@ def test_output_account_fans_out_and_stops_with_gate_closed(tmp_path, slate, sou
 
 
 def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None):
-    from relay.supervisor.outputs_model import OutputAccount
+    from golive_relay.supervisor.outputs_model import OutputAccount
 
     env = Env(tmp_path, slate, source_gop)
     if state:
@@ -371,8 +371,8 @@ def test_output_login_is_retried_after_transient_failure(tmp_path, slate, source
 
 
 def test_reset_fatal_account_zeroes_rejections_and_reports_unlatched(tmp_path, slate, source_gop, monkeypatch):
-    monkeypatch.setattr("relay.service._is_operator", lambda uid: True)
-    from relay.control.state import account_view, set_account
+    monkeypatch.setattr("golive_relay.service._is_operator", lambda uid: True)
+    from golive_relay.control.state import account_view, set_account
 
     uid = 424242
     latch = {"reason": "RELAY_REJECTED_BY_SERVER", "detail": "", "at": 0.0}
@@ -389,7 +389,7 @@ def test_reset_fatal_account_zeroes_rejections_and_reports_unlatched(tmp_path, s
 
 
 def test_output_account_mismatch_is_not_retried_and_ingest_keeps_relaying(tmp_path, slate, source_gop):
-    from relay.adapter.output_account import AccountMismatch
+    from golive_relay.adapter.output_account import AccountMismatch
 
     uid = 424242
     outs: list[FakeOutAdapter] = []

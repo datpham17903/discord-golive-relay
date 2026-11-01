@@ -4,8 +4,8 @@ import sys
 
 import pytest
 
-from relay.control.server import ControlServer
-from relay.obs import JsonLogger, Metrics, write_status
+from golive_relay.control.server import ControlServer
+from golive_relay.obs import JsonLogger, Metrics, write_status
 
 
 def test_logger_redacts_secrets_everywhere():
@@ -51,7 +51,7 @@ def test_control_server_roundtrip(tmp_path):
     import os
     import stat
 
-    from relay.control.cli import send_request
+    from golive_relay.control.cli import send_request
 
     async def go():
         sock = tmp_path / "c.sock"

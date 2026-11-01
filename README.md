@@ -99,7 +99,7 @@ Store each token as a one-line text file (name = credential name):
 | --- | --- |
 | `secrets/relay-token` | `relayctl run`, ingest account (`discord.ingest_credential`) |
 | `secrets/relay-token-2`, ... | `relayctl run`, output accounts (`credential` in `output_accounts`) |
-| `secrets/relay.token`, `secrets/relay2.token` | M0 spikes (paths set in `spikes/m0/m0.json`) |
+| `secrets/relay.token`, `secrets/relay2.token` | M0 spikes (paths set in `scripts/m0/m0.json`) |
 
 On Linux restrict them: `chmod 600 secrets/*`. The relay never reads tokens from YAML or the command line.
 
@@ -199,15 +199,15 @@ The service only runs a quality profile that was verified live on that exact rel
 
 ## 6. First-time validation (M0 gates)
 
-Run these once, in order, before enabling the service. The spikes are standalone scripts that use a small JSON file, not the YAML config. Each run writes a log `spikes/m0/out/<gate>-<timestamp>.jsonl` (tokens are redacted). Stop any spike with Ctrl+C, or create the file `spikes/m0/out/STOP` (G1 uses `<its log name>.STOP`). If G2a or G2b fails, stop and fix the protocol problem first.
+Run these once, in order, before enabling the service. The spikes are standalone scripts that use a small JSON file, not the YAML config. Each run writes a log `scripts/m0/out/<gate>-<timestamp>.jsonl` (tokens are redacted). Stop any spike with Ctrl+C, or create the file `scripts/m0/out/STOP` (G1 uses `<its log name>.STOP`). If G2a or G2b fails, stop and fix the protocol problem first.
 
 Prepare once:
 
 ```bash
-cp spikes/m0/m0.example.json spikes/m0/m0.json    # Windows: Copy-Item
+cp scripts/m0/m0.example.json scripts/m0/m0.json    # Windows: Copy-Item
 ```
 
-Edit `spikes/m0/m0.json`: `guild_id`, `target_user_id`, `voice_channel_id`, `expected_relay_user_id`, `token_file` (relative to the JSON file) and, for G2c, `output_accounts` as `{"user_id", "token_file"}`. Remove the `output_accounts` entry if you do not test G2c. Put the tokens in `secrets/`.
+Edit `scripts/m0/m0.json`: `guild_id`, `target_user_id`, `voice_channel_id`, `expected_relay_user_id`, `token_file` (relative to the JSON file) and, for G2c, `output_accounts` as `{"user_id", "token_file"}`. Remove the `output_accounts` entry if you do not test G2c. Put the tokens in `secrets/`.
 
 All commands below run from the project folder.
 
@@ -215,14 +215,14 @@ All commands below run from the project folder.
 
 | Gate | Command | What you do in Discord | Success looks like (in the log or console) |
 | --- | --- | --- | --- |
-| G1 probe | `python spikes/m0/g1_probe.py --config spikes/m0/m0.json --minutes 10` | Relay account is online but not in voice. The target joins voice, starts and stops sharing, leaves. | `VOICE_STATE_UPDATE` events for the target, including `self_stream` changes. |
-| G2a | `python spikes/m0/g2a_watch_and_publish.py --config spikes/m0/m0.json --minutes 5` | The target joins the voice channel and starts sharing. A second person checks the channel. | Events `watch_connected` and `output_connected`; viewer sees a test pattern Go Live next to the target's; `session_end` is clean. |
-| G2b | `python spikes/m0/g2b_relay.py --config spikes/m0/m0.json --minutes 30` | The target shares real content (with sound) for the whole 30 minutes. A viewer opens the relay Go Live. | `output_playing`; viewer sees smooth video and sound; no `output_play_ended` with an error; 30 minutes without restart. |
-| G2c | `python spikes/m0/g2c_multi.py --config spikes/m0/m0.json --minutes 30` | Same as G2b, with `output_accounts` filled in. Open each relay Go Live. | `connected` and `playing` events for every account; viewers see all relay streams; only the ingest account is in the target's viewer list. |
+| G1 probe | `python scripts/m0/g1_probe.py --config scripts/m0/m0.json --minutes 10` | Relay account is online but not in voice. The target joins voice, starts and stops sharing, leaves. | `VOICE_STATE_UPDATE` events for the target, including `self_stream` changes. |
+| G2a | `python scripts/m0/g2a_watch_and_publish.py --config scripts/m0/m0.json --minutes 5` | The target joins the voice channel and starts sharing. A second person checks the channel. | Events `watch_connected` and `output_connected`; viewer sees a test pattern Go Live next to the target's; `session_end` is clean. |
+| G2b | `python scripts/m0/g2b_relay.py --config scripts/m0/m0.json --minutes 30` | The target shares real content (with sound) for the whole 30 minutes. A viewer opens the relay Go Live. | `output_playing`; viewer sees smooth video and sound; no `output_play_ended` with an error; 30 minutes without restart. |
+| G2c | `python scripts/m0/g2c_multi.py --config scripts/m0/m0.json --minutes 30` | Same as G2b, with `output_accounts` filled in. Open each relay Go Live. | `connected` and `playing` events for every account; viewers see all relay streams; only the ingest account is in the target's viewer list. |
 | T_dead | see below | Target shares a static screen for 10 minutes (no movement). | the tool prints a recommended value. |
 | G4 | Run G2b or G2c again (same commands) | While it runs, let viewers join and leave the relay Go Live several times. | Stream stays up; DAVE state in `stats` events does not report errors; no decode errors. |
 
-Useful spike options (all optional): `--max-width`, `--max-height`, `--fps`, `--video-kbps` (default 8000), `--encoder` (`auto`, `x264`, `amf`, `h264_nvenc`, ...; default `x264` in G2b, `auto` in G2c), `--hw-decode`, `--audio-kbps`, `--pacing` (`cfr` or `source`, default `source`), `--jitter-ms`, `--jitter-max-ms` (default 600), `--source-dead-seconds`. G2a also takes `--width --height --fps` of its test pattern. Run `python spikes/m0/g2b_relay.py --help` for the full list.
+Useful spike options (all optional): `--max-width`, `--max-height`, `--fps`, `--video-kbps` (default 8000), `--encoder` (`auto`, `x264`, `amf`, `h264_nvenc`, ...; default `x264` in G2b, `auto` in G2c), `--hw-decode`, `--audio-kbps`, `--pacing` (`cfr` or `source`, default `source`), `--jitter-ms`, `--jitter-max-ms` (default 600), `--source-dead-seconds`. G2a also takes `--width --height --fps` of its test pattern. Run `python scripts/m0/g2b_relay.py --help` for the full list.
 
 ### T_dead calibration
 
@@ -230,14 +230,14 @@ Useful spike options (all optional): `--max-width`, `--max-height`, `--fps`, `--
 2. Dry run (prints the recommended value, writes nothing):
 
    ```bash
-   python tools/calibrate_tdead.py spikes/m0/out/g2c-*.jsonl
+   python scripts/calibrate_tdead.py scripts/m0/out/g2c-*.jsonl
    ```
 
-   On Windows PowerShell, pass the files explicitly, for example `python tools/calibrate_tdead.py (Get-ChildItem spikes/m0/out/g2c-*.jsonl)`.
+   On Windows PowerShell, pass the files explicitly, for example `python scripts/calibrate_tdead.py (Get-ChildItem scripts/m0/out/g2c-*.jsonl)`.
 3. Write the value into the capability manifest and your config:
 
    ```bash
-   python tools/calibrate_tdead.py spikes/m0/out/g2c-*.jsonl --write --config config.yaml
+   python scripts/calibrate_tdead.py scripts/m0/out/g2c-*.jsonl --write --config config.yaml
    ```
 
    The tool refuses with less than 10 minutes of watched source (`--min-minutes`, or `--force`). The formula is `max(3.0, round_up(2 x observed_max_gap + 1.0, 0.5))`. By default `--write` updates `manifests/verified-capabilities.json` in the project folder; use `--manifest PATH` for another copy.
@@ -363,8 +363,8 @@ Decoding: `hw_decode: none` (software) is the default. On the owner's integrated
 Benchmark encoders with synthetic frames (nothing is written to disk):
 
 ```bash
-python tools/bench_encode.py --seconds 10
-python tools/bench_encode.py --profile motion      # profiles: saver, default, detail, motion
+python scripts/bench_encode.py --seconds 10
+python scripts/bench_encode.py --profile motion      # profiles: saver, default, detail, motion
 ```
 
 It prints p50/p95 encode time, CPU time and memory growth per profile.
@@ -432,7 +432,7 @@ From `live_results` in `manifests/verified-capabilities.json` (all on the owner'
 
 ```
 config.example.yaml       example config (copy to config.yaml)
-relay/                    the service
+src/golive_relay/         the service (installed package)
   config.py               config loader and validator
   service.py              wires everything together (relayctl run)
   adapter/                Discord access (watching, publishing, output accounts)
@@ -440,16 +440,17 @@ relay/                    the service
   media/                  decode, encode (hwaccel.py), publisher, slate
   supervisor/             state machine, liveness, ownership, retry, outputs
   worker/                 media worker process (process.py, messages.py, canvas, timeline, IPC)
-spikes/m0/                live gate scripts (G1, G2a, G2b, G2c), helpers (common.py, session.py,
-                          relay_worker.py; `python spikes/m0/relay_worker.py --selftest`), m0.example.json, out/ logs
-tools/                    bench_encode.py, calibrate_tdead.py
+scripts/                  bench_encode.py, calibrate_tdead.py
+scripts/m0/               live gate scripts (G1, G2a, G2b, G2c), helpers (common.py, session.py,
+                          relay_worker.py; `python scripts/m0/relay_worker.py --selftest`), m0.example.json, out/ logs
 manifests/                requirements.lock.txt, build-manifest.json (exact versions),
                           verified-capabilities.json (live results, T_dead),
                           verified-profiles.json (+ .example.json)
 deploy/systemd/           discord-relay.service
-tests/                    pytest suite
+tests/                    pytest suite, mirrors the package (tests/<area>/test_*.py)
 .github/workflows/        CI: test suite on Linux
 secrets/                  token files (gitignored)
+LICENSE                   MIT
 ```
 
 Run the tests (no Discord needed):
@@ -457,3 +458,7 @@ Run the tests (no Discord needed):
 ```bash
 python -m pytest -q
 ```
+
+## License
+
+MIT. See [LICENSE](LICENSE).

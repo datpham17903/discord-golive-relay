@@ -1,4 +1,4 @@
-"""Tests for relay.config."""
+"""Tests for golive_relay.config."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-from relay.config import ConfigInvalid, check_operable, load_config
-from relay.worker.messages import OutputProfile
+from golive_relay.config import ConfigInvalid, check_operable, load_config
+from golive_relay.worker.messages import OutputProfile
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "config.example.yaml"
 
@@ -84,8 +84,8 @@ def test_encoder_and_hw_decode_keys(tmp_path):
 
 
 def test_hw_decode_typo_rejected_and_devices_match_hwaccel(tmp_path):
-    from relay.config import HW_DECODE_DEVICES
-    from relay.media import hwaccel
+    from golive_relay.config import HW_DECODE_DEVICES
+    from golive_relay.media import hwaccel
 
     assert set(HW_DECODE_DEVICES) == {"none", *(d for ds in hwaccel.HW_DEVICE_ORDER.values() for d in ds)}
     raw = _raw()
