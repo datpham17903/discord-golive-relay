@@ -59,9 +59,10 @@ def output_codecs() -> list[VoiceCodec]:
     ]
 
 
-def output_stream_client(fps: int) -> type[nv.StreamClient]:
+def output_stream_client(fps: int, debug_stats: bool = False) -> type[nv.StreamClient]:
     """Output StreamClient: H264 + Opus, one screen RID."""
     return nv.StreamClient.with_config(
         codecs=output_codecs(),
         video_streams=[VoiceStream.screen(rid="100", quality=100, max_framerate=fps)],
+        enable_debug_stats=debug_stats,
     )

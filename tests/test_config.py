@@ -272,3 +272,22 @@ def test_nine_output_accounts_allowed(tmp_path):
 def test_bad_ingest_options_rejected(tmp_path):
     errs = _errors(tmp_path, _with_outputs([], ingest_credential="a/b", ingest_publishes="yes"))
     assert any("ingest_credential" in e for e in errs) and any("ingest_publishes" in e for e in errs)
+
+
+def test_network_stats_default_false_and_true(tmp_path):
+    raw = _raw()
+    assert _load(tmp_path, raw).logging.network_stats is False
+    raw["logging"]["network_stats"] = True
+    assert _load(tmp_path, raw).logging.network_stats is True
+    raw["logging"]["network_stats"] = "yes"
+    assert any("network_stats" in e for e in _errors(tmp_path, raw))
+
+
+def test_video_mode_default_and_parse(tmp_path):
+    raw = _raw()
+    raw["codecs"].pop("video_mode", None)
+    assert _load(tmp_path, raw).output_profile().video_mode == "transcode"
+    raw["codecs"]["video_mode"] = "passthrough"
+    assert _load(tmp_path, raw).output_profile().video_mode == "passthrough"
+    raw["codecs"]["video_mode"] = "auto"
+    assert any("codecs.video_mode" in e for e in _errors(tmp_path, raw))

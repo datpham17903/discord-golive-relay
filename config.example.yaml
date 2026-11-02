@@ -22,6 +22,7 @@ codecs:
   output_rids: 1
   video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
   hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
+  video_mode: transcode      # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
 
 quality:
   mode: auto                 # auto | fixed
@@ -62,3 +63,4 @@ storage:
 logging:
   level: INFO
   include_media: false
+  network_stats: false   # opt-in: expose packet loss / NACK / RTX counters in status

@@ -133,6 +133,7 @@ relayctl validate --config config.yaml
 | `codecs.output_rids` | Output layers | `1` | never (only 1 supported) |
 | `codecs.video_encoder` | `auto`, `libx264`, `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf`, `h264_videotoolbox` (`h264_vaapi` is accepted but not usable) | `auto` | force a specific encoder (section 9) |
 | `codecs.hw_decode` | `none`, `auto`, `d3d11va`, `cuda`, `vaapi`, `videotoolbox` | `none` | see section 9 |
+| `codecs.video_mode` | `transcode`, `passthrough` | `transcode` | `passthrough` forwards the target's H.264 access units without decoding or re-encoding: near-zero CPU and lower latency, but the target's bitrate is sent as-is (can trigger Discord error 2003 if too high), keyframes come from PLI requests to the target, and non-H.264 or oversized sources fall back to transcode |
 | `quality.mode` | `auto` (use `max_*`) or `fixed` (use `fixed_*`) | `auto` | you need exact size/fps |
 | `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 1920 x 1080 @ 60 | lower for weak CPU or network |
 | `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | only with `fixed` |
@@ -157,6 +158,7 @@ relayctl validate --config config.yaml
 | `storage.state_directory` | Where `state.json`, `status.json` and the control socket live | `/var/lib/discord-relay` | always on Windows (for example `state`) |
 | `logging.level` | `DEBUG` `INFO` `WARNING` `ERROR` `CRITICAL` | `INFO` | debugging |
 | `logging.include_media` | Log media content | `false` | never (must be `false`) |
+| `logging.network_stats` | Expose packet loss / NACK / RTX counters in `status` | `false` | diagnosing stutter |
 
 Relative manifest paths are looked up next to the config file.
 

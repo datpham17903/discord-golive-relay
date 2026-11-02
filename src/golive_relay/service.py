@@ -712,6 +712,11 @@ class Service:
         d["accounts"] = [
             {**row, **self._out_pubs[row["account"]].take_window()} for row in self.pool.status(time.monotonic())
         ]
+        if self.cfg.logging.network_stats:
+            d["network"] = self._adapter.network_stats() if self._adapter is not None else {}
+            for row in d["accounts"]:
+                a = self._out_adapters.get(row["account"])
+                row["network"] = a.network_stats() if a is not None else {}
         return d
 
     def _write_status(self) -> None:
@@ -772,10 +777,11 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
     d = cfg.discord
     with InstanceLocks([d.expected_relay_user_id, *(a.user_id for a in accounts)]):
         svc = Service(
-            cfg, store, lambda events, ingress, lg: DiscordAdapter(cfg, events, ingress, lg),
+            cfg, store, lambda events, ingress, lg: DiscordAdapter(cfg, events, ingress, lg, network_stats=cfg.logging.network_stats),
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
-                acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg),
+                acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
+                network_stats=cfg.logging.network_stats),
             output_tokens=out_tokens,
         )
         return await svc.run(token)
