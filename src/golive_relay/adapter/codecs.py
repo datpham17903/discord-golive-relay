@@ -34,6 +34,12 @@ def probe_decoders() -> set[str]:
     return found
 
 
+def advertised(decodable: set[str], mode: str) -> set[str]:
+    """Video codecs to offer for decode. ``h264_only`` makes the voice server pick H.264 for the
+    target's stream (it chooses a codec every participant can decode), which keeps passthrough on."""
+    return decodable & {"H264"} if mode == "h264_only" else decodable
+
+
 def parent_codecs(decodable: set[str]) -> list[VoiceCodec]:
     """Codec list for the parent VoiceClient: Opus plus every decodable video codec."""
     out = [VoiceCodec.opus(payload_type=_OPUS_PT)]

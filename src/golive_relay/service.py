@@ -781,7 +781,7 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
-                network_stats=cfg.logging.network_stats),
+                network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs),
             output_tokens=out_tokens,
         )
         return await svc.run(token)

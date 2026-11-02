@@ -80,10 +80,13 @@ class DiscordAdapter:
         self.log = log
         self._paused_verified = paused_verified
         decodable = codecs.probe_decoders() if decodable is None else decodable
-        self._parent_cls = self._make_parent_cls(decodable)
+        modes = getattr(cfg, "codecs", None)
+        self._parent_cls = self._make_parent_cls(
+            codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
         self._watch_cls = nv.StreamClient.with_config(
-            codecs=codecs.watch_codecs(decodable), enable_debug_stats=network_stats
+            codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
+            enable_debug_stats=network_stats,
         )
         self._client: _Client | None = None
         self._connect_task: asyncio.Task[Any] | None = None

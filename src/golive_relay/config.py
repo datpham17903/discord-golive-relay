@@ -350,8 +350,8 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
 
     r = _Reader("codecs", top._get("codecs"), errors)
     codecs = CodecsConfig(
-        r.str_("parent_codecs", ("auto_decode",)),
-        r.str_("watch_codecs", ("auto_decode",)),
+        r.str_("parent_codecs", ("auto_decode", "h264_only")),
+        r.str_("watch_codecs", ("auto_decode", "h264_only")),
         r.str_("output_codec", ("H264",)),
         r.int_("output_rids"),
         r.opt_str("video_encoder", VIDEO_ENCODERS),

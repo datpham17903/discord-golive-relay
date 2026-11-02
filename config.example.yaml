@@ -16,13 +16,13 @@ authorization:
   excluded_viewer_ids: []
 
 codecs:
-  parent_codecs: auto_decode
-  watch_codecs: auto_decode
+  parent_codecs: h264_only   # auto_decode | h264_only; h264_only makes Discord pick H.264 for the target's stream
+  watch_codecs: h264_only    # (it chooses a codec every participant decodes) so passthrough always applies
   output_codec: H264
   output_rids: 1
   video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
   hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
-  video_mode: transcode      # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
+  video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
 
 quality:
   mode: auto                 # auto | fixed

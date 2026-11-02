@@ -207,3 +207,13 @@ def test_output_stream_client_passes_debug_stats() -> None:
 
     assert codecs.output_stream_client(30, True).enable_debug_stats is True
     assert codecs.output_stream_client(30).enable_debug_stats is False
+
+
+def test_h264_only_offers_only_h264_for_decode() -> None:
+    from golive_relay.adapter import codecs
+
+    all_codecs = {"AV1", "H265", "H264", "VP8"}
+    assert codecs.advertised(all_codecs, "h264_only") == {"H264"}
+    assert codecs.advertised(all_codecs, "auto_decode") == all_codecs
+    names = [c.name for c in codecs.watch_codecs(codecs.advertised(all_codecs, "h264_only"))]
+    assert names == ["opus", "H264"]

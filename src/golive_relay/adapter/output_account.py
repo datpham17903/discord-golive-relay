@@ -39,6 +39,7 @@ class OutputAccountAdapter:
         decodable: set[str] | None = None,
         client_factory: Callable[[], Any] | None = None,
         network_stats: bool = False,
+        codec_mode: str = "auto_decode",
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
@@ -47,7 +48,7 @@ class OutputAccountAdapter:
         self.log = log
         decodable = codecs.probe_decoders() if decodable is None else decodable
         self._parent_cls = self._make_parent_cls(
-            nv.VoiceClient.with_config(codecs=codecs.parent_codecs(decodable))
+            nv.VoiceClient.with_config(codecs=codecs.parent_codecs(codecs.advertised(decodable, codec_mode)))
         )
         self._client_factory = client_factory or discord.Client
         self._network_stats = network_stats

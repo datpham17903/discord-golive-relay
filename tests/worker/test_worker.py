@@ -773,11 +773,14 @@ def test_passthrough_jbuf_overflow_clears_and_requests_keyframe(aus240):
     assert not w.need_key and len(w.jbuf) == 1
 
 
-def test_passthrough_egress_full_clears_and_requests_keyframe(aus240):
+def test_passthrough_egress_full_waits_without_dropping(aus240):
     w, egress, events = make_worker(PT, egress=Sink({"video": 1}))
-    feed(w, aus240[:5], time.monotonic())
+    now = feed(w, aus240[:5], time.monotonic())
     assert len(egress.video()) == 1 and egress.video()[0].is_idr
-    assert w.need_key and not w.jbuf and events.events("need_keyframe")
+    assert not w.need_key and len(w.jbuf) == 4 and not events.events("need_keyframe")
+    egress.capacity = {}  # the main process polled
+    drain(w, now)
+    assert len(egress.video()) == 5 and not w.need_key
 
 
 def test_passthrough_requests_keyframe_when_no_idr_for_interval(aus240):

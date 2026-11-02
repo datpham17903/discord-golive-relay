@@ -332,10 +332,6 @@ class Worker:
             if not key:
                 self._pt_resync()
                 return True
-        if self.egress.full("video"):
-            self.stats["backpressure_skips"] += 1
-            self._pt_resync()
-            return True
         if _h264_is_idr(data):
             data = ensure_low_delay_vui(data)
         self.jbuf.append((self._present_at(rtp_s, m.mono_received), data, m.mono_received, rtp_s))
@@ -506,26 +502,24 @@ class Worker:
     def _pt_tick(self, now: float) -> None:
         """Forward the oldest due access unit as received; any loss is repaired by a new source IDR."""
         assert self.profile is not None
-        if self.jbuf and self.jbuf[0][0] <= now:
+        # A full egress only means the main process has not polled yet: the AU waits in jbuf
+        # (dropping it would freeze viewers until the next source IDR, ~0.7 s live).
+        if self.jbuf and self.jbuf[0][0] <= now and not self.egress.full("video"):
             _, au, rcv, rtp_s = self.jbuf.popleft()
-            if self.egress.full("video"):
-                self.stats["backpressure_skips"] += 1
-                self._pt_resync()
+            idr = _h264_is_idr(au)
+            item = EgressVideo(self.generation, self.epoch, au, idr, self._frame_time_ms(rtp_s), now, rcv, False)
+            if self.egress.put_nowait(item, "video", len(au)):
+                self.stats["frames_out"] += 1
+                self.stats["passthrough_frames"] += 1
+                self.stats["idr"] += idr
+                if idr:
+                    self.last_pt_idr = now
             else:
-                idr = _h264_is_idr(au)
-                item = EgressVideo(self.generation, self.epoch, au, idr, self._frame_time_ms(rtp_s), now, rcv, False)
-                if self.egress.put_nowait(item, "video", len(au)):
-                    self.stats["frames_out"] += 1
-                    self.stats["passthrough_frames"] += 1
-                    self.stats["idr"] += idr
-                    if idr:
-                        self.last_pt_idr = now
-                else:
-                    self.stats["egress_dropped"] += 1
-                    self._pt_resync()
-                    if now - self.last_overflow_event >= OVERFLOW_EVENT_INTERVAL_S:
-                        self.last_overflow_event = now
-                        self._event("overflow", channel="egress_video")
+                self.stats["egress_dropped"] += 1
+                self._pt_resync()
+                if now - self.last_overflow_event >= OVERFLOW_EVENT_INTERVAL_S:
+                    self.last_overflow_event = now
+                    self._event("overflow", channel="egress_video")
         if now - self.last_pt_idr >= self.profile.keyframe_interval_s * IDR_INTERVAL_MARGIN:
             self._emit_need_keyframe()
 

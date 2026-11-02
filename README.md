@@ -128,12 +128,12 @@ relayctl validate --config config.yaml
 | `discord.output_accounts` | Extra publish-only accounts, max 9 (list of `{user_id, credential}`) | `[]` | you want more relay Go Lives |
 | `authorization.agreement_ref` | Note pointing to the consent record | placeholder | always |
 | `authorization.excluded_viewer_ids` | Viewer IDs the target asked to exclude | `[]` | the target asks |
-| `codecs.parent_codecs`, `watch_codecs` | Codec negotiation mode | `auto_decode` | never (only value) |
+| `codecs.parent_codecs`, `watch_codecs` | Video codecs the relay offers to decode. `h264_only` makes Discord send the target's stream as H.264 for every viewer of it (it picks a codec all participants decode), so passthrough always applies; `auto_decode` offers every codec PyAV decodes | `h264_only` | rarely |
 | `codecs.output_codec` | Output codec | `H264` | never (only value) |
 | `codecs.output_rids` | Output layers | `1` | never (only 1 supported) |
 | `codecs.video_encoder` | `auto`, `libx264`, `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf`, `h264_videotoolbox` (`h264_vaapi` is accepted but not usable) | `auto` | force a specific encoder (section 9) |
 | `codecs.hw_decode` | `none`, `auto`, `d3d11va`, `cuda`, `vaapi`, `videotoolbox` | `none` | see section 9 |
-| `codecs.video_mode` | `transcode`, `passthrough` | `transcode` | `passthrough` forwards the target's H.264 access units without decoding or re-encoding: near-zero CPU and lower latency, but the target's bitrate is sent as-is (can trigger Discord error 2003 if too high), keyframes come from PLI requests to the target, and non-H.264 or oversized sources fall back to transcode |
+| `codecs.video_mode` | `passthrough` forwards the target's H.264 as-is (near-zero CPU, lower latency; the target's bitrate is sent unchanged and keyframes come from PLI requests to the target); `transcode` decodes and re-encodes at `video_bitrate_kbps`. Non-H.264 or oversized sources always fall back to transcode | `passthrough` | use `transcode` if relay viewers hit Discord error 2003 (target bitrate too high for your uplink) |
 | `quality.mode` | `auto` (use `max_*`) or `fixed` (use `fixed_*`) | `auto` | you need exact size/fps |
 | `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 1920 x 1080 @ 60 | lower for weak CPU or network |
 | `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | only with `fixed` |

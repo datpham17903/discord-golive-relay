@@ -291,3 +291,12 @@ def test_video_mode_default_and_parse(tmp_path):
     assert _load(tmp_path, raw).output_profile().video_mode == "passthrough"
     raw["codecs"]["video_mode"] = "auto"
     assert any("codecs.video_mode" in e for e in _errors(tmp_path, raw))
+
+
+def test_codec_modes_accept_h264_only(tmp_path):
+    raw = _raw()
+    raw["codecs"]["parent_codecs"] = raw["codecs"]["watch_codecs"] = "h264_only"
+    cfg = _load(tmp_path, raw)
+    assert (cfg.codecs.parent_codecs, cfg.codecs.watch_codecs) == ("h264_only", "h264_only")
+    raw["codecs"]["watch_codecs"] = "av1_only"
+    assert any("codecs.watch_codecs" in e for e in _errors(tmp_path, raw))
