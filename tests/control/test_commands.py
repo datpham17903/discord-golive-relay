@@ -180,7 +180,7 @@ def test_display_names_neutralise_markdown_and_format_chars():
     s = format_status(old, c, "X", {})
     for bad in ("[", "]", "(https", "\u202e", "@", "<@"):
         assert bad not in s
-    assert "xhttps://evil.example (555)" in s
+    assert "://" not in s and "<@" not in s
     assert "abc (21)" in s and "everyone (22)" in s and "1 (23)" in s
     out = describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)
     assert "đổi target** thành 999." in out  # nothing left of the name: ID only

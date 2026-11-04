@@ -94,7 +94,7 @@ class RoutingContext:
     user_name: Callable[[int], str | None] = field(default=lambda _: None)
 
 
-_NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\")
+_NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
 
 
 def _user(ctx: RoutingContext, uid: int) -> str:
