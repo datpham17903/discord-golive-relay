@@ -650,6 +650,48 @@ def test_audio_deadline_follows_video_jitter_buffer():
     assert first_deadline(0.4) - first_deadline(0.0) == pytest.approx(0.4, abs=1e-6)
 
 
+@pytest.mark.parametrize("sender_offset", [1.0, -0.5, 5.0])
+def test_audio_timed_by_arrival_not_sender_clock(sender_offset):
+    # Live: the sender's clock (RTCP / abs-send-time) was seconds off local arrival, so every
+    # deadline fell outside the publisher's play window and the relayed audio was silent.
+    from golive_relay.media.publisher import Publisher
+
+    w, egress, _ = make_worker()
+    w.jitter_s = 0.2
+    t0 = 1000.0
+    produced_at = []  # arrival time of the packet that produced each block
+    for i, p in enumerate(gen_opus(40)):
+        now = t0 + i * 0.02
+        w.handle(IngressAudio(1, 0, 7, i * 960, None, now, now + sender_offset, p), now)
+        produced_at += [now] * (len(egress.audio()) - len(produced_at))
+    audio = egress.audio()
+    assert len(audio) >= 30
+    for k, a in enumerate(audio):
+        assert 0.0 <= a.deadline - (t0 + k * 0.02) <= w.jitter_s + 0.1
+    clock = [t0]
+    pub = Publisher(lambda g, e, t: True, clock=lambda: clock[0])
+    pub.set_source(1, 0)
+    audible, i = 0, 0
+    for k in range(150):
+        clock[0] = t0 + k * 0.02
+        while i < len(audio) and produced_at[i] <= clock[0]:  # offered as they are produced
+            pub.offer_audio(audio[i])
+            i += 1
+        audible += pub.next_audio() != bytes(AUDIO_FRAME_BYTES)
+    assert audible >= len(audio) - 2
+
+
+def test_audio_does_not_disturb_video_jitter_state():
+    w, egress, _ = make_worker()
+    t0 = 1000.0
+    for i, p in enumerate(gen_opus(40)):
+        now = t0 + i * 0.02 + (0.3 if i % 5 == 0 else 0.0)  # bursty, late audio arrivals
+        w.handle(IngressAudio(1, 0, 7, i * 960, None, now, None, p), now)
+    assert egress.audio() and w.audio_offsets.get(7)  # audio went through its own timing state
+    assert w.jitter_s == 0.0
+    assert not w.offsets and not w.lateness
+
+
 def test_need_keyframe_repeats_at_most_once_per_second(aus640, monkeypatch):
     from golive_relay.worker import process
 

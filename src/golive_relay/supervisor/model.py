@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from .routing import Routing
+
 
 class GatewayState(Enum):
     FRESH = "fresh"
@@ -68,6 +70,7 @@ class StopReason(Enum):
     CONNECT_FAILED = "connect_failed"
     CONFIG_INVALID = "config_invalid"
     SHUTDOWN = "shutdown"
+    ROUTING_CHANGED = "routing_changed"
 
 
 class Liveness(Enum):
@@ -151,6 +154,25 @@ class Tick:
 @dataclass(frozen=True, slots=True)
 class EnableChanged:
     enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingChanged:
+    routing: Routing
+
+
+@dataclass(frozen=True, slots=True)
+class PrejoinChanged:
+    """Runtime override of runtime.prejoin_voice (chat ``prejoin on|off``)."""
+
+    on: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrejoinFailed:
+    """The JoinVoice join failed: the relay is not in voice."""
+
+    detail: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +266,7 @@ class ConnectFailed:
     reason: StopReason
     retryable: bool
     detail: str = ""
+    watch_retry: bool = False  # joined, but the watch failed (e.g. stream_full): retry the watch fast
 
 
 @dataclass(frozen=True, slots=True)
@@ -307,7 +330,7 @@ Event = (
     Tick | EnableChanged | ResetFatal | GatewayChanged | GatewaySnapshot | TargetVoiceChanged | StreamStarted
     | StreamUpdated | StreamEnded | ParticipantsChanged | RelayVoiceObserved | Joined | Watching | FirstFrame
     | OutputReady | ConnectFailed | InboundHealth | OutputHealth | SourceProgress | FreshFrame | WorkerFailed
-    | CodecChanged | AuthRejected | ConfigInvalid | Shutdown
+    | CodecChanged | AuthRejected | ConfigInvalid | Shutdown | RoutingChanged | PrejoinChanged | PrejoinFailed
 )
 
 
@@ -383,6 +406,11 @@ class LeaveVoice:
 
 
 @dataclass(frozen=True, slots=True)
+class JoinVoice:
+    """Pre-join (runtime.prejoin_voice): join the main channel before the target streams."""
+
+
+@dataclass(frozen=True, slots=True)
 class SetFatalLatch:
     reason: FatalReason
     detail: str = ""
@@ -408,9 +436,16 @@ class Exit:
     code: int
 
 
+@dataclass(frozen=True, slots=True)
+class ApplyRouting:
+    """Emitted before the restart's StartConnect: the service points the adapter at the new routing."""
+
+    routing: Routing
+
+
 Action = (
     CloseGate | OpenGate | ShowSlate | StartConnect | CreateOutput | RebuildPipeline | RequestInputKeyframe
-    | Teardown | LeaveVoice | SetFatalLatch | ClearFatalLatch | SetQuarantine | SetRejections | Exit
+    | Teardown | LeaveVoice | JoinVoice | SetFatalLatch | ClearFatalLatch | SetQuarantine | SetRejections | Exit | ApplyRouting
 )
 
 

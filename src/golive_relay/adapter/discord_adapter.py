@@ -10,6 +10,7 @@ stream; ``resumed`` -> FRESH is therefore emitted after every earlier event
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, Callable
 
@@ -17,6 +18,8 @@ import discord
 from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
+from golive_relay.config import ControlConfig
+from golive_relay.control.commands import ChatCommand
 from golive_relay.supervisor.model import (
     AuthRejected,
     ConfigInvalid,
@@ -38,6 +41,7 @@ from golive_relay.worker.messages import IngressAudio, IngressVideo
 
 PROGRESS_MIN_INTERVAL_S = 0.25  # 4 per second
 CONNECT_TIMEOUT_S = 15
+OPUS_SILENCE = b"\xf8\xff\xfe"  # the frame a sender emits while muted / silent
 
 
 class _Client(discord.Client):
@@ -66,6 +70,7 @@ class DiscordAdapter:
         paused_verified: bool = False,
         decodable: set[str] | None = None,
         network_stats: bool = False,
+        audio_bitrate_kbps: int = 64,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -75,6 +80,8 @@ class DiscordAdapter:
         self.target_id = int(d.target_user_id)
         self.channel_id = int(d.allowed_voice_channel_id)
         self.relay_id = int(d.expected_relay_user_id)
+        self._relay_ids = {self.relay_id, *(a.user_id for a in getattr(d, "output_accounts", ()))}
+        self._control: ControlConfig = getattr(cfg, "control", None) or ControlConfig()
         self._events = events
         self._ingress = ingress
         self.log = log
@@ -84,6 +91,7 @@ class DiscordAdapter:
         self._parent_cls = self._make_parent_cls(
             codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
+        self._audio_bitrate_kbps = audio_bitrate_kbps
         self._watch_cls = nv.StreamClient.with_config(
             codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
@@ -92,6 +100,7 @@ class DiscordAdapter:
         self._connect_task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._vc: Any = None
+        self._voice_state_cb: Callable[[], None] | None = None
         self._sc: Any = None
         self._out: Any = None
         self._incarnation = 0
@@ -102,6 +111,8 @@ class DiscordAdapter:
         self._video_ssrc: int | None = None
         self._last_seq: dict[int, int | None] = {}
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
+        self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
+        self._audio_window = {"packets": 0, "silence": 0}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -165,6 +176,30 @@ class DiscordAdapter:
             self._on_stream_delete(args[0])
         elif event == "voice_state_update":
             self._on_voice_state(*args)
+        elif event == "message":
+            self._on_message(args[0])
+
+    def _on_message(self, msg: Any) -> None:
+        """Operator messages in the configured guild (and command channel) only; the rest is ignored silently."""
+        c = self._control
+        if not c.chat_commands or msg.guild is None or msg.guild.id != self.guild_id:
+            return
+        author = msg.author.id
+        if author in self._relay_ids:
+            return
+        member = msg.author
+        if not hasattr(member, "_roles") and not hasattr(member, "roles"):
+            member = msg.guild.get_member(author)
+        # Raw ids: Member.roles drops ids missing from the guild role cache.
+        raw = getattr(member, "_roles", None)
+        if raw is None:
+            raw = [r.id for r in getattr(member, "roles", ())]
+        role_ids = frozenset(raw)
+        if not c.is_operator(author, role_ids):
+            return
+        if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
+            return
+        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id
@@ -301,6 +336,31 @@ class DiscordAdapter:
             self._incarnation += 1
         self._stream = self._to_source(live)
 
+    # ------------------------------------------------------------------- chat
+
+    async def reply(self, channel_id: int, message_id: int, text: str) -> None:
+        """Reply without pinging anyone: no author mention, no parsed mentions in ``text``."""
+        channel = self._client.get_channel(channel_id) if self._client else None
+        if channel is None:
+            raise RuntimeError("command channel not in cache")
+        await channel.get_partial_message(message_id).reply(
+            text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+    def voice_channel_ids(self) -> frozenset[int]:
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        if guild is None:
+            return frozenset()
+        return frozenset(c.id for c in guild.channels if isinstance(c, discord.VoiceChannel))
+
+    def display_name(self, uid: int) -> str | None:
+        """Guild display name, else global name, from cache; None when unknown."""
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        member = guild.get_member(uid) if guild else None
+        if member is not None:
+            return member.display_name
+        user = self._client.get_user(uid) if self._client else None
+        return (user.global_name or user.name) if user is not None else None
+
     # ------------------------------------------------------------------ voice
 
     def _make_parent_cls(self, decodable: set[str]) -> type:
@@ -313,18 +373,39 @@ class DiscordAdapter:
                 cid = data.get("channel_id")
                 adapter._emit(RelayVoiceObserved(data.get("session_id"), int(cid) if cid is not None else None))
                 await super().on_voice_state_update(data)
+                adapter._own_voice_state(self, data)
 
         return RelayParentVoiceClient
 
-    async def join(self) -> str | None:
-        """Connect the parent voice client; returns its voice session id."""
+    async def join(self, on_voice_state: Callable[[], None] | None = None) -> str | None:
+        """Connect the parent voice client; returns its voice session id.
+
+        ``on_voice_state`` is called once the gateway echoes our voice state for the channel, before the voice
+        media session connects. From then on ``watch`` may run: the library only needs the voice client to be
+        registered for the channel and to know its session id when STREAM_CREATE arrives."""
         channel = self._guild_channel()
         if channel is None:
             raise RuntimeError("allowed voice channel not available")
-        self._vc = await channel.connect(
-            cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
-        )
+        self._voice_state_cb = on_voice_state
+        try:
+            self._vc = await channel.connect(
+                cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
+            )
+        except BaseException:
+            self._vc = None  # the voice-state echo may already have set it
+            raise
+        finally:
+            self._voice_state_cb = None
         return self._vc.session_id
+
+    def _own_voice_state(self, vc: Any, data: Any) -> None:
+        """The parent client applied our VOICE_STATE_UPDATE: hand it out early when a join is waiting for it."""
+        cb, cid = self._voice_state_cb, data.get("channel_id")
+        if cb is None or cid is None or int(cid) != self.channel_id or not data.get("session_id"):
+            return
+        self._voice_state_cb = None
+        self._vc = vc
+        cb()
 
     async def watch(self, generation: int, epoch: int, stream: SourceStream) -> None:
         """Watch exactly ``stream`` (key and incarnation must match the tracked one)."""
@@ -353,7 +434,13 @@ class DiscordAdapter:
         return self._out.negotiated_video_codec
 
     def play(self, source: Any) -> None:
-        self._out.play(source)
+        self._out.play(source, bitrate=self._audio_bitrate_kbps)
+
+    def take_audio_window(self) -> dict[str, int]:
+        """Target audio packets received since the last call, and how many were Opus silence frames."""
+        with self._audio_lock:
+            w, self._audio_window = self._audio_window, {"packets": 0, "silence": 0}
+        return w
 
     def network_stats(self) -> dict[str, dict[str, int]]:
         """Loss/NACK/RTX counters of the watch and own-output clients (empty when disabled or absent)."""
@@ -419,6 +506,9 @@ class DiscordAdapter:
                 self._loop.call_soon_threadsafe(self._request_video, pkt.ssrc)
         else:
             msg = IngressAudio(generation, epoch, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload))
+            with self._audio_lock:
+                self._audio_window["packets"] += 1
+                self._audio_window["silence"] += msg.data == OPUS_SILENCE
         self._ingress(msg)
         fresh = pkt.sequence is None or self._last_seq.get(pkt.ssrc) != pkt.sequence
         self._last_seq[pkt.ssrc] = pkt.sequence

@@ -10,20 +10,22 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 
 from .liveness import LivenessTracker
 from .model import (
-    Action, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
+    Action, ApplyRouting, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
     DURABLE_FATAL, EnableChanged, Event, Exit, FatalReason, FirstFrame, FreshFrame, GateFacts, GatewayChanged,
-    GatewaySnapshot, GatewayState, HoldReason, InboundHealth, Joined, LeaveVoice, Liveness, OpenGate, OutputHealth,
-    OutputReady, ParticipantsChanged, QuarantineRecord, RebuildPipeline, RelayState, RelayVoiceObserved,
-    RequestInputKeyframe, ResetFatal, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
+    GatewaySnapshot, GatewayState, HoldReason, InboundHealth, Joined, JoinVoice, LeaveVoice, Liveness, OpenGate, OutputHealth,
+    OutputReady, ParticipantsChanged, PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline, RelayState,
+    RelayVoiceObserved, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, SourceStream, StartConnect, StatusSnapshot, StopReason, StreamEnded, StreamStarted,
     StreamUpdated, TargetVoice, TargetVoiceChanged, Teardown, Tick, Watching, WorkerFailed,
 )
 from .ownership import OwnershipDetector, OwnershipVerdict
 from .predicate import evaluate_gate
+from .routing import Routing
 from .retry import RetryPolicy
 
 _SESSION = frozenset({RelayState.CONNECTING, RelayState.RELAYING, RelayState.HOLD})
@@ -31,11 +33,14 @@ _SESSION = frozenset({RelayState.CONNECTING, RelayState.RELAYING, RelayState.HOL
 _PREFLIGHT_IGNORED = frozenset(
     {"decodable_frame", "incarnation", "relay_channel", "ownership", "liveness", "rtc_ready", "generation_epoch"}
 )
+# Pre-join needs everything a start needs except a stream to watch.
+_PREJOIN_IGNORED = _PREFLIGHT_IGNORED | {"target_streaming", "stream_available", "not_paused"}
 _BACKOFF_REASONS = frozenset(
     {StopReason.HOLD_EXPIRED, StopReason.OUTPUT_DEAD, StopReason.CODEC_MISMATCH, StopReason.CONNECT_FAILED}
 )
 _NORMAL_END = frozenset({StopReason.SOURCE_STOPPED, StopReason.SOURCE_LEFT_WHITELIST})
 _KEYFRAME_ORDER = ("pli", "rewatch")
+_FAST_WATCH_LEAVE_AFTER = 3  # consecutive fast watch retries before the parent voice client is rebuilt
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +62,9 @@ class SupervisorConfig:
     paused_capability_verified: bool = False
     keyframe_methods: tuple[str, ...] = ("pli", "rewatch")
     keyframe_step_seconds: float = 3.0  # wait per recovery step before trying the next one
+    prejoin_voice: bool = False
+    watch_retry_interval: float = 1.0  # watch failed while joined (slot race): retry this fast, jittered
+    watch_retry_cap: float = 300.0  # after this long of fast watch retries, normal backoff resumes
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,8 +76,12 @@ class PersistedStateView:
 
 
 class Supervisor:
-    def __init__(self, cfg: SupervisorConfig, persisted: PersistedStateView, rng: random.Random | None = None) -> None:
+    def __init__(
+        self, cfg: SupervisorConfig, persisted: PersistedStateView, rng: random.Random | None = None,
+        mirrors: Mapping[int, int] | None = None,
+    ) -> None:
         self.cfg = cfg
+        self._mirrors: Mapping[int, int] = dict(mirrors or {})
         self.desired_enabled = persisted.desired_enabled
         self.fatal = persisted.fatal_reason if persisted.fatal_reason in DURABLE_FATAL else None
         self.quarantine = persisted.quarantine
@@ -83,7 +95,13 @@ class Supervisor:
         self.epoch = 0
         self._liveness = LivenessTracker(cfg.t_dead)
         self._owner = OwnershipDetector()
-        self._retry = RetryPolicy(cfg.retry_delays, cfg.retry_cooldown, jitter=cfg.retry_jitter, rng=rng)
+        self._rng = rng or random.Random()
+        self._retry = RetryPolicy(cfg.retry_delays, cfg.retry_cooldown, jitter=cfg.retry_jitter, rng=self._rng)
+        self._watch_retry_since: float | None = None
+        self._fast_fails = 0
+        self._prejoin_retry = RetryPolicy(cfg.retry_delays, cfg.retry_cooldown, jitter=cfg.retry_jitter, rng=self._rng)
+        self._prejoin_after: float | None = None
+        self.gate_ready_at: float | None = None  # when the start gate passed for the last StartConnect
         self._in_voice = False
         self._leave_at: float | None = None
         self._debounce_since: float | None = None
@@ -93,6 +111,14 @@ class Supervisor:
         self.state = self._enable_state()
 
     # ------------------------------------------------------------ public
+
+    @property
+    def prejoin_voice(self) -> bool:
+        return self.cfg.prejoin_voice
+
+    @property
+    def routing(self) -> Routing:
+        return Routing(self.cfg.target_user_id, self.cfg.allowed_channel_id, self._mirrors)
 
     def handle(self, event: Event, now: float) -> list[Action]:
         acts: list[Action] = []
@@ -201,6 +227,7 @@ class Supervisor:
         self._cur_inc = self.stream.incarnation
         self._session_stream = self.stream
         self._connect_started = now
+        self.gate_ready_at = self._debounce_since if self._debounce_since is not None else now
         self._in_voice = True
         self._leave_at = None
         self._debounce_since = None
@@ -227,6 +254,21 @@ class Supervisor:
                         self.state = self._enable_state()
                 elif self.state not in (RelayState.DISABLED, RelayState.FATAL):
                     self._stop(StopReason.DISABLED, now, acts)
+            case RoutingChanged(routing=r):
+                self._apply_routing(r, now, acts)
+            case PrejoinChanged(on=on):
+                self.cfg = replace(self.cfg, prejoin_voice=on)
+                self._prejoin_after = None
+                self._prejoin_retry.reset()
+                if not on and self.state is RelayState.IDLE and self._in_voice and not self._source_ok(now):
+                    acts.append(LeaveVoice("prejoin_off"))
+                    self._in_voice = False
+                    self._leave_at = None
+            case PrejoinFailed():
+                if self.state not in _SESSION and self._in_voice:
+                    self._in_voice = False
+                    self._leave_at = None
+                    self._prejoin_after = now + self._prejoin_retry.next_delay()
             case ResetFatal():
                 if self.state is RelayState.FATAL and self.fatal in DURABLE_FATAL:
                     reset = self.fatal is FatalReason.RELAY_REJECTED_BY_SERVER
@@ -261,6 +303,8 @@ class Supervisor:
             case ParticipantsChanged(participants=p):
                 self.participants = p
             case RelayVoiceObserved() as e:
+                if self.state not in _SESSION and self._in_voice and e.channel_id == self.cfg.allowed_channel_id:
+                    self._prejoin_retry.reset()  # the pre-join landed
                 self._on_relay_voice(e, now, acts)
             case Joined() as e if self._cur(e):
                 self._owner.arm(e.voice_session_id)
@@ -287,7 +331,7 @@ class Supervisor:
                 if not self._codec_ok(e.negotiated_video_codec):
                     self._stop(StopReason.CODEC_MISMATCH, now, acts)
             case ConnectFailed() as e if self._cur(e):
-                self._stop(e.reason, now, acts, retryable=e.retryable, detail=e.detail)
+                self._stop(e.reason, now, acts, retryable=e.retryable, detail=e.detail, watch_retry=e.watch_retry)
             case InboundHealth() as e if self._cur(e):
                 self._inbound = e.ok
             case OutputHealth() as e if self._cur(e):
@@ -309,6 +353,27 @@ class Supervisor:
                 self._stop(StopReason.SHUTDOWN, now, acts)
             case _:
                 pass  # stale or irrelevant for the current state
+
+    def _apply_routing(self, r: Routing, now: float, acts: list[Action]) -> None:
+        """Not a rejection: no backoff, quarantine and fatal latch are left as they are."""
+        cfg = self.cfg
+        self._mirrors = dict(r.mirrors)
+        if (r.target_user_id, r.channel_id) == (cfg.target_user_id, cfg.allowed_channel_id):
+            acts.append(ApplyRouting(self.routing))
+            return
+        channel_changed = r.channel_id != cfg.allowed_channel_id
+        if self.state in _SESSION:
+            self._stop(StopReason.ROUTING_CHANGED, now, acts, keep_voice=not channel_changed)
+        elif channel_changed and self._in_voice:
+            acts.append(LeaveVoice(StopReason.ROUTING_CHANGED.value))
+            self._in_voice = False
+            self._leave_at = None
+        self.cfg = replace(cfg, target_user_id=r.target_user_id, allowed_channel_id=r.channel_id)
+        if self.state not in (RelayState.DISABLED, RelayState.FATAL):
+            self.state = self._enable_state()
+            self._debounce_since = None
+            self._backoff_until = None
+        acts.append(ApplyRouting(self.routing))
 
     def _mine(self, s: SourceStream | None) -> SourceStream | None:
         """Only the configured target's streams matter; anyone else's are ignored."""
@@ -382,11 +447,21 @@ class Supervisor:
     # -------------------------------------------------------------- stop
 
     def _stop(
-        self, reason: StopReason, now: float, acts: list[Action], retryable: bool = True, detail: str = ""
+        self, reason: StopReason, now: float, acts: list[Action], retryable: bool = True, detail: str = "",
+        keep_voice: bool = False, watch_retry: bool = False,
     ) -> None:
         in_session = self.state in _SESSION
         ss, media = self._session_stream, self._media_seen
-        keep_voice = reason is StopReason.SOURCE_STOPPED and self._in_voice
+        fast = reason is StopReason.CONNECT_FAILED and watch_retry and retryable and self._fast_watch_retry(now)
+        rebuild_voice = False
+        if fast:
+            self._fast_fails += 1
+            if self._fast_fails >= _FAST_WATCH_LEAVE_AFTER:
+                self._fast_fails = 0
+                rebuild_voice = True  # the parent voice client may be dead: the next attempt joins again
+        elif in_session:
+            self._fast_fails = 0
+        keep_voice = (reason is StopReason.SOURCE_STOPPED or keep_voice or (fast and not rebuild_voice)) and self._in_voice
         acts.append(CloseGate(reason.value))
         if in_session:
             acts.append(Teardown(self.generation, not keep_voice, reason))
@@ -420,11 +495,20 @@ class Supervisor:
         elif reason is StopReason.RELAY_DISPLACED and ss is not None:
             self._displaced(ss, acts)
         elif reason in _BACKOFF_REASONS:
-            delay = self._retry.next_delay() if retryable else self.cfg.retry_cooldown
+            if fast:  # not a rejection and no escalation: the next watch should win a freed slot quickly
+                j = self.cfg.retry_jitter
+                delay = self.cfg.watch_retry_interval * (1 + self._rng.uniform(-j, j))
+            else:
+                delay = self._retry.next_delay() if retryable else self.cfg.retry_cooldown
             self._backoff_until = now + delay
             self.state = RelayState.BACKOFF
         else:
             self.state = RelayState.IDLE
+
+    def _fast_watch_retry(self, now: float) -> bool:
+        if self._watch_retry_since is None:
+            self._watch_retry_since = now
+        return now - self._watch_retry_since < self.cfg.watch_retry_cap
 
     def _latch(self, reason: FatalReason, detail: str, acts: list[Action]) -> None:
         acts.append(SetFatalLatch(reason, detail))
@@ -491,15 +575,35 @@ class Supervisor:
                 self._start(now, acts)
             return
         self._debounce_since = None
+        self._watch_retry_since = None
+        self._fast_fails = 0
+        prejoin = self.cfg.prejoin_voice and self._prejoin_ok(now)
+        if not prejoin:
+            self._prejoin_after = None
+            self._prejoin_retry.reset()
         if not self._in_voice:
+            if prejoin and (self._prejoin_after is None or now >= self._prejoin_after):
+                self._prejoin_after = None
+                acts.append(JoinVoice())
+                self._in_voice = True
+                self._leave_at = None
             return
         t = self.target
         if t is None or t.channel_id != self.cfg.allowed_channel_id:
             acts.append(LeaveVoice("source_left_voice"))
             self._in_voice = False
+        elif prejoin:
+            self._leave_at = None  # stay ready for the next stream start
+        elif self._leave_at is None:  # e.g. pre-join turned off while a start was debouncing
+            self._leave_at = now + self.cfg.idle_grace
         elif self._leave_at is not None and now >= self._leave_at:
             acts.append(LeaveVoice("idle_grace"))
             self._in_voice = False
+
+    def _prejoin_ok(self, now: float) -> bool:
+        """Every join gate passes; only the stream itself is missing."""
+        failed = evaluate_gate(self._facts(now)).failed
+        return not (set(failed) - _PREJOIN_IGNORED)
 
     def _backoff(self, now: float, acts: list[Action]) -> None:
         if not self._source_ok(now):
@@ -514,7 +618,10 @@ class Supervisor:
         cfg = self.cfg
         if not (self._joined and self._watching):
             if now - self._connect_started >= cfg.connect_timeout:
-                self._stop(StopReason.CONNECT_FAILED, now, acts, detail="join timeout")
+                if self._joined:
+                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="watch timeout", watch_retry=True)
+                else:
+                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="join timeout")
                 return
         elif not self._has_frame and self._ready_at is not None and now - self._ready_at >= cfg.first_media_timeout:
             self._stop(StopReason.CONNECT_FAILED, now, acts, detail="no first media")
@@ -537,6 +644,8 @@ class Supervisor:
         self._hold_reason = None
         self._hold_deadline = None
         self._retry.reset()
+        self._watch_retry_since = None
+        self._fast_fails = 0
         acts.append(OpenGate(self.generation, self.epoch))
 
     def _relaying(self, now: float, acts: list[Action]) -> None:

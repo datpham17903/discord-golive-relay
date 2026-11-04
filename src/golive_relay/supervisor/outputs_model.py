@@ -80,6 +80,7 @@ class SessionEnded:
 class OutJoined:
     account: int
     generation: int
+    attempt: int
     voice_session_id: str | None
 
 
@@ -87,6 +88,7 @@ class OutJoined:
 class OutReady:
     account: int
     generation: int
+    attempt: int
     negotiated_video_codec: str | None
 
 
@@ -94,6 +96,7 @@ class OutReady:
 class OutFailed:
     account: int
     generation: int
+    attempt: int
     reason: StopReason
     retryable: bool
     detail: str = ""
@@ -103,6 +106,7 @@ class OutFailed:
 class OutHealth:
     account: int
     generation: int
+    attempt: int
     ok: bool
 
 
@@ -113,6 +117,15 @@ class OutVoiceObserved:
     account: int
     session_id: str | None
     channel_id: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class MirrorParticipants:
+    """Voice participants of the channel the account is assigned to, seen by the account's own client."""
+
+    account: int
+    participants: frozenset[int]
+    channel_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,7 +140,7 @@ class OutTick:
 
 PoolEvent = (
     SessionLive | SessionHold | SessionEnded | OutJoined | OutReady | OutFailed | OutHealth
-    | OutVoiceObserved | OutAuthRejected | OutTick
+    | OutVoiceObserved | MirrorParticipants | OutAuthRejected | OutTick
 )
 
 
@@ -136,10 +149,15 @@ PoolEvent = (
 
 @dataclass(frozen=True, slots=True)
 class OutStart:
-    """Join the allowed voice (self_mute), create_stream with the output codecs, play a MediaSource."""
+    """Join the allowed voice (self_mute), create_stream with the output codecs, play a MediaSource.
+
+    ``attempt`` is per account and comes back in OutJoined/OutReady/OutFailed/OutHealth, so events
+    of an earlier attempt still in flight in the same generation are ignored."""
 
     account: int
     generation: int
+    attempt: int
+    channel_id: int
 
 
 @dataclass(frozen=True, slots=True)

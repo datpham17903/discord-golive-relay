@@ -16,7 +16,7 @@ from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
 from golive_relay.supervisor.outputs_model import (
-    OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved, PoolEvent,
+    MirrorParticipants, OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved, PoolEvent,
 )
 
 CONNECT_TIMEOUT_S = 15
@@ -40,10 +40,13 @@ class OutputAccountAdapter:
         client_factory: Callable[[], Any] | None = None,
         network_stats: bool = False,
         codec_mode: str = "auto_decode",
+        excluded_viewer_ids: frozenset[int] = frozenset(),
+        audio_bitrate_kbps: int = 64,
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
         self.channel_id = channel_id
+        self._excluded = excluded_viewer_ids
         self._events = events
         self.log = log
         decodable = codecs.probe_decoders() if decodable is None else decodable
@@ -52,6 +55,7 @@ class OutputAccountAdapter:
         )
         self._client_factory = client_factory or discord.Client
         self._network_stats = network_stats
+        self._audio_bitrate_kbps = audio_bitrate_kbps
         self._client: Any = None
         self._gateway_task: asyncio.Task[Any] | None = None
         self._vc: Any = None
@@ -61,6 +65,7 @@ class OutputAccountAdapter:
     async def start(self, token: str) -> None:
         """Log in and wait for READY. ``LoginFailure`` -> OutAuthRejected (nothing is left running)."""
         self._client = self._client_factory()
+        self._client.on_voice_state_update = self._on_member_voice
         self._gateway_task = asyncio.create_task(self._client.start(token))
         ready = asyncio.create_task(self._client.wait_until_ready())
         try:
@@ -95,30 +100,46 @@ class OutputAccountAdapter:
 
         return OutputParentVoiceClient
 
-    async def publish(self, generation: int, fps: int, source: Any) -> str | None:
-        """Join, create the Go Live and play ``source``; returns the negotiated video codec."""
+    async def _on_member_voice(self, member: Any, before: Any, after: Any) -> None:
+        if self.channel_id in (getattr(before.channel, "id", None), getattr(after.channel, "id", None)):
+            self._emit_participants()
+
+    def _emit_participants(self) -> None:
+        guild = self._client.get_guild(self.guild_id)
+        channel = guild.get_channel(self.channel_id) if guild else None
+        if channel is not None:
+            self._events(MirrorParticipants(self.user_id, frozenset(channel.voice_states), self.channel_id))
+
+    async def publish(self, generation: int, attempt: int, fps: int, source: Any, channel_id: int) -> str | None:
+        """Join ``channel_id``, create the Go Live and play ``source``; returns the negotiated video codec."""
+        self.channel_id = channel_id
         guild = self._client.get_guild(self.guild_id)
         channel = guild.get_channel(self.channel_id) if guild else None
         if channel is None:
             raise RuntimeError("allowed voice channel not available")
+        if self._excluded & frozenset(channel.voice_states):
+            # same as the main channel's preflight: never join while an excluded viewer is present
+            self._emit_participants()
+            raise RuntimeError("excluded viewer in voice channel")
         self._vc = await channel.connect(
             cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
-        self._events(OutJoined(self.user_id, generation, self._vc.session_id))
+        self._events(OutJoined(self.user_id, generation, attempt, self._vc.session_id))
+        self._emit_participants()
         self._out = await self._vc.create_stream(
             cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
         codec = self._out.negotiated_video_codec
-        self._events(OutReady(self.user_id, generation, codec))
-        self._out.play(source)
-        self._health_task = asyncio.create_task(self._watch_health(generation, self._out, self._vc))
+        self._events(OutReady(self.user_id, generation, attempt, codec))
+        self._out.play(source, bitrate=self._audio_bitrate_kbps)
+        self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
         return codec
 
-    async def _watch_health(self, generation: int, out: Any, vc: Any) -> None:
+    async def _watch_health(self, generation: int, attempt: int, out: Any, vc: Any) -> None:
         """A dropped stream or voice connection without a voice-state change is reported once as unhealthy."""
         while out.is_connected() and vc.is_connected():
             await asyncio.sleep(HEALTH_POLL_S)
-        self._events(OutHealth(self.user_id, generation, False))
+        self._events(OutHealth(self.user_id, generation, attempt, False))
 
     def network_stats(self) -> dict[str, int]:
         """Loss/NACK/RTX counters of the output client (empty when disabled or absent)."""

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from golive_relay.supervisor.model import FatalReason, StopReason
 from golive_relay.supervisor.outputs_model import (
     AccountPersisted,
+    MirrorParticipants,
     OutAuthRejected,
     OutCloseGate,
     OutFailed,
@@ -39,6 +40,7 @@ from golive_relay.supervisor.outputs_model import (
 from golive_relay.supervisor.model import RelayVoiceObserved
 from golive_relay.supervisor.ownership import OwnershipDetector, OwnershipVerdict
 from golive_relay.supervisor.retry import RetryPolicy
+from golive_relay.supervisor.routing import Routing
 
 
 @dataclass(slots=True)
@@ -59,11 +61,13 @@ class _Acct:
     rejections: int = 0
     generation: int | None = None  # session generation this account is bound to
     incarnation: int | None = None
+    attempt: int = 0  # per-account OutStart counter; events carry it back
     backoff_until: float | None = None
     skip_generation: int | None = None  # non-retryable failure: wait for the next session
     counted_inc: int | None = None  # incarnation whose displacement was already counted
     streamed_inc: int | None = None
     queued: bool = False
+    blocked: bool = False  # an excluded viewer is in this mirror channel
     detector: OwnershipDetector = field(default_factory=OwnershipDetector)
 
 
@@ -76,11 +80,13 @@ class OutputPool:
         stagger_s: float = 2.0,
         retry: Callable[[], RetryPolicy],
         rejection_limit: int = 3,
-        allowed_channel_id: int,
+        routing: Routing,
+        excluded_viewer_ids: frozenset[int] = frozenset(),
     ) -> None:
         self._stagger = stagger_s
         self._limit = rejection_limit
-        self._allowed = allowed_channel_id
+        self._routing = routing
+        self._excluded = excluded_viewer_ids
         self._accts: dict[int, _Acct] = {}
         for a in accounts:
             p = persisted.get(a.user_id) or AccountPersisted(None, None, 0)
@@ -96,6 +102,32 @@ class OutputPool:
         self._next_start = float("-inf")
 
     # ------------------------------------------------------------ queries
+
+    def channel_of(self, uid: int) -> int:
+        for ch, acct in self._routing.mirrors.items():
+            if acct == uid:
+                return ch
+        return self._routing.channel_id
+
+    def _is_mirror(self, uid: int) -> bool:
+        return uid in self._routing.mirrors.values()
+
+    def set_routing(self, routing: Routing, now: float) -> list[PoolAction]:
+        """Restart only the accounts whose mirror assignment moved them; a main-channel change waits for the next session."""
+        out: list[PoolAction] = []
+        old_mirrored = set(self._routing.mirrors.values())
+        before = {uid: self.channel_of(uid) for uid in self._accts}
+        self._routing = routing
+        for uid, rec in self._accts.items():
+            if before[uid] == self.channel_of(uid) or not (uid in old_mirrored or self._is_mirror(uid)):
+                continue
+            rec.blocked = False
+            if self._active(rec):
+                self._stop(rec, "routing_changed", StopReason.ROUTING_CHANGED, out)
+            if self._restartable(rec):
+                self._enqueue(rec)
+        self._pump(now, out)
+        return out
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
         rec = self._accts.get(account)
@@ -135,13 +167,13 @@ class OutputPool:
         elif isinstance(event, SessionEnded):
             self._on_ended(event, out)
         elif isinstance(event, OutJoined):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and rec.state is OutputState.JOINING:
                 rec.detector.arm(event.voice_session_id)
         elif isinstance(event, OutReady):
             self._on_ready(event, now, out)
         elif isinstance(event, OutFailed):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and self._active(rec):
                 if event.retryable:
                     self._backoff(rec, event.reason, now, out)
@@ -149,11 +181,13 @@ class OutputPool:
                     rec.skip_generation = rec.generation
                     self._stop(rec, "failed", event.reason, out)
         elif isinstance(event, OutHealth):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and not event.ok and self._active(rec):
                 self._backoff(rec, StopReason.OUTPUT_DEAD, now, out)
         elif isinstance(event, OutVoiceObserved):
             self._on_voice(event, now, out)
+        elif isinstance(event, MirrorParticipants):
+            self._on_participants(event, out)
         elif isinstance(event, OutAuthRejected):
             rec = self._accts.get(event.account)
             if rec is not None:
@@ -171,9 +205,9 @@ class OutputPool:
     def _active(rec: _Acct) -> bool:
         return rec.state in (OutputState.JOINING, OutputState.READY, OutputState.LIVE)
 
-    def _current(self, account: int, generation: int) -> _Acct | None:
+    def _current(self, account: int, generation: int, attempt: int) -> _Acct | None:
         rec = self._accts.get(account)
-        if rec is None or rec.generation is None or rec.generation != generation:
+        if rec is None or rec.generation is None or rec.generation != generation or rec.attempt != attempt:
             return None
         return rec
 
@@ -194,6 +228,10 @@ class OutputPool:
         rec.fatal = reason
         rec.state = OutputState.FATAL
         out.append(OutSetFatal(rec.account.user_id, reason, detail))
+
+    def _restartable(self, rec: _Acct) -> bool:
+        s = self._session
+        return s is not None and rec.state is OutputState.OFF and rec.skip_generation != s.generation
 
     def _enqueue(self, rec: _Acct) -> None:
         if not rec.queued:
@@ -254,7 +292,7 @@ class OutputPool:
                         out.append(OutSetRejections(uid, 0))
 
     def _on_ready(self, ev: OutReady, now: float, out: list[PoolAction]) -> None:
-        rec = self._current(ev.account, ev.generation)
+        rec = self._current(ev.account, ev.generation, ev.attempt)
         if rec is None or rec.state is not OutputState.JOINING:
             return
         s = self._session
@@ -274,7 +312,7 @@ class OutputPool:
         rec = self._accts.get(ev.account)
         if rec is None or rec.state not in (OutputState.READY, OutputState.LIVE):
             return  # JOINING/STOPPING are exempt; other states hold no voice
-        verdict = rec.detector.classify(RelayVoiceObserved(ev.session_id, ev.channel_id), self._allowed, now)
+        verdict = rec.detector.classify(RelayVoiceObserved(ev.session_id, ev.channel_id), self.channel_of(ev.account), now)
         if verdict in (OwnershipVerdict.OK, OwnershipVerdict.IGNORED):
             return
         uid = rec.account.user_id
@@ -296,6 +334,20 @@ class OutputPool:
         else:  # MISSING_EVIDENCE: do not guess, stop sending and retry
             self._backoff(rec, StopReason.OWNERSHIP_LOST, now, out)
 
+    def _on_participants(self, ev: MirrorParticipants, out: list[PoolAction]) -> None:
+        rec = self._accts.get(ev.account)
+        if rec is None or not self._is_mirror(ev.account) or ev.channel_id != self.channel_of(ev.account):
+            return
+        blocked = bool(self._excluded & ev.participants)
+        if blocked == rec.blocked:
+            return
+        rec.blocked = blocked
+        if blocked:
+            if self._active(rec):
+                self._stop(rec, "excluded_viewer", StopReason.EXCLUDED_VIEWER, out)
+        elif self._restartable(rec):
+            self._enqueue(rec)
+
     def _pump(self, now: float, out: list[PoolAction]) -> None:
         s = self._session
         for rec in self._accts.values():
@@ -312,11 +364,12 @@ class OutputPool:
         while self._queue and now >= self._next_start:
             rec = self._accts[self._queue.pop(0)]
             rec.queued = False
-            if rec.state is not OutputState.OFF:
+            if rec.state is not OutputState.OFF or rec.blocked:
                 continue
             rec.state = OutputState.JOINING
             rec.generation = s.generation
             rec.incarnation = s.incarnation
             rec.detector.disarm()
-            out.append(OutStart(rec.account.user_id, s.generation))
+            rec.attempt += 1
+            out.append(OutStart(rec.account.user_id, s.generation, rec.attempt, self.channel_of(rec.account.user_id)))
             self._next_start = now + self._stagger

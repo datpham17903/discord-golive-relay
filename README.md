@@ -134,15 +134,15 @@ relayctl validate --config config.yaml
 | `codecs.video_encoder` | `auto`, `libx264`, `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf`, `h264_videotoolbox` (`h264_vaapi` is accepted but not usable) | `auto` | force a specific encoder (section 9) |
 | `codecs.hw_decode` | `none`, `auto`, `d3d11va`, `cuda`, `vaapi`, `videotoolbox` | `none` | see section 9 |
 | `codecs.video_mode` | `passthrough` forwards the target's H.264 as-is (near-zero CPU, lower latency; the target's bitrate is sent unchanged and keyframes come from PLI requests to the target); `transcode` decodes and re-encodes at `video_bitrate_kbps`. Non-H.264 or oversized sources always fall back to transcode | `passthrough` | use `transcode` if relay viewers hit Discord error 2003 (target bitrate too high for your uplink) |
-| `quality.mode` | `auto` (use `max_*`) or `fixed` (use `fixed_*`) | `auto` | you need exact size/fps |
+| `quality.mode` | `fixed` (always output `fixed_*`; a source of exactly that size is passed through, any other size is decoded and scaled to fit with black bars, which costs CPU and adds no detail) or `auto` (use `max_*`, never upscale) | `fixed` | use `auto` to keep the source size |
 | `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 1920 x 1080 @ 60 | lower for weak CPU or network |
-| `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | only with `fixed` |
+| `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | lower for weak CPU or network |
 | `quality.video_bitrate_kbps` | Encode bitrate per output | `8000` | lower if you see error 2003 (section 10) |
 | `quality.audio_bitrate_kbps` | Audio bitrate | `128` | rarely |
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
 | `audio.source` | Audio source | `target_stream_only` | never (only value) |
-| `runtime.start_debounce_ms` | Wait before reacting to a start | `500` | rarely |
+| `runtime.start_debounce_ms` | Wait before reacting to a start | `500` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
 | `runtime.idle_voice_grace_seconds` | Grace while the target is idle in voice | `30` | rarely |
 | `runtime.hold_recovery_timeout_seconds` | How long a HOLD (slate) may last | `15` | rarely |
 | `runtime.connect_timeout_seconds` | Voice connect timeout | `15` | slow networks |
@@ -153,12 +153,18 @@ relayctl validate --config config.yaml
 | `runtime.feedback_idr_min_interval_ms` | Min gap between keyframes forced by viewer feedback | `500` | rarely |
 | `runtime.repeated_rejection_limit` | Consecutive rejected sessions before FATAL | `3` | rarely |
 | `runtime.recording_enabled` | Recording | `false` | never (must be `false`) |
+| `runtime.prejoin_voice` | The ingest joins the main channel while the target is there, before it streams, so a stream start only needs the watch (all start gates still apply; it leaves when the target leaves, the relay is disabled or routing changes; a failed pre-join is retried after the normal retry delays). `!relay prejoin on|off` overrides it at runtime (stored in `state.json`). Without pre-join the ingest joins and watches back to back, like clicking a Go Live in the official client. Independently of this setting, a watch refused with `stream_full` or timed out while the target streams is retried about every second for up to 5 minutes, then normal backoff; every third such retry in a row leaves and re-joins voice. Other watch refusals use normal backoff | `false` | slot races on a busy stream |
 | `liveness.source_dead_timeout_seconds` | Seconds without source packets before the relay treats the source as dead (`T_dead`) | `null` | set by section 6 (the service refuses to run while `null`) |
 | `liveness.verified_capability_manifest` | Capability file with the measured value | `manifests/verified-capabilities.json` | different location |
 | `storage.state_directory` | Where `state.json`, `status.json` and the control socket live | `/var/lib/discord-relay` | always on Windows (for example `state`) |
 | `logging.level` | `DEBUG` `INFO` `WARNING` `ERROR` `CRITICAL` | `INFO` | debugging |
 | `logging.include_media` | Log media content | `false` | never (must be `false`) |
 | `logging.network_stats` | Expose packet loss / NACK / RTX counters in `status` | `false` | diagnosing stutter |
+| `control.chat_commands` | Accept `!relay ...` commands from guild chat (section 7, Chat commands). When `false` no message is read | `false` | you want to steer the relay from Discord |
+| `control.command_prefix` | First word of every command, no whitespace | `!relay` | it clashes with another bot |
+| `control.operator_user_ids` | User IDs (quoted strings) allowed to command; with `operator_role_ids`, at least one of the two must be non-empty when `chat_commands` is `true` | `[]` | when enabling chat commands, unless roles are set |
+| `control.operator_role_ids` | Role IDs (quoted strings); members holding any of these roles may command | `[]` | no |
+| `control.command_channel_id` | When set, commands are accepted only in this text channel | `null` | you want one command channel |
 
 Relative manifest paths are looked up next to the config file.
 
@@ -286,6 +292,27 @@ A fresh install is disabled. Run `relayctl enable` once. The service then relays
 
 Windows note: the control socket is a Unix socket. If it is unavailable, `enable`, `disable` and `reset-fatal` change `state.json` directly and `status` reads the files, so run them while the service is stopped or after it exited.
 
+### Chat commands
+
+With `control.chat_commands: true` the ingest account reads messages in the configured guild and answers commands typed there:
+
+| Command | What it does |
+| --- | --- |
+| `!relay` | Shows the command list |
+| `!relay status` | Session state, target, main channel, mirrors and their output accounts |
+| `!relay on` / `!relay off` | Same as `relayctl enable` / `disable` |
+| `!relay target <user_id>` | Relays another person. The current session stops and starts again when the new target shares in the main channel. A relay account (ingest or output) is refused |
+| `!relay channel <channel_id>` | Moves the main voice channel. The channel must be a voice channel of the guild and not a mirror |
+| `!relay mirror <channel_id>` | Publishes the same stream in another voice channel, using a free output account (the last free one in config order). Needs a free, non-FATAL, non-quarantined output account |
+| `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the output account returns to the main channel |
+| `!relay prejoin on` / `!relay prejoin off` | Turns pre-join (`runtime.prejoin_voice`) on or off. `on` joins the main channel as soon as the target is there; `off` leaves voice when the target is not streaming. Stored as `prejoin_voice` in `state.json` and kept across restarts; while nothing is stored the config value is used. `!relay status` shows it |
+
+Who may command: only users listed in `control.operator_user_ids` or members holding a role listed in `control.operator_role_ids`, and only in `control.command_channel_id` when it is set. Messages from anyone else, from other guilds or channels, and from the relay accounts themselves are ignored without a reply. Message text is never logged; the log records the command name, author ID, channel ID and outcome.
+
+Mentions: give every ID as plain decimal digits. A mention such as `<@123>` or `<#123>` is refused with a usage hint. Replies never ping anyone: they are sent with all mentions disabled and without mentioning the author, users are shown as display name plus ID (with `<`, `>`, `@`, backticks, `[`, `]`, `(`, `)`, `*`, `_`, `~`, `|`, `\`, `:` and Unicode format/control characters removed from names), and channels as `<#id>` links.
+
+Changes are written to `routing` in `state.json` and survive restarts; while no routing is stored the `discord.target_user_id` and `discord.allowed_voice_channel_id` from config are used. A routing edited in `state.json` while the service runs is applied within a second, without a chat reply. At start the stored routing is checked: a target that is a relay account, a mirror using an account that is not a configured output account, a mirror on the main channel, or one account in two mirrors stops the service with `state.json routing is invalid` (fix or remove the `routing` entry). An invalid routing written while the service runs is ignored, logged once as `state_routing_rejected` (`level: error`), shown as `routing_error` in `status.json` and as a ⚠️ line in `!relay status`; it will stop the service at the next start. A chat command that changes routing is refused with "state.json vừa thay đổi, thử lại lệnh" when `state.json` routing changed since the service last read it. `relayctl status` shows the current `routing` and the channel of each output account.
+
 ## 8. Deploying on a Linux VPS with systemd
 
 Sizing (measured on the owner's laptop and in the G2b/G2c runs):
@@ -376,6 +403,28 @@ It prints p50/p95 encode time, CPU time and memory growth per profile.
 ### Smoothness versus latency
 
 The relay buffers incoming video in an adaptive jitter buffer, up to 600 ms, because source packets arrive in bursts. Audio is delayed to follow the video. Expect about 0.3 to 0.6 s end-to-end latency in G2c, and 70 to 130 ms inside the pipeline. The 600 ms cap is not a config key in the service; the spikes accept `--jitter-ms` and `--jitter-max-ms` for experiments.
+
+### Start latency (`session_timing`)
+
+Each session logs one `session_timing` event, when the gate opens (`outcome: open`) or when the session ends before that (`outcome` is the stop reason). `*_ms` fields are milliseconds after the start (the `StartConnect`); `*_from_seen_ms` fields are milliseconds after `stream_seen`, the moment the target's stream was first seen.
+
+| Field | Meaning |
+| --- | --- |
+| `prejoined` | The ingest was already in voice when the session started |
+| `start_from_seen_ms` | `stream_seen` to start: debounce, plus any DISABLED or BACKOFF time |
+| `gate_ready_from_seen_ms` | `stream_seen` to `gate_ready`, the first time the start gate passed (target, channel, consent, quarantine, excluded viewers) |
+| `start_from_gate_ready_ms` | `gate_ready` to start: debounce only. A retry after BACKOFF counts from the end of the backoff, so DISABLED and BACKOFF time are not in it |
+| `voice_state_confirmed_ms` | The gateway echoed our voice state (only when not already in voice); the watch is requested right after it |
+| `watch_sent_ms` | The watch (gateway op 20) was requested |
+| `watching_ms` | The watch connection is up |
+| `voice_connected_ms` | The voice media session is connected (at the start when pre-joined) |
+| `worker_started_ms` | The worker process was spawned (in parallel with join and watch) |
+| `first_video_packet_ms`, `first_frame_ms` | First target video packet received; first frame decoded |
+| `slate_ready_ms`, `slate_ms`, `slate_cached` | Slate available; its build time; whether it came from the cache |
+| `output_created_ms`, `output_create_ms` | The ingest's own Go Live is created; how long that took |
+| `open_gate_ms` | The gate opened |
+
+The race for the 50 viewer slots is decided by `watch_sent_from_seen_ms`.
 
 ### Discord errors 2002 / 2003 (reduced quality / bandwidth)
 

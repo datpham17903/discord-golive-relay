@@ -63,7 +63,7 @@ def test_output_profile():
     cfg = load_config(EXAMPLE)
     prof = cfg.output_profile()
     assert isinstance(prof, OutputProfile)
-    assert (prof.mode, prof.max_width, prof.max_height, prof.fps) == ("auto", 1920, 1080, 60)
+    assert (prof.mode, prof.fixed_width, prof.fixed_height, prof.fps) == ("fixed", 1920, 1080, 60)
     assert prof.video_bitrate_kbps == 8000
     assert prof.keyframe_interval_s == 2
     assert prof.audio_enabled is True
@@ -300,3 +300,58 @@ def test_codec_modes_accept_h264_only(tmp_path):
     assert (cfg.codecs.parent_codecs, cfg.codecs.watch_codecs) == ("h264_only", "h264_only")
     raw["codecs"]["watch_codecs"] = "av1_only"
     assert any("codecs.watch_codecs" in e for e in _errors(tmp_path, raw))
+
+
+def test_control_config_defaults_when_absent_and_example():
+    cfg = load_config(EXAMPLE)
+    assert cfg.control.chat_commands is False and cfg.control.command_prefix == "!relay"
+    assert cfg.control.operator_user_ids == frozenset() and cfg.control.command_channel_id is None
+
+
+def test_control_config_requires_operators_when_enabled(tmp_path: Path):
+    raw = _raw()
+    raw["control"] = {"chat_commands": True, "operator_user_ids": []}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"chat_commands": True, "operator_user_ids": ["42"], "command_channel_id": "7", "command_prefix": "!r"}
+    c = _load(tmp_path, raw).control
+    assert c.operator_user_ids == frozenset({42}) and c.command_channel_id == 7 and c.command_prefix == "!r"
+    raw["control"] = {"chat_commands": True, "operator_role_ids": ["77"]}
+    c = _load(tmp_path, raw).control
+    assert c.operator_role_ids == frozenset({77}) and c.operator_user_ids == frozenset()
+    raw["control"] = {"chat_commands": True, "operator_user_ids": [], "operator_role_ids": []}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"operator_role_ids": ["x"]}
+    assert any("control.operator_role_ids" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"command_prefix": "! relay"}
+    assert any("control.command_prefix" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"bogus": 1}
+    assert any("control.bogus" in e for e in _errors(tmp_path, raw))
+
+
+def test_prejoin_voice_is_opt_in(tmp_path):
+    assert load_config(EXAMPLE).runtime.prejoin_voice is False
+    raw = _raw()
+    del raw["runtime"]["prejoin_voice"]
+    assert _load(tmp_path, raw).runtime.prejoin_voice is False
+    raw["runtime"]["prejoin_voice"] = True
+    assert _load(tmp_path, raw).runtime.prejoin_voice is True
+    raw["runtime"]["prejoin_voice"] = "yes"
+    assert any("prejoin_voice" in e for e in _errors(tmp_path, raw))
+
+
+def test_control_is_operator_by_user_role_or_neither() -> None:
+    from golive_relay.config import ControlConfig
+
+    c = ControlConfig(operator_user_ids=frozenset({1}), operator_role_ids=frozenset({10}))
+    assert c.is_operator(1, frozenset())
+    assert c.is_operator(2, frozenset({10, 11}))
+    assert not c.is_operator(2, frozenset({11}))
+
+
+def test_control_config_rejects_bad_command_channel_and_missing_operators(tmp_path: Path):
+    raw = _raw()
+    for bad in (7, "abc", "-7", "0", ["7"]):
+        raw["control"] = {"command_channel_id": bad}
+        assert any("control.command_channel_id" in e for e in _errors(tmp_path, raw)), bad
+    raw["control"] = {"chat_commands": True}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))

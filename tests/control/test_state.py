@@ -28,7 +28,7 @@ def test_update_increments_revision_and_persists(tmp_path: Path) -> None:
     assert st.revision == 2
     again = StateStore(tmp_path).load()
     assert again == st and again.desired_enabled is True
-    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 2
+    assert json.loads((tmp_path / "state.json").read_text())["schema_version"] == 3
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -139,11 +139,11 @@ def test_v1_file_reads_as_v2_keeps_ingest_fields_and_writes_v2(tmp_path: Path) -
     (tmp_path / "state.json").write_text(json.dumps(v1))
     store = StateStore(tmp_path)
     st = store.load()
-    assert st.accounts == {} and st.schema_version == 2
+    assert st.accounts == {} and st.schema_version == 3
     assert st.fatal_latch == v1["fatal_latch"] and st.quarantine == q and st.consecutive_rejections == 2
     st = store.update(lambda s: s)
     on_disk = json.loads((tmp_path / "state.json").read_text())
-    assert on_disk["schema_version"] == 2 and on_disk["accounts"] == {} and on_disk["quarantine"] == q
+    assert on_disk["schema_version"] == 3 and on_disk["accounts"] == {} and on_disk["quarantine"] == q
     assert on_disk["fatal_latch"] == v1["fatal_latch"] and st.revision == 6
 
 
@@ -207,3 +207,69 @@ def test_replace_retries_on_windows_permission_error(tmp_path: Path, monkeypatch
     store = StateStore(tmp_path)
     assert store.update(lambda s: replace(s, desired_enabled=True)).revision == 1
     assert len(calls) == 3
+
+
+def test_v2_state_reads_with_routing_none(tmp_path: Path) -> None:
+    v2 = {
+        "schema_version": 2, "revision": 3, "desired_enabled": True, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {},
+    }
+    (tmp_path / "state.json").write_text(json.dumps(v2))
+    st = StateStore(tmp_path).load()
+    assert st.routing is None and st.schema_version == 3 and st.revision == 3
+
+
+def test_routing_roundtrip_v3(tmp_path: Path) -> None:
+    from golive_relay.supervisor.routing import Routing
+
+    default = Routing(1, 2, {})
+    rt = Routing(10, 20, {30: 40, 31: 41})
+    store = StateStore(tmp_path)
+    store.update(lambda s: replace(s, routing=rt.to_persisted()))
+    st = StateStore(tmp_path).load()
+    assert st.routing == {"target_user_id": 10, "channel_id": 20, "mirrors": {"30": 40, "31": 41}}
+    assert Routing.from_persisted(st.routing, default) == rt
+    assert Routing.from_persisted(None, default) is default
+
+
+@pytest.mark.parametrize(
+    "routing",
+    [
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"abc": 3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 3, "6": 3}},
+        {"target_user_id": "1", "channel_id": 2, "mirrors": {}},
+        {"target_user_id": 1, "channel_id": 2},
+        {"target_user_id": 0, "channel_id": 2, "mirrors": {}},
+        {"target_user_id": 1, "channel_id": -2, "mirrors": {}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"0": 3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 0}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": -3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"01": 3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 3, "05": 4}},
+    ],
+)
+def test_routing_rejects_bad_shape(tmp_path: Path, routing: dict) -> None:
+    doc = {
+        "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {}, "routing": routing,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    with pytest.raises(StateCorrupt):
+        StateStore(tmp_path).load()
+
+
+def test_prejoin_override_is_optional_v3_key(tmp_path: Path) -> None:
+    doc = {
+        "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {}, "routing": None,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    store = StateStore(tmp_path)
+    assert store.load().prejoin_voice is None  # nothing persisted: config decides
+    store.update(lambda s: replace(s, prejoin_voice=True))
+    st = StateStore(tmp_path).load()
+    assert st.prejoin_voice is True and st.schema_version == 3
+    doc["prejoin_voice"] = "yes"
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    with pytest.raises(StateCorrupt):
+        store.load()

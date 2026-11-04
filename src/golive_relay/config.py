@@ -94,6 +94,7 @@ class RuntimeConfig:
     feedback_idr_min_interval_ms: int
     repeated_rejection_limit: int
     recording_enabled: bool
+    prejoin_voice: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +116,18 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlConfig:
+    chat_commands: bool = False
+    command_prefix: str = "!relay"
+    operator_user_ids: frozenset[int] = frozenset()
+    operator_role_ids: frozenset[int] = frozenset()
+    command_channel_id: int | None = None
+
+    def is_operator(self, user_id: int, role_ids: frozenset[int]) -> bool:
+        return user_id in self.operator_user_ids or not self.operator_role_ids.isdisjoint(role_ids)
+
+
+@dataclass(frozen=True, slots=True)
 class RelayConfig:
     schema_version: int
     discord: DiscordConfig
@@ -126,6 +139,7 @@ class RelayConfig:
     liveness: LivenessConfig
     storage: StorageConfig
     logging: LoggingConfig
+    control: ControlConfig = ControlConfig()
 
     def output_accounts(self) -> list[OutputAccount]:
         return list(self.discord.output_accounts)
@@ -315,6 +329,33 @@ def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str)
     return tuple(out)
 
 
+def _control(section: Any, errors: list[str]) -> ControlConfig:
+    """The optional ``control`` section; absent means chat commands off."""
+    if section is None:
+        return ControlConfig()
+    r = _Reader("control", section, errors)
+    enabled = r.opt_bool("chat_commands")
+    prefix = _optional(r, "command_prefix", "!relay")
+    if not isinstance(prefix, str) or not prefix or any(c.isspace() for c in prefix):
+        r._err("command_prefix", "must be a non-empty string without whitespace")
+        prefix = "!relay"
+    operators = r.ids("operator_user_ids") if "operator_user_ids" in r.data else frozenset()
+    r._seen.add("operator_user_ids")
+    roles = r.ids("operator_role_ids") if "operator_role_ids" in r.data else frozenset()
+    r._seen.add("operator_role_ids")
+    if enabled and not operators and not roles:
+        r._err("operator_user_ids", "operator_user_ids or operator_role_ids must not both be empty when chat_commands is true")
+    channel = None
+    if _optional(r, "command_channel_id", None) is not None:
+        v = r.data["command_channel_id"]
+        if isinstance(v, str) and v.isascii() and v.isdigit() and int(v) > 0:
+            channel = int(v)
+        else:
+            r._err("command_channel_id", "must be a string of decimal digits")
+    r.finish()
+    return ControlConfig(enabled, prefix, operators, roles, channel)
+
+
 def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     if not isinstance(raw, dict):
         errors.append("config: top level must be a mapping")
@@ -407,6 +448,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         feedback_idr_min_interval_ms=r.int_("feedback_idr_min_interval_ms", minimum=0),
         repeated_rejection_limit=r.int_("repeated_rejection_limit"),
         recording_enabled=r.only_false("recording_enabled"),
+        prejoin_voice=r.opt_bool("prejoin_voice"),
     )
     if runtime.keyframe_interval_seconds > 2.0:  # num() already rejects values <= 0
         r._err("keyframe_interval_seconds", "must be > 0 and <= 2.0")
@@ -425,6 +467,8 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     r = _Reader("logging", top._get("logging"), errors)
     logging = LoggingConfig(r.str_("level", tuple(sorted(_LOG_LEVELS))), r.only_false("include_media"), r.opt_bool("network_stats"))
     r.finish()
+
+    control = _control(_optional(top, "control", None), errors)
     top.finish()
 
     if errors:
@@ -440,6 +484,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         liveness=liveness,
         storage=storage,
         logging=logging,
+        control=control,
     )
 
 

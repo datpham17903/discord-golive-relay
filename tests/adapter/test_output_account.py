@@ -9,7 +9,7 @@ import discord
 import pytest
 
 from golive_relay.adapter.output_account import AccountMismatch, OutputAccountAdapter
-from golive_relay.supervisor.outputs_model import OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved
+from golive_relay.supervisor.outputs_model import OutAuthRejected, MirrorParticipants, OutHealth, OutJoined, OutReady, OutVoiceObserved
 
 USER, GUILD, CHAN = 7, 1, 2
 
@@ -24,8 +24,9 @@ class FakeOut:
     def is_connected(self) -> bool:
         return self.connected
 
-    def play(self, source) -> None:
+    def play(self, source, **kw) -> None:
         self.calls.append(("play", source))
+        self.calls.append(("play_kw", kw))
 
     def stop(self) -> None:
         self.calls.append("out.stop")
@@ -66,6 +67,7 @@ class FakeClient:
         self.user = NS(id=uid)
         self.login_error = login_error
         self.ready = asyncio.Event()
+        self.voice_states: dict = {}
 
     async def start(self, token: str) -> None:
         if self.login_error:
@@ -77,7 +79,13 @@ class FakeClient:
         await self.ready.wait()
 
     def get_guild(self, gid: int):
-        return NS(get_channel=lambda cid: FakeChannel(self.calls))
+        def get_channel(cid):
+            self.calls.append(("get_channel", cid))
+            ch = FakeChannel(self.calls)
+            ch.voice_states = self.voice_states.get(cid, {})
+            return ch
+
+        return NS(get_channel=get_channel)
 
     async def close(self) -> None:
         self.calls.append("client.close")
@@ -117,9 +125,9 @@ def test_publish_and_end_order() -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        codec = await a.publish(5, 30, "SRC")
+        codec = await a.publish(5, 1, 30, "SRC", CHAN)
         assert codec == "H264"
-        assert events == [OutJoined(USER, 5, "sess"), OutReady(USER, 5, "H264")]
+        assert events == [OutJoined(USER, 5, 1, "sess"), MirrorParticipants(USER, frozenset(), CHAN), OutReady(USER, 5, 1, "H264")]
         connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
         assert connect["self_mute"] is True and connect["reconnect"] is False and connect["timeout"] == 15
         cs = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "create_stream")
@@ -168,12 +176,12 @@ def test_dropped_stream_emits_out_health(monkeypatch) -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        await a.publish(5, 30, "SRC")
+        await a.publish(5, 1, 30, "SRC", CHAN)
         await asyncio.sleep(0.05)
-        assert OutHealth(USER, 5, False) not in events
+        assert OutHealth(USER, 5, 1, False) not in events
         a._out.connected = False
         await asyncio.sleep(0.05)
-        assert events.count(OutHealth(USER, 5, False)) == 1
+        assert events.count(OutHealth(USER, 5, 1, False)) == 1
         await a.end()
 
     asyncio.run(go())
@@ -185,7 +193,7 @@ def test_end_stops_health_watch(monkeypatch) -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        await a.publish(5, 30, "SRC")
+        await a.publish(5, 1, 30, "SRC", CHAN)
         out = a._out
         await a.end()
         out.connected = False
@@ -217,3 +225,59 @@ def test_h264_only_offers_only_h264_for_decode() -> None:
     assert codecs.advertised(all_codecs, "auto_decode") == all_codecs
     names = [c.name for c in codecs.watch_codecs(codecs.advertised(all_codecs, "h264_only"))]
     assert names == ["opus", "H264"]
+
+
+def test_publish_joins_passed_channel_and_emits_participants() -> None:
+    async def go():
+        a, calls, events = make()
+        await a.start("tok")
+        a._client.voice_states = {77: {5: object(), 6: object()}}
+        await a.publish(5, 1, 30, "SRC", 77)
+        assert ("get_channel", 77) in calls
+        assert MirrorParticipants(USER, frozenset({5, 6}), 77) in events
+        events.clear()
+        a._client.voice_states = {77: {5: object()}}
+        await a._client.on_voice_state_update(
+            NS(id=6), NS(channel=NS(id=77)), NS(channel=None))
+        assert events == [MirrorParticipants(USER, frozenset({5}), 77)]
+        events.clear()
+        await a._client.on_voice_state_update(NS(id=6), NS(channel=NS(id=3)), NS(channel=NS(id=4)))
+        assert events == []
+
+    asyncio.run(go())
+
+
+def test_publish_does_not_join_while_excluded_viewer_present() -> None:
+    async def go():
+        calls: list = []
+        events: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, events.append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), excluded_viewer_ids=frozenset({555}),
+        )
+        await a.start("tok")
+        a._client.voice_states = {77: {5: object(), 555: object()}}
+        with pytest.raises(RuntimeError, match="excluded viewer"):
+            await a.publish(5, 1, 30, "SRC", 77)
+        assert not any(isinstance(c, tuple) and c[0] == "connect" for c in calls)
+        assert events == [MirrorParticipants(USER, frozenset({5, 555}), 77)]
+        a._client.voice_states = {77: {5: object()}}
+        await a.publish(5, 2, 30, "SRC", 77)
+        assert any(isinstance(c, tuple) and c[0] == "connect" for c in calls)
+
+    asyncio.run(go())
+
+
+def test_publish_plays_with_configured_audio_bitrate() -> None:
+    async def go():
+        calls: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), audio_bitrate_kbps=96,
+        )
+        await a.start("tok")
+        await a.publish(5, 1, 30, "SRC", CHAN)
+        assert ("play_kw", {"bitrate": 96}) in calls
+        await a.end()
+
+    asyncio.run(go())
