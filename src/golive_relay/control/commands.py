@@ -89,7 +89,7 @@ def _usage_error(sub: str, why: str) -> ParseError:
 
 
 def _parse_id(sub: str, raw: str) -> int | ParseError:
-    if not (raw.isascii() and raw.isdigit()) or int(raw) <= 0:
+    if not (raw.isascii() and raw.isdigit()) or len(raw) > 20 or int(raw) <= 0:
         return _usage_error(sub, f"**ID không hợp lệ** (chỉ nhận số thập phân, không dùng mention)")
     return int(raw)
 

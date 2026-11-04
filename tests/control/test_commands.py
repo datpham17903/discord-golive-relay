@@ -38,6 +38,11 @@ def test_parse_rejects_mention_syntax():
         assert isinstance(parse(t, P), ParseError)
 
 
+def test_parse_rejects_oversized_id():
+    assert isinstance(parse("!relay target " + "1" * 5000, P), ParseError)
+    assert isinstance(parse("!relay channel " + "1" * 21, P), ParseError)
+
+
 def test_parse_ignores_other_prefix():
     assert parse("hello", P) is None
     assert parse("!relayx status", P) is None
