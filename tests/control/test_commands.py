@@ -165,3 +165,32 @@ def test_prejoin_plan_and_reply():
 def test_status_shows_prejoin():
     assert "Pre-join: bật" in format_status(routing(), ctx(), "IDLE", {}, prejoin=True)
     assert "Pre-join: tắt" in format_status(routing(), ctx(), "IDLE", {}, prejoin=False)
+
+
+def test_display_names_neutralise_markdown_and_format_chars():
+    hostile = {
+        555: "[x](https://evil.example)",
+        O1: "\u202eabc",
+        O2: "@everyone",
+        O3: "<@1>",
+        999: "\u2066\u202e\u2069\x00*_~|\\`[]()",
+    }
+    c = ctx(user_name=hostile.get)
+    old = routing({200: O1, 300: O2, 400: O3})
+    s = format_status(old, c, "X", {})
+    for bad in ("[", "]", "(https", "\u202e", "@", "<@"):
+        assert bad not in s
+    assert "xhttps://evil.example (555)" in s
+    assert "abc (21)" in s and "everyone (22)" in s and "1 (23)" in s
+    out = describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)
+    assert "đổi target** thành 999." in out  # nothing left of the name: ID only
+
+
+def test_parse_id_edges_and_prefix():
+    for bad in ("!relay target 0", "!relay channel -5", "!relay mirror 0"):
+        assert isinstance(parse(bad, P), ParseError)
+    assert parse("!RELAY status", P) == Status()
+    assert parse("!Relay STATUS", P) == Status()
+    assert parse("!relayx status", P) is None
+    msg = plan_change(SetChannel(999), routing(), ctx())
+    assert isinstance(msg, str) and msg.startswith("⚠️") and "voice" in msg

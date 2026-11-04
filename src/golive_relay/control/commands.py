@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping
 
@@ -93,12 +94,14 @@ class RoutingContext:
     user_name: Callable[[int], str | None] = field(default=lambda _: None)
 
 
-_NAME_UNSAFE = str.maketrans("", "", "<>@`")
+_NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\")
 
 
 def _user(ctx: RoutingContext, uid: int) -> str:
-    # display names are user-controlled: no mention or code syntax may survive into a reply
-    name = " ".join((ctx.user_name(uid) or "").translate(_NAME_UNSAFE).split())
+    # display names are user-controlled: no mention, link, markdown or bidi/format trick may survive into a reply
+    raw = (ctx.user_name(uid) or "").translate(_NAME_UNSAFE)
+    raw = "".join(c for c in raw if unicodedata.category(c) not in ("Cf", "Cc") or c.isspace())
+    name = " ".join(raw.split())
     return f"{name} ({uid})" if name else str(uid)
 
 
