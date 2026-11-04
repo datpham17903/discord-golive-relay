@@ -76,6 +76,9 @@ class FakeAdapter:
         self.order = order
         self.started = False
         self.calls: list[str] = []
+        self.replies: list[tuple[int, int, str]] = []
+        self.snap: GatewaySnapshot | None = None
+        self.voice_ids: frozenset[int] = frozenset()
 
     async def start(self, token: str) -> None:
         self.started = True
@@ -114,6 +117,19 @@ class FakeAdapter:
 
     async def rewatch(self) -> None:
         self.calls.append("rewatch")
+
+    def snapshot(self, new_session: bool = False) -> GatewaySnapshot:
+        self.calls.append("snapshot")
+        return self.snap or GatewaySnapshot(None, None, frozenset(), new_session)
+
+    async def reply(self, channel_id: int, message_id: int, text: str) -> None:
+        self.replies.append((channel_id, message_id, text))
+
+    def voice_channel_ids(self) -> frozenset[int]:
+        return self.voice_ids
+
+    def display_name(self, uid: int) -> str | None:
+        return None
 
 
 class Env:
@@ -478,3 +494,149 @@ def test_status_network_only_when_enabled(tmp_path, slate, source_gop):
     assert env.svc.status_dict()["network"] == {}
     env.svc._adapter = type("A", (), {"network_stats": lambda self: {"watch": {"video_sequence_gaps": 3}}})()
     assert env.svc.status_dict()["network"] == {"watch": {"video_sequence_gaps": 3}}
+
+
+OPERATOR, CMD_CHAN = 50, 60
+
+
+def chat(env, text: str, msg_id: int = 900) -> None:
+    from golive_relay.control.commands import ChatCommand
+
+    env.adapters[-1].events(ChatCommand(OPERATOR, CMD_CHAN, msg_id, text))
+
+
+def test_chat_target_command_persists_and_restarts(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    new_target = 777
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        gen = env.svc.sup.generation
+        stream = SourceStream("key-2", new_target, env.chan, 2, None, False)
+        a.snap = GatewaySnapshot(TargetVoice(env.chan, True), stream, frozenset({new_target}), False)
+        chat(env, f"!relay target {new_target}")
+        assert env.store.load().routing == {"target_user_id": new_target, "channel_id": env.chan, "mirrors": {}}
+        assert env.svc.sup.routing.target_user_id == new_target
+        assert (a.target_id, a.channel_id) == (new_target, env.chan)
+        # the new target is already streaming: the re-snapshot starts a new session without any gateway event
+        await wait_until(lambda: env.svc.sup.generation > gen and a.calls.count("watch") == 2)
+        await wait_until(lambda: a.replies)
+        (ch, mid, text), = a.replies
+        assert (ch, mid) == (CMD_CHAN, 900) and text.startswith("✅") and str(new_target) in text
+        # a recreated adapter (reconnect / fatal reset) keeps the new routing
+        await env.svc._drop_adapter()
+        await env.svc._start_adapter()
+        assert env.adapters[-1].target_id == new_target
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+    assert "chat_command" in env.logs
+
+
+def test_chat_rejection_and_status_reply_without_state_change(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        rev = env.store.load().revision
+        chat(env, f"!relay target {env.cfg.discord.expected_relay_user_id}", 1)
+        chat(env, "!relay target <@123>", 2)
+        chat(env, "!relay status", 3)
+        chat(env, "just talking", 4)
+        await wait_until(lambda: len(a.replies) == 3)
+        assert [r[1] for r in a.replies] == [1, 2, 3]
+        assert a.replies[0][2].startswith("⚠️") and a.replies[1][2].startswith("❌")
+        assert a.replies[2][2].startswith("📡")
+        assert all("<@" not in r[2] for r in a.replies)
+        assert env.store.load().revision == rev
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_chat_off_reuses_enable_path(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        chat(env, "!relay off")
+        assert env.store.load().desired_enabled is False
+        await wait_until(lambda: env.svc.sup.state is RelayState.DISABLED)
+        await wait_until(lambda: env.adapters[0].replies)
+        assert env.adapters[0].replies[0][2].startswith("✅")
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_state_file_routing_change_applies_without_reply(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        r = {"target_user_id": 778, "channel_id": env.chan, "mirrors": {}}
+        env.store.update(lambda s: replace(s, routing=r))
+        await wait_until(lambda: env.svc.sup.routing.target_user_id == 778)
+        assert env.adapters[0].target_id == 778
+        await asyncio.sleep(0.1)
+        assert env.adapters[0].replies == []
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_invalid_persisted_routing_fails_closed(tmp_path, slate, source_gop):
+    from golive_relay.control.state import StateCorrupt
+
+    env = Env(tmp_path, slate, source_gop)
+    assert env.svc.sup.routing.target_user_id == env.target  # no routing persisted: config values
+    relay = env.cfg.discord.expected_relay_user_id
+    for bad in (
+        {"target_user_id": relay, "channel_id": env.chan, "mirrors": {}},
+        {"target_user_id": 777, "channel_id": env.chan, "mirrors": {"999": 31337}},  # not an output account
+    ):
+        env.store.update(lambda s: replace(s, routing=bad))
+        with pytest.raises(StateCorrupt, match="state.json routing"):
+            Service(env.cfg, env.store, lambda *a: None, lambda p: None, lambda *a, **k: None, install_signals=False)
+
+
+def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source_gop):
+    uid, mirror_chan = 424242, 999
+    outs: list = []
+
+    class ChannelOut(FakeOutAdapter):
+        async def publish(self, g, fps, source, channel_id):
+            self.calls.append(("channel", channel_id))
+            return await super().publish(g, fps, source, channel_id)
+
+    def out_factory(acct, events, log):
+        a = ChannelOut(acct, events, [])
+        outs.append(a)
+        return a
+
+    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory)
+
+    async def main():
+        task = await reach_relaying(env)
+        await wait_until(lambda: env.svc.pool.account_live(uid, env.svc._gen, env.svc._epoch))
+        assert ("channel", env.chan) in outs[0].calls
+        env.adapters[0].voice_ids = frozenset({env.chan, mirror_chan})
+        chat(env, f"!relay mirror {mirror_chan}")
+        assert env.store.load().routing["mirrors"] == {str(mirror_chan): uid}
+        await wait_until(lambda: ("channel", mirror_chan) in outs[0].calls)
+        await wait_until(lambda: env.adapters[0].replies)
+        assert env.adapters[0].replies[0][2].startswith("✅")
+        st = env.svc.status_dict()
+        assert st["routing"]["mirrors"] == {str(mirror_chan): uid}
+        assert st["accounts"][0]["channel_id"] == mirror_chan
+        assert env.svc.sup.state is RelayState.RELAYING  # the main session is not interrupted
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())

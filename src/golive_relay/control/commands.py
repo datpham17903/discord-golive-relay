@@ -29,6 +29,16 @@ _USAGE = {
 
 
 @dataclass(frozen=True, slots=True)
+class ChatCommand:
+    """A guild message from an operator, already filtered by the adapter; ``text`` is never logged."""
+
+    author_id: int
+    channel_id: int
+    message_id: int
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
 class Status:
     pass
 
@@ -75,8 +85,12 @@ class RoutingContext:
     user_name: Callable[[int], str | None] = field(default=lambda _: None)
 
 
+_NAME_UNSAFE = str.maketrans("", "", "<>@`")
+
+
 def _user(ctx: RoutingContext, uid: int) -> str:
-    name = ctx.user_name(uid)
+    # display names are user-controlled: no mention or code syntax may survive into a reply
+    name = " ".join((ctx.user_name(uid) or "").translate(_NAME_UNSAFE).split())
     return f"{name} ({uid})" if name else str(uid)
 
 

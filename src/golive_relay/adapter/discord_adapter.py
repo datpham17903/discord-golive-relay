@@ -17,6 +17,8 @@ import discord
 from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
+from golive_relay.config import ControlConfig
+from golive_relay.control.commands import ChatCommand
 from golive_relay.supervisor.model import (
     AuthRejected,
     ConfigInvalid,
@@ -75,6 +77,8 @@ class DiscordAdapter:
         self.target_id = int(d.target_user_id)
         self.channel_id = int(d.allowed_voice_channel_id)
         self.relay_id = int(d.expected_relay_user_id)
+        self._relay_ids = {self.relay_id, *(a.user_id for a in getattr(d, "output_accounts", ()))}
+        self._control: ControlConfig = getattr(cfg, "control", None) or ControlConfig()
         self._events = events
         self._ingress = ingress
         self.log = log
@@ -165,6 +169,20 @@ class DiscordAdapter:
             self._on_stream_delete(args[0])
         elif event == "voice_state_update":
             self._on_voice_state(*args)
+        elif event == "message":
+            self._on_message(args[0])
+
+    def _on_message(self, msg: Any) -> None:
+        """Operator messages in the configured guild (and command channel) only; the rest is ignored silently."""
+        c = self._control
+        if not c.chat_commands or msg.guild is None or msg.guild.id != self.guild_id:
+            return
+        author = msg.author.id
+        if author in self._relay_ids or author not in c.operator_user_ids:
+            return
+        if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
+            return
+        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id
@@ -300,6 +318,31 @@ class DiscordAdapter:
         if self._stream is None or self._stream.key != str(live.key):
             self._incarnation += 1
         self._stream = self._to_source(live)
+
+    # ------------------------------------------------------------------- chat
+
+    async def reply(self, channel_id: int, message_id: int, text: str) -> None:
+        """Reply without pinging anyone: no author mention, no parsed mentions in ``text``."""
+        channel = self._client.get_channel(channel_id) if self._client else None
+        if channel is None:
+            raise RuntimeError("command channel not in cache")
+        await channel.get_partial_message(message_id).reply(
+            text, mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+
+    def voice_channel_ids(self) -> frozenset[int]:
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        if guild is None:
+            return frozenset()
+        return frozenset(c.id for c in guild.channels if isinstance(c, discord.VoiceChannel))
+
+    def display_name(self, uid: int) -> str | None:
+        """Guild display name, else global name, from cache; None when unknown."""
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        member = guild.get_member(uid) if guild else None
+        if member is not None:
+            return member.display_name
+        user = self._client.get_user(uid) if self._client else None
+        return (user.global_name or user.name) if user is not None else None
 
     # ------------------------------------------------------------------ voice
 

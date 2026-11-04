@@ -129,3 +129,14 @@ def test_no_reply_contains_user_mention():
     for t in ("!relay target <@1>", "!relay x", "!relay mirror"):
         outs.append(parse(t, P).text)
     assert all("<@" not in o for o in outs)
+
+
+def test_display_names_are_sanitized():
+    hostile = {555: "<@123> @everyone `x`", O1: "<@&9>", 999: "@<>`"}
+    c = ctx(user_name=hostile.get)
+    old = routing({200: O1})
+    outs = [format_status(old, c, "X", {O1: "OK"}), describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)]
+    for o in outs:
+        assert "<@" not in o and "@" not in o and "`x`" not in o
+    assert "123 everyone x (555)" in outs[0]
+    assert "đổi target** thành 999." in outs[1]  # nothing left of the name: ID only

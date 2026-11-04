@@ -159,6 +159,10 @@ relayctl validate --config config.yaml
 | `logging.level` | `DEBUG` `INFO` `WARNING` `ERROR` `CRITICAL` | `INFO` | debugging |
 | `logging.include_media` | Log media content | `false` | never (must be `false`) |
 | `logging.network_stats` | Expose packet loss / NACK / RTX counters in `status` | `false` | diagnosing stutter |
+| `control.chat_commands` | Accept `!relay ...` commands from guild chat (section 7, Chat commands). When `false` no message is read | `false` | you want to steer the relay from Discord |
+| `control.command_prefix` | First word of every command, no whitespace | `!relay` | it clashes with another bot |
+| `control.operator_user_ids` | User IDs (quoted strings) allowed to command; must be non-empty when `chat_commands` is `true` | `[]` | always, when enabling chat commands |
+| `control.command_channel_id` | When set, commands are accepted only in this text channel | `null` | you want one command channel |
 
 Relative manifest paths are looked up next to the config file.
 
@@ -285,6 +289,26 @@ relayctl reset-fatal --state-dir /var/lib/discord-relay --account 11111111111111
 A fresh install is disabled. Run `relayctl enable` once. The service then relays automatically whenever the target shares in the allowed voice channel. It stops when the target stops sharing, leaves or moves, or when you run `relayctl disable` (or SIGINT/SIGTERM). Runtime state (enabled flag, FATAL latch, quarantine, rejection counter) is in `state.json` inside the state directory; the config is never modified.
 
 Windows note: the control socket is a Unix socket. If it is unavailable, `enable`, `disable` and `reset-fatal` change `state.json` directly and `status` reads the files, so run them while the service is stopped or after it exited.
+
+### Chat commands
+
+With `control.chat_commands: true` the ingest account reads messages in the configured guild and answers commands typed there:
+
+| Command | What it does |
+| --- | --- |
+| `!relay` | Shows the command list |
+| `!relay status` | Session state, target, main channel, mirrors and their output accounts |
+| `!relay on` / `!relay off` | Same as `relayctl enable` / `disable` |
+| `!relay target <user_id>` | Relays another person. The current session stops and starts again when the new target shares in the main channel. A relay account (ingest or output) is refused |
+| `!relay channel <channel_id>` | Moves the main voice channel. The channel must be a voice channel of the guild and not a mirror |
+| `!relay mirror <channel_id>` | Publishes the same stream in another voice channel, using a free output account (the last free one in config order). Needs a free, non-FATAL, non-quarantined output account |
+| `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the output account returns to the main channel |
+
+Who may command: only users in `control.operator_user_ids`, and only in `control.command_channel_id` when it is set. Messages from anyone else, from other guilds or channels, and from the relay accounts themselves are ignored without a reply. Message text is never logged; the log records the command name, author ID, channel ID and outcome.
+
+Mentions: give every ID as plain decimal digits. A mention such as `<@123>` or `<#123>` is refused with a usage hint. Replies never ping anyone: they are sent with all mentions disabled and without mentioning the author, users are shown as display name plus ID (with `<`, `>`, `@` and backticks removed from names), and channels as `<#id>` links.
+
+Changes are written to `routing` in `state.json` and survive restarts; while no routing is stored the `discord.target_user_id` and `discord.allowed_voice_channel_id` from config are used. A routing edited in `state.json` while the service runs is applied within a second, without a chat reply. At start the stored routing is checked: a target that is a relay account, or a mirror using an account that is not a configured output account, stops the service with `state.json routing is invalid` (fix or remove the `routing` entry). `relayctl status` shows the current `routing` and the channel of each output account.
 
 ## 8. Deploying on a Linux VPS with systemd
 

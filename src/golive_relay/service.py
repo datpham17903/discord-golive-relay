@@ -21,6 +21,9 @@ from discord.ext.native_voice.media import VideoConfig
 
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
+from golive_relay.control.commands import (
+    ChatCommand, ParseError, RoutingContext, SetEnabled, Status, describe_change, format_status, parse, plan_change,
+)
 from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
 from golive_relay.control.state import PersistedState, StateCorrupt, StateStore, account_view, set_account
@@ -30,15 +33,16 @@ from golive_relay.media.source import RelayMediaSource
 from golive_relay.obs import JsonLogger, Metrics, write_status
 from golive_relay.supervisor.outputs import OutputPool
 from golive_relay.supervisor.outputs_model import (
-    OutCloseGate, OutFailed, OutputAccount, OutSetFatal, OutSetLive, OutSetQuarantine, OutSetRejections,
+    OutCloseGate, OutFailed, OutputAccount, OutputState, OutSetFatal, OutSetLive, OutSetQuarantine, OutSetRejections,
     OutSlate, OutStart, OutTeardown, OutTick, SessionEnded, SessionHold, SessionLive,
 )
 from golive_relay.supervisor.retry import RetryPolicy
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
+from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
-    FatalReason, FirstFrame, FreshFrame, Joined, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
-    RelayState, RequestInputKeyframe, ResetFatal, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
+    FatalReason, FirstFrame, FreshFrame, GatewayState, Joined, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
+    RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
 )
 from golive_relay.worker.messages import (
@@ -79,6 +83,23 @@ def supervisor_config(cfg: RelayConfig) -> SupervisorConfig:
     )
 
 
+def config_routing(cfg: RelayConfig) -> Routing:
+    return Routing(cfg.discord.target_user_id, cfg.discord.allowed_voice_channel_id, {})
+
+
+def routing_error(r: Routing, cfg: RelayConfig) -> str | None:
+    """Checks a routing that did not come from a chat command (state.json); channels are not checked offline."""
+    outputs = {a.user_id for a in cfg.output_accounts()}
+    if r.target_user_id in outputs | {cfg.discord.expected_relay_user_id}:
+        return f"target_user_id {r.target_user_id} is a relay account (ingest or output)"
+    for ch, acct in r.mirrors.items():
+        if acct not in outputs:
+            return f"mirror {ch} uses {acct}, which is not a configured output account"
+        if ch == r.channel_id:
+            return f"mirror {ch} is the main channel"
+    return None
+
+
 def persisted_view(st: PersistedState) -> PersistedStateView:
     fatal = None
     if st.fatal_latch:
@@ -114,13 +135,20 @@ class Service:
         self._slate_builder = slate_builder
         self._install_signals = install_signals
         self._tick_s = tick_s
-        self.sup = Supervisor(supervisor_config(cfg), persisted_view(store.load()))
+        st = store.load()
+        routing = Routing.from_persisted(st.routing, config_routing(cfg))
+        err = routing_error(routing, cfg)
+        if err is not None:
+            raise StateCorrupt(f"state.json routing is invalid: {err}; fix or remove the routing entry")
+        self._rejected_routing: dict | None = None
+        sup_cfg = replace(supervisor_config(cfg), target_user_id=routing.target_user_id,
+                          allowed_channel_id=routing.channel_id)
+        self.sup = Supervisor(sup_cfg, persisted_view(st), mirrors=routing.mirrors)
         self.publisher = Publisher(
             lambda g, e, now: self.sup.gate_allows(g, e, now), on_need_idr=self._need_idr
         )
         r = cfg.runtime
         accounts = cfg.output_accounts()
-        st = store.load()
         self.pool = OutputPool(
             accounts, {a.user_id: account_view(st, a.user_id) for a in accounts},
             retry=lambda: RetryPolicy(r.retry_delays_seconds, r.retry_cooldown_seconds),
@@ -138,6 +166,7 @@ class Service:
         self._out_misconfigured: set[int] = set()
         self._out_tail: dict[int, asyncio.Task] = {}
         self._out_tasks: set[asyncio.Task] = set()
+        self._reply_tail: asyncio.Task | None = None
         self._feedback_min = cfg.runtime.feedback_idr_min_interval_ms / 1000.0
         self._adapter: Any = None
         self._worker: Any = None
@@ -292,6 +321,9 @@ class Service:
     # ---------------------------------------------------------------- events
 
     def _handle(self, event: Any) -> None:
+        if isinstance(event, ChatCommand):
+            self._on_chat(event)
+            return
         before = self.sup.state
         acts = self.sup.handle(event, time.monotonic())
         if not isinstance(event, Tick):
@@ -317,6 +349,83 @@ class Service:
             self._handle(EnableChanged(st.desired_enabled))
         if st.fatal_latch is None and self.sup.state is RelayState.FATAL and self.sup.fatal in DURABLE_FATAL:
             self._handle(ResetFatal())
+        routing = Routing.from_persisted(st.routing, config_routing(self.cfg))
+        if routing != self.sup.routing:
+            err = routing_error(routing, self.cfg)
+            if err is None:
+                self._handle(RoutingChanged(routing))
+            elif st.routing != self._rejected_routing:  # log once per distinct bad entry
+                self._rejected_routing = st.routing
+                self.log("state_routing_rejected", error=err)
+
+    # ------------------------------------------------------------------ chat
+
+    def _on_chat(self, ev: ChatCommand) -> None:
+        """parse -> plan -> persist -> RoutingChanged (which re-routes the pool) -> reply. Content is never logged."""
+        cmd = parse(ev.text, self.cfg.control.command_prefix)
+        if cmd is None:
+            return
+        ctx = self._routing_context()
+        old = self.sup.routing
+        try:
+            if isinstance(cmd, ParseError):
+                outcome, text = "parse_error", cmd.text
+            elif isinstance(cmd, Status):
+                states = {row["account"]: row["state"] for row in self.pool.status(time.monotonic())}
+                outcome, text = "status", format_status(old, ctx, self.sup.state.value, states)
+            elif isinstance(cmd, SetEnabled):
+                self._set_enabled(cmd.on)
+                outcome, text = "applied", describe_change(cmd, old, old, ctx)
+            else:
+                new = plan_change(cmd, old, ctx)
+                if isinstance(new, str):
+                    outcome, text = "rejected", new
+                else:
+                    self.store.update(lambda s: replace(s, routing=new.to_persisted()))
+                    self._handle(RoutingChanged(new))
+                    outcome, text = "applied", describe_change(cmd, old, new, ctx)
+        except (OSError, StateCorrupt) as exc:
+            self.log("chat_state_write_failed", error=repr(exc))
+            outcome, text = "write_failed", "❌ **Không ghi được state.json**; không có gì thay đổi."
+        self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
+                 outcome=outcome)
+        self._reply(ev, text)
+
+    def _routing_context(self) -> RoutingContext:
+        accounts = [a.user_id for a in self.cfg.output_accounts()]
+        bad = {OutputState.FATAL.value, OutputState.QUARANTINE.value}
+        adapter = self._adapter
+        return RoutingContext(
+            relay_user_ids=frozenset({self.cfg.discord.expected_relay_user_id, *accounts}),
+            output_order=tuple(accounts),
+            unavailable=frozenset(r["account"] for r in self.pool.status(time.monotonic()) if r["state"] in bad),
+            voice_channel_ids=adapter.voice_channel_ids() if adapter is not None else frozenset(),
+            user_name=adapter.display_name if adapter is not None else (lambda _: None),
+        )
+
+    def _reply(self, ev: ChatCommand, text: str) -> None:
+        """Replies go out in order, off the ops queue so a slow voice join never delays them."""
+        adapter, prev = self._adapter, self._reply_tail
+        if adapter is None:
+            return
+
+        async def run() -> None:
+            if prev is not None:
+                await asyncio.wait({prev})
+            try:
+                await adapter.reply(ev.channel_id, ev.message_id, text)
+            except Exception as exc:
+                self.log("chat_reply_failed", channel=ev.channel_id, error=repr(exc))
+
+        task = asyncio.get_running_loop().create_task(run())
+        self._reply_tail = task
+        self._out_tasks.add(task)
+        task.add_done_callback(self._out_tasks.discard)
+
+    def _resnapshot(self, adapter: Any) -> None:
+        """After a target/channel change the new target may already be streaming: read the cache now."""
+        if adapter is self._adapter and self.sup.gateway is GatewayState.FRESH:
+            self._handle(adapter.snapshot())
 
     # --------------------------------------------------------------- actions
 
@@ -340,9 +449,11 @@ class Service:
                     inc = self.sup.status(time.monotonic()).source_incarnation
                     self._pool_event(SessionLive(g, e, 0 if inc is None else inc))
                 case ApplyRouting(routing=r):
-                    if self._adapter is not None:
-                        self._adapter.target_id = r.target_user_id
-                        self._adapter.channel_id = r.channel_id
+                    adapter = self._adapter
+                    if adapter is not None and (adapter.target_id, adapter.channel_id) != (r.target_user_id, r.channel_id):
+                        adapter.target_id = r.target_user_id
+                        adapter.channel_id = r.channel_id
+                        asyncio.get_running_loop().call_soon(self._resnapshot, adapter)
                     for pa in self.pool.set_routing(r):
                         self._pool_action(pa)
                 case StartConnect():
@@ -624,6 +735,8 @@ class Service:
         if self._adapter is not None or self._shutdown_requested:
             return
         self._adapter = self._adapter_factory(self._handle, self._ingress, self.log)
+        r = self.sup.routing  # a recreated adapter follows the current routing, not the static config
+        self._adapter.target_id, self._adapter.channel_id = r.target_user_id, r.channel_id
         await self._adapter.start(self._token)
 
     async def _ensure_adapter(self) -> None:
@@ -716,8 +829,10 @@ class Service:
         d["adapter_running"] = self._adapter is not None
         d["metrics"] = self.metrics.snapshot()
         d["ingest_send"] = self.publisher.take_window()
+        d["routing"] = self.sup.routing.to_persisted()
         d["accounts"] = [
-            {**row, **self._out_pubs[row["account"]].take_window()} for row in self.pool.status(time.monotonic())
+            {**row, "channel_id": self.pool.channel_of(row["account"]), **self._out_pubs[row["account"]].take_window()}
+            for row in self.pool.status(time.monotonic())
         ]
         if self.cfg.logging.network_stats:
             d["network"] = self._adapter.network_stats() if self._adapter is not None else {}
@@ -740,8 +855,7 @@ class Service:
             return {"ok": False, "error": f"{cmd} is operator-only"}
         if cmd in ("enable", "disable"):
             enabled = cmd == "enable"
-            st = self.store.update(lambda s: replace(s, desired_enabled=enabled))
-            self._handle(EnableChanged(enabled))
+            st = self._set_enabled(enabled)
             return {"ok": True, "revision": st.revision, "desired_enabled": enabled}
         if cmd == "reset-fatal" and req.get("account") is not None:
             uid = int(req["account"])
@@ -759,6 +873,11 @@ class Service:
             self._handle(ResetFatal())
             return {"ok": True}
         return {"ok": False, "error": f"unknown command: {cmd!r}"}
+
+    def _set_enabled(self, enabled: bool) -> PersistedState:
+        st = self.store.update(lambda s: replace(s, desired_enabled=enabled))
+        self._handle(EnableChanged(enabled))
+        return st
 
 
 def _is_operator(uid: int | None) -> bool:
