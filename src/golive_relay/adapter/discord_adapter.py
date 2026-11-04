@@ -185,11 +185,18 @@ class DiscordAdapter:
         if not c.chat_commands or msg.guild is None or msg.guild.id != self.guild_id:
             return
         author = msg.author.id
-        if author in self._relay_ids or author not in c.operator_user_ids:
+        if author in self._relay_ids:
+            return
+        roles = getattr(msg.author, "roles", None)
+        if roles is None:
+            member = msg.guild.get_member(author) if hasattr(msg.guild, "get_member") else None
+            roles = getattr(member, "roles", None) or ()
+        role_ids = frozenset(r.id for r in roles)
+        if not c.is_operator(author, role_ids):
             return
         if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
             return
-        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content))
+        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id

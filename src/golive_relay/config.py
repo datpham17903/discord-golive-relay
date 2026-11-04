@@ -120,7 +120,11 @@ class ControlConfig:
     chat_commands: bool = False
     command_prefix: str = "!relay"
     operator_user_ids: frozenset[int] = frozenset()
+    operator_role_ids: frozenset[int] = frozenset()
     command_channel_id: int | None = None
+
+    def is_operator(self, user_id: int, role_ids: frozenset[int]) -> bool:
+        return user_id in self.operator_user_ids or not self.operator_role_ids.isdisjoint(role_ids)
 
 
 @dataclass(frozen=True, slots=True)
@@ -341,8 +345,10 @@ def _control(section: Any, errors: list[str]) -> ControlConfig:
         prefix = "!relay"
     operators = r.ids("operator_user_ids") if "operator_user_ids" in r.data else frozenset()
     r._seen.add("operator_user_ids")
-    if enabled and not operators:
-        r._err("operator_user_ids", "must not be empty when chat_commands is true")
+    roles = r.ids("operator_role_ids") if "operator_role_ids" in r.data else frozenset()
+    r._seen.add("operator_role_ids")
+    if enabled and not operators and not roles:
+        r._err("operator_user_ids", "operator_user_ids or operator_role_ids must not both be empty when chat_commands is true")
     channel = None
     if _optional(r, "command_channel_id", None) is not None:
         v = r.data["command_channel_id"]
@@ -351,7 +357,7 @@ def _control(section: Any, errors: list[str]) -> ControlConfig:
         else:
             r._err("command_channel_id", "must be a string of decimal digits")
     r.finish()
-    return ControlConfig(enabled, prefix, operators, channel)
+    return ControlConfig(enabled, prefix, operators, roles, channel)
 
 
 def _build(raw: Any, errors: list[str]) -> RelayConfig | None:

@@ -16,12 +16,12 @@ GUILD, CHAN, TARGET, RELAY, OUT = 1, 2, 3, 4, 5
 OPERATOR, CMD_CHAN = 50, 60
 
 
-def make(chat: bool = True, command_channel: int | None = CMD_CHAN) -> tuple[DiscordAdapter, list]:
+def make(chat: bool = True, command_channel: int | None = CMD_CHAN, roles: frozenset = frozenset()) -> tuple[DiscordAdapter, list]:
     out: list = []
     cfg = NS(
         discord=NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4",
                    output_accounts=(OutputAccount(OUT, "relay-token-2"),)),
-        control=ControlConfig(chat_commands=chat, operator_user_ids=frozenset({OPERATOR, RELAY, OUT}),
+        control=ControlConfig(chat_commands=chat, operator_user_ids=frozenset({OPERATOR, RELAY, OUT}), operator_role_ids=roles,
                               command_channel_id=command_channel),
     )
     return DiscordAdapter(cfg, out.append, lambda m: None, lambda *a, **k: None, decodable={"H264"}), out
@@ -109,3 +109,37 @@ def test_join_reports_voice_state_echo_before_voice_connects() -> None:
 
     asyncio.run(main())
     assert seen == ["callback", "echo_seen", "media_connected"]
+
+
+ROLE = 700
+
+
+def test_role_holder_is_operator_and_role_ids_are_passed() -> None:
+    a, out = make(roles=frozenset({ROLE}))
+    m = message(author=51)
+    m.author.roles = [NS(id=ROLE), NS(id=701)]
+    a.handle_dispatch("message", m)
+    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status", frozenset({ROLE, 701}))]
+
+
+def test_role_operator_denials() -> None:
+    a, out = make(roles=frozenset({ROLE}))
+    other = message(author=51)
+    other.author.roles = [NS(id=701)]
+    a.handle_dispatch("message", other)  # wrong role
+    a.handle_dispatch("message", message(author=51))  # not a member, unknown
+    wrong_guild = message(author=51, guild=99)
+    wrong_guild.author.roles = [NS(id=ROLE)]
+    a.handle_dispatch("message", wrong_guild)
+    relay = message(author=RELAY)
+    relay.author.roles = [NS(id=ROLE)]
+    a.handle_dispatch("message", relay)
+    assert out == []
+
+
+def test_role_lookup_via_guild_member_when_author_is_not_a_member() -> None:
+    a, out = make(roles=frozenset({ROLE}))
+    m = message(author=51)
+    m.guild.get_member = lambda uid: NS(roles=[NS(id=ROLE)]) if uid == 51 else None
+    a.handle_dispatch("message", m)
+    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE})

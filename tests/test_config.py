@@ -315,6 +315,13 @@ def test_control_config_requires_operators_when_enabled(tmp_path: Path):
     raw["control"] = {"chat_commands": True, "operator_user_ids": ["42"], "command_channel_id": "7", "command_prefix": "!r"}
     c = _load(tmp_path, raw).control
     assert c.operator_user_ids == frozenset({42}) and c.command_channel_id == 7 and c.command_prefix == "!r"
+    raw["control"] = {"chat_commands": True, "operator_role_ids": ["77"]}
+    c = _load(tmp_path, raw).control
+    assert c.operator_role_ids == frozenset({77}) and c.operator_user_ids == frozenset()
+    raw["control"] = {"chat_commands": True, "operator_user_ids": [], "operator_role_ids": []}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"operator_role_ids": ["x"]}
+    assert any("control.operator_role_ids" in e for e in _errors(tmp_path, raw))
     raw["control"] = {"command_prefix": "! relay"}
     assert any("control.command_prefix" in e for e in _errors(tmp_path, raw))
     raw["control"] = {"bogus": 1}

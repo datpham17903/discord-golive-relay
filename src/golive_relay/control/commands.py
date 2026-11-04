@@ -38,6 +38,7 @@ class ChatCommand:
     channel_id: int
     message_id: int
     text: str
+    author_role_ids: frozenset[int] = frozenset()
 
 
 @dataclass(frozen=True, slots=True)

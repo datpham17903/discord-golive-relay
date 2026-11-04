@@ -162,7 +162,8 @@ relayctl validate --config config.yaml
 | `logging.network_stats` | Expose packet loss / NACK / RTX counters in `status` | `false` | diagnosing stutter |
 | `control.chat_commands` | Accept `!relay ...` commands from guild chat (section 7, Chat commands). When `false` no message is read | `false` | you want to steer the relay from Discord |
 | `control.command_prefix` | First word of every command, no whitespace | `!relay` | it clashes with another bot |
-| `control.operator_user_ids` | User IDs (quoted strings) allowed to command; must be non-empty when `chat_commands` is `true` | `[]` | always, when enabling chat commands |
+| `control.operator_user_ids` | User IDs (quoted strings) allowed to command; with `operator_role_ids`, at least one of the two must be non-empty when `chat_commands` is `true` | `[]` | when enabling chat commands, unless roles are set |
+| `control.operator_role_ids` | Role IDs (quoted strings); members holding any of these roles may command | `[]` | no |
 | `control.command_channel_id` | When set, commands are accepted only in this text channel | `null` | you want one command channel |
 
 Relative manifest paths are looked up next to the config file.
@@ -306,7 +307,7 @@ With `control.chat_commands: true` the ingest account reads messages in the conf
 | `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the output account returns to the main channel |
 | `!relay prejoin on` / `!relay prejoin off` | Turns pre-join (`runtime.prejoin_voice`) on or off. `on` joins the main channel as soon as the target is there; `off` leaves voice when the target is not streaming. Stored as `prejoin_voice` in `state.json` and kept across restarts; while nothing is stored the config value is used. `!relay status` shows it |
 
-Who may command: only users in `control.operator_user_ids`, and only in `control.command_channel_id` when it is set. Messages from anyone else, from other guilds or channels, and from the relay accounts themselves are ignored without a reply. Message text is never logged; the log records the command name, author ID, channel ID and outcome.
+Who may command: only users listed in `control.operator_user_ids` or members holding a role listed in `control.operator_role_ids`, and only in `control.command_channel_id` when it is set. Messages from anyone else, from other guilds or channels, and from the relay accounts themselves are ignored without a reply. Message text is never logged; the log records the command name, author ID, channel ID and outcome.
 
 Mentions: give every ID as plain decimal digits. A mention such as `<@123>` or `<#123>` is refused with a usage hint. Replies never ping anyone: they are sent with all mentions disabled and without mentioning the author, users are shown as display name plus ID (with `<`, `>`, `@` and backticks removed from names), and channels as `<#id>` links.
 
