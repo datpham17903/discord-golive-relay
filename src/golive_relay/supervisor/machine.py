@@ -303,6 +303,8 @@ class Supervisor:
             case ParticipantsChanged(participants=p):
                 self.participants = p
             case RelayVoiceObserved() as e:
+                if self.state not in _SESSION and self._in_voice and e.channel_id == self.cfg.allowed_channel_id:
+                    self._prejoin_retry.reset()  # the pre-join landed
                 self._on_relay_voice(e, now, acts)
             case Joined() as e if self._cur(e):
                 self._owner.arm(e.voice_session_id)
@@ -592,7 +594,7 @@ class Supervisor:
             self._in_voice = False
         elif prejoin:
             self._leave_at = None  # stay ready for the next stream start
-        elif self.cfg.prejoin_voice and self._leave_at is None:
+        elif self._leave_at is None:  # e.g. pre-join turned off while a start was debouncing
             self._leave_at = now + self.cfg.idle_grace
         elif self._leave_at is not None and now >= self._leave_at:
             acts.append(LeaveVoice("idle_grace"))

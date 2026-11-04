@@ -1085,3 +1085,24 @@ def test_gate_ready_at_is_debounce_start_or_backoff_expiry():
     sup.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, "join"), 3.0)
     assert has(sup.handle(Tick(), 8.0), StartConnect)
     assert sup.gate_ready_at == 8.0  # backoff time is not start latency
+
+
+def test_prejoin_off_during_debounce_then_stream_end_leaves_after_idle_grace():
+    sup = make(prejoin_voice=True, debounce=5.0, idle_grace=30.0)
+    assert has(idle_in_channel(sup), _join_cls())
+    sup.handle(TargetVoiceChanged(IN), 1.0)
+    sup.handle(StreamStarted(stream()), 1.0)  # in the start debounce
+    assert not has(sup.handle(_ev("PrejoinChanged")(False), 2.0), LeaveVoice_cls())
+    sup.handle(TargetVoiceChanged(NOT_SHARING), 3.0)  # ends before the start
+    assert not has(sup.handle(Tick(), 32.9), LeaveVoice_cls())
+    assert has(sup.handle(Tick(), 33.0), LeaveVoice_cls())
+
+
+def test_prejoin_retry_resets_after_confirmed_join():
+    sup = make(prejoin_voice=True, retry_delays=(5.0, 10.0))
+    assert has(idle_in_channel(sup), _join_cls())
+    sup.handle(_ev("PrejoinFailed")("boom"), 1.0)
+    assert has(sup.handle(Tick(), 6.0), _join_cls())
+    sup.handle(RelayVoiceObserved("vs", CH), 6.5)  # the pre-join landed in the main channel
+    sup.handle(_ev("PrejoinFailed")("boom"), 7.0)
+    assert has(sup.handle(Tick(), 12.0), _join_cls())  # first delay again, not the second
