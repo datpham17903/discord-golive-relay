@@ -126,7 +126,7 @@ def test_publish_and_end_order() -> None:
         await a.start("tok")
         codec = await a.publish(5, 30, "SRC", CHAN)
         assert codec == "H264"
-        assert events == [OutJoined(USER, 5, "sess"), MirrorParticipants(USER, frozenset()), OutReady(USER, 5, "H264")]
+        assert events == [OutJoined(USER, 5, "sess"), MirrorParticipants(USER, frozenset(), CHAN), OutReady(USER, 5, "H264")]
         connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
         assert connect["self_mute"] is True and connect["reconnect"] is False and connect["timeout"] == 15
         cs = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "create_stream")
@@ -233,12 +233,12 @@ def test_publish_joins_passed_channel_and_emits_participants() -> None:
         a._client.voice_states = {77: {5: object(), 6: object()}}
         await a.publish(5, 30, "SRC", 77)
         assert ("get_channel", 77) in calls
-        assert MirrorParticipants(USER, frozenset({5, 6})) in events
+        assert MirrorParticipants(USER, frozenset({5, 6}), 77) in events
         events.clear()
         a._client.voice_states = {77: {5: object()}}
         await a._client.on_voice_state_update(
             NS(id=6), NS(channel=NS(id=77)), NS(channel=None))
-        assert events == [MirrorParticipants(USER, frozenset({5}))]
+        assert events == [MirrorParticipants(USER, frozenset({5}), 77)]
         events.clear()
         await a._client.on_voice_state_update(NS(id=6), NS(channel=NS(id=3)), NS(channel=NS(id=4)))
         assert events == []

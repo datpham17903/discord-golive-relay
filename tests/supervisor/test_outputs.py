@@ -292,13 +292,13 @@ def test_main_channel_change_moves_non_mirror_accounts_next_session():
 def test_excluded_viewer_in_mirror_stops_only_that_account():
     p = make(mirrors={MCH: B}, excluded=(555,))
     t = bring_live(p)
-    assert p.handle(MirrorParticipants(B, frozenset({1, 2})), t + 1) == []
-    acts = p.handle(MirrorParticipants(B, frozenset({555})), t + 2)
+    assert p.handle(MirrorParticipants(B, frozenset({1, 2}), MCH), t + 1) == []
+    acts = p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2)
     assert acts == [OutCloseGate(B, "excluded_viewer"), OutTeardown(B, 1, StopReason.EXCLUDED_VIEWER)]
     assert p.handle(OutTick(), t + 60) == []  # no backoff restart while the viewer is present
     assert p.account_live(A, 1, 1)
-    assert p.handle(MirrorParticipants(A, frozenset({555})), t + 61) == []  # main channel: supervisor's rule
-    assert p.handle(MirrorParticipants(B, frozenset()), t + 62) == [OutStart(B, 1, MCH)]
+    assert p.handle(MirrorParticipants(A, frozenset({555}), MCH), t + 61) == []  # main channel: supervisor's rule
+    assert p.handle(MirrorParticipants(B, frozenset(), MCH), t + 62) == [OutStart(B, 1, MCH)]
 
 
 def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
@@ -308,3 +308,11 @@ def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
     assert p.handle(OutTick(), 10.0) == []
     assert p.set_routing(Routing(SRC, CH, {MCH: B})) == []
     assert p.status(10.0)[1]["state"] == "fatal"
+
+
+def test_stale_channel_participants_ignored_after_mirror_move():
+    p = make(mirrors={MCH: B}, excluded=(555,))
+    t = bring_live(p)
+    # B is routed to a new channel; an event from the old channel must not block it
+    assert p.handle(MirrorParticipants(B, frozenset({555}), 999), t + 1) == []
+    assert p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2) != []

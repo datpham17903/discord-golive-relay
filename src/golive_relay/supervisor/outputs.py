@@ -330,7 +330,7 @@ class OutputPool:
 
     def _on_participants(self, ev: MirrorParticipants, out: list[PoolAction]) -> None:
         rec = self._accts.get(ev.account)
-        if rec is None or not self._is_mirror(ev.account):
+        if rec is None or not self._is_mirror(ev.account) or ev.channel_id != self.channel_of(ev.account):
             return
         blocked = bool(self._excluded & ev.participants)
         if blocked == rec.blocked:

@@ -121,6 +121,7 @@ class MirrorParticipants:
 
     account: int
     participants: frozenset[int]
+    channel_id: int
 
 
 @dataclass(frozen=True, slots=True)

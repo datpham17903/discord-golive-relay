@@ -104,7 +104,7 @@ class OutputAccountAdapter:
         guild = self._client.get_guild(self.guild_id)
         channel = guild.get_channel(self.channel_id) if guild else None
         if channel is not None:
-            self._events(MirrorParticipants(self.user_id, frozenset(channel.voice_states)))
+            self._events(MirrorParticipants(self.user_id, frozenset(channel.voice_states), self.channel_id))
 
     async def publish(self, generation: int, fps: int, source: Any, channel_id: int) -> str | None:
         """Join ``channel_id``, create the Go Live and play ``source``; returns the negotiated video codec."""
