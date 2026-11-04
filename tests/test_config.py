@@ -346,3 +346,12 @@ def test_control_is_operator_by_user_role_or_neither() -> None:
     assert c.is_operator(1, frozenset())
     assert c.is_operator(2, frozenset({10, 11}))
     assert not c.is_operator(2, frozenset({11}))
+
+
+def test_control_config_rejects_bad_command_channel_and_missing_operators(tmp_path: Path):
+    raw = _raw()
+    for bad in (7, "abc", "-7", "0", ["7"]):
+        raw["control"] = {"command_channel_id": bad}
+        assert any("control.command_channel_id" in e for e in _errors(tmp_path, raw)), bad
+    raw["control"] = {"chat_commands": True}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))

@@ -198,10 +198,6 @@ class _Reader:
             if key not in self._seen:
                 self.errors.append(f"{self.name}.{key}: unknown key")
 
-    def _get_optional(self, key: str) -> Any:
-        self._seen.add(key)
-        return self.data.get(key)
-
     def id(self, key: str) -> int:
         v = self._get(key)
         if isinstance(v, str) and v.isascii() and v.isdigit() and int(v) > 0:
@@ -472,7 +468,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     logging = LoggingConfig(r.str_("level", tuple(sorted(_LOG_LEVELS))), r.only_false("include_media"), r.opt_bool("network_stats"))
     r.finish()
 
-    control = _control(top._get_optional("control"), errors)
+    control = _control(_optional(top, "control", None), errors)
     top.finish()
 
     if errors:
