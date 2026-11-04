@@ -116,6 +116,14 @@ class OutVoiceObserved:
 
 
 @dataclass(frozen=True, slots=True)
+class MirrorParticipants:
+    """Voice participants of the channel the account is assigned to, seen by the account's own client."""
+
+    account: int
+    participants: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
 class OutAuthRejected:
     account: int
 
@@ -127,7 +135,7 @@ class OutTick:
 
 PoolEvent = (
     SessionLive | SessionHold | SessionEnded | OutJoined | OutReady | OutFailed | OutHealth
-    | OutVoiceObserved | OutAuthRejected | OutTick
+    | OutVoiceObserved | MirrorParticipants | OutAuthRejected | OutTick
 )
 
 
@@ -140,6 +148,7 @@ class OutStart:
 
     account: int
     generation: int
+    channel_id: int
 
 
 @dataclass(frozen=True, slots=True)

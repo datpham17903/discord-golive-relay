@@ -267,7 +267,7 @@ class FakeOutAdapter:
     async def start(self, token: str) -> None:
         self.calls.append("start")
 
-    async def publish(self, g, fps, source):
+    async def publish(self, g, fps, source, channel_id):
         from golive_relay.supervisor.outputs_model import OutJoined, OutReady
 
         self.calls.append("publish")

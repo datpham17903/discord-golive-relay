@@ -16,7 +16,7 @@ from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
 from golive_relay.supervisor.outputs_model import (
-    OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved, PoolEvent,
+    MirrorParticipants, OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved, PoolEvent,
 )
 
 CONNECT_TIMEOUT_S = 15
@@ -61,6 +61,7 @@ class OutputAccountAdapter:
     async def start(self, token: str) -> None:
         """Log in and wait for READY. ``LoginFailure`` -> OutAuthRejected (nothing is left running)."""
         self._client = self._client_factory()
+        self._client.on_voice_state_update = self._on_member_voice
         self._gateway_task = asyncio.create_task(self._client.start(token))
         ready = asyncio.create_task(self._client.wait_until_ready())
         try:
@@ -95,8 +96,19 @@ class OutputAccountAdapter:
 
         return OutputParentVoiceClient
 
-    async def publish(self, generation: int, fps: int, source: Any) -> str | None:
-        """Join, create the Go Live and play ``source``; returns the negotiated video codec."""
+    async def _on_member_voice(self, member: Any, before: Any, after: Any) -> None:
+        if self.channel_id in (getattr(before.channel, "id", None), getattr(after.channel, "id", None)):
+            self._emit_participants()
+
+    def _emit_participants(self) -> None:
+        guild = self._client.get_guild(self.guild_id)
+        channel = guild.get_channel(self.channel_id) if guild else None
+        if channel is not None:
+            self._events(MirrorParticipants(self.user_id, frozenset(channel.voice_states)))
+
+    async def publish(self, generation: int, fps: int, source: Any, channel_id: int) -> str | None:
+        """Join ``channel_id``, create the Go Live and play ``source``; returns the negotiated video codec."""
+        self.channel_id = channel_id
         guild = self._client.get_guild(self.guild_id)
         channel = guild.get_channel(self.channel_id) if guild else None
         if channel is None:
@@ -105,6 +117,7 @@ class OutputAccountAdapter:
             cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
         self._events(OutJoined(self.user_id, generation, self._vc.session_id))
+        self._emit_participants()
         self._out = await self._vc.create_stream(
             cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
         )

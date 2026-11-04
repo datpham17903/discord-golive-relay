@@ -2,6 +2,7 @@ import random
 
 from golive_relay.supervisor.model import FatalReason, HoldReason, StopReason
 from golive_relay.supervisor.outputs import OutputPool
+from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.outputs_model import (
     AccountPersisted,
     OutAuthRejected,
@@ -19,6 +20,7 @@ from golive_relay.supervisor.outputs_model import (
     OutTeardown,
     OutTick,
     OutputAccount,
+    MirrorParticipants,
     OutVoiceObserved,
     SessionEnded,
     SessionHold,
@@ -28,15 +30,18 @@ from golive_relay.supervisor.retry import RetryPolicy
 
 CH = 500
 A, B, C = 11, 12, 13
+SRC = 99
+MCH = 600
 
 
-def make(ids=(A, B), persisted=None, limit=3):
+def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=()):
     return OutputPool(
         [OutputAccount(i, f"c{i}") for i in ids],
         persisted or {},
         retry=lambda: RetryPolicy([1.0, 2.0], 30.0, jitter=0.0, rng=random.Random(0)),
         rejection_limit=limit,
-        allowed_channel_id=CH,
+        routing=Routing(SRC, CH, mirrors or {}),
+        excluded_viewer_ids=frozenset(excluded),
     )
 
 
@@ -58,11 +63,11 @@ def bring_live(pool, ids=(A, B), g=1, e=1, inc=7, t=0.0):
 
 def test_start_is_staggered_one_per_window():
     p = make((A, B, C))
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
     assert p.handle(OutTick(), 1.0) == []
-    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1)]
+    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, CH)]
     assert p.handle(OutTick(), 3.9) == []
-    assert p.handle(OutTick(), 4.0) == [OutStart(C, 1)]
+    assert p.handle(OutTick(), 4.0) == [OutStart(C, 1, CH)]
     assert p.handle(OutTick(), 9.0) == []
 
 
@@ -167,12 +172,12 @@ def test_healthy_observation_and_joining_exempt():
 def test_auth_rejected_is_fatal_and_blocks_start():
     p = make((A, B))
     assert p.handle(OutAuthRejected(A), 0.0) == [OutSetFatal(A, FatalReason.AUTH_REJECTED, "")]
-    assert p.handle(SessionLive(1, 1, 7), 1.0) == [OutStart(B, 1)]
+    assert p.handle(SessionLive(1, 1, 7), 1.0) == [OutStart(B, 1, CH)]
 
 
 def test_persisted_fatal_not_started():
     p = make((A, B), {A: AccountPersisted(FatalReason.AUTH_REJECTED, None, 0)})
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(B, 1)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(B, 1, CH)]
     assert p.handle(OutTick(), 5.0) == []
 
 
@@ -182,7 +187,7 @@ def test_backoff_retry_only_while_live():
     acts = p.handle(OutFailed(A, 1, StopReason.CONNECT_FAILED, True), t + 1)
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.handle(OutTick(), t + 1.5) == []
-    assert p.handle(OutTick(), t + 2.0) == [OutStart(A, 1)]
+    assert p.handle(OutTick(), t + 2.0) == [OutStart(A, 1, CH)]
     # fail again, then the session ends during backoff: no restart
     p.handle(OutFailed(A, 1, StopReason.CONNECT_FAILED, True), t + 3)
     p.handle(SessionEnded(1, StopReason.HOLD_EXPIRED, False), t + 3.5)
@@ -211,7 +216,7 @@ def test_non_retryable_failure_off_until_next_session():
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.handle(OutTick(), t + 50) == []
     assert p.handle(SessionLive(1, 2, 7), t + 51) == []  # same session
-    assert p.handle(SessionLive(2, 1, 7), t + 52) == [OutStart(A, 2)]
+    assert p.handle(SessionLive(2, 1, 7), t + 52) == [OutStart(A, 2, CH)]
 
 
 def test_stale_generation_ignored():
@@ -240,3 +245,66 @@ def test_one_account_failure_leaves_others_live():
     assert p.account_live(B, 1, 1)
     p.handle(OutVoiceObserved(A, "x", None), t + 2)  # A has no voice: ignored
     assert p.account_live(B, 1, 1)
+
+
+def test_mirror_account_not_displaced_in_its_channel():
+    p = make(mirrors={MCH: B})
+    assert p.channel_of(A) == CH and p.channel_of(B) == MCH
+    t = bring_live(p)
+    assert p.handle(OutVoiceObserved(B, f"vs{B}", MCH), t + 1) == []
+    assert p.handle(OutVoiceObserved(A, f"vs{A}", CH), t + 1) == []
+    acts = p.handle(OutVoiceObserved(B, f"vs{B}", CH), t + 2)  # pulled elsewhere
+    assert OutSetQuarantine(B, 7) in acts
+
+
+def test_start_carries_assigned_channel():
+    p = make(mirrors={MCH: B})
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
+    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, MCH)]
+
+
+def test_set_routing_restarts_only_moved_account():
+    p = make(mirrors={})
+    t = bring_live(p)
+    acts = p.set_routing(Routing(SRC, CH, {MCH: B}))
+    assert acts == [OutCloseGate(B, "routing_changed"), OutTeardown(B, 1, StopReason.ROUTING_CHANGED)]
+    assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, MCH)]
+    pool_ready = p.handle(OutJoined(B, 1, "vsB2"), t + 2.0)
+    assert pool_ready == []
+    p.handle(OutReady(B, 1, "H264"), t + 2.5)
+    # removing the mirror moves B back to main; A untouched
+    acts = p.set_routing(Routing(SRC, CH, {}))
+    assert [a.account for a in acts] == [B, B]
+    assert p.set_routing(Routing(SRC, CH, {})) == []
+
+
+def test_main_channel_change_moves_non_mirror_accounts_next_session():
+    p = make(mirrors={MCH: B})
+    t = bring_live(p)
+    assert p.set_routing(Routing(SRC, 700, {MCH: B})) == []
+    assert p.account_live(A, 1, 1) and p.account_live(B, 1, 1)
+    p.handle(SessionEnded(1, StopReason.DISABLED, False), t + 1)
+    acts = p.handle(SessionLive(2, 1, 8), t + 10)
+    assert acts == [OutStart(A, 2, 700)]
+    assert p.handle(OutTick(), t + 12) == [OutStart(B, 2, MCH)]
+
+
+def test_excluded_viewer_in_mirror_stops_only_that_account():
+    p = make(mirrors={MCH: B}, excluded=(555,))
+    t = bring_live(p)
+    assert p.handle(MirrorParticipants(B, frozenset({1, 2})), t + 1) == []
+    acts = p.handle(MirrorParticipants(B, frozenset({555})), t + 2)
+    assert acts == [OutCloseGate(B, "excluded_viewer"), OutTeardown(B, 1, StopReason.EXCLUDED_VIEWER)]
+    assert p.handle(OutTick(), t + 60) == []  # no backoff restart while the viewer is present
+    assert p.account_live(A, 1, 1)
+    assert p.handle(MirrorParticipants(A, frozenset({555})), t + 61) == []  # main channel: supervisor's rule
+    assert p.handle(MirrorParticipants(B, frozenset()), t + 62) == [OutStart(B, 1, MCH)]
+
+
+def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
+    p = make(mirrors={MCH: B}, persisted={B: AccountPersisted(FatalReason.AUTH_REJECTED, None, 0)})
+    assert p.channel_of(B) == MCH
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
+    assert p.handle(OutTick(), 10.0) == []
+    assert p.set_routing(Routing(SRC, CH, {MCH: B})) == []
+    assert p.status(10.0)[1]["state"] == "fatal"

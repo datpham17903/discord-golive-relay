@@ -125,7 +125,8 @@ class Service:
             accounts, {a.user_id: account_view(st, a.user_id) for a in accounts},
             retry=lambda: RetryPolicy(r.retry_delays_seconds, r.retry_cooldown_seconds),
             rejection_limit=r.repeated_rejection_limit,
-            allowed_channel_id=cfg.discord.allowed_voice_channel_id,
+            routing=self.sup.routing,
+            excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
         )
         self._out_pubs: dict[int, Publisher] = {
             a.user_id: Publisher(self._out_gate(a.user_id), on_need_idr=self._need_idr) for a in accounts
@@ -342,6 +343,8 @@ class Service:
                     if self._adapter is not None:
                         self._adapter.target_id = r.target_user_id
                         self._adapter.channel_id = r.channel_id
+                    for pa in self.pool.set_routing(r):
+                        self._pool_action(pa)
                 case StartConnect():
                     self._start_connect(a)
                 case CreateOutput(generation=g):
@@ -387,7 +390,7 @@ class Service:
     def _pool_action(self, a: Any) -> None:
         self.metrics.inc(f"action.{type(a).__name__}")
         match a:
-            case OutStart(account=uid, generation=g):
+            case OutStart(account=uid, generation=g, channel_id=ch):
                 if self._canvas is None or self._profile is None:
                     self._pool_event(OutFailed(uid, g, StopReason.CONNECT_FAILED, True, "no canvas"))
                 else:
@@ -395,7 +398,7 @@ class Service:
                     p = self._profile
                     source = RelayMediaSource(
                         self._out_pubs[uid], VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000))
-                    self._out_queue(uid, self._out_publish, uid, g, p.fps, source)
+                    self._out_queue(uid, self._out_publish, uid, g, p.fps, source, ch)
             case OutSetLive(account=uid, generation=g, epoch=e):
                 pub = self._out_pubs[uid]
                 pub.set_slate(self._slate)
@@ -434,7 +437,7 @@ class Service:
         self._out_tasks.add(task)
         task.add_done_callback(self._out_tasks.discard)
 
-    async def _out_publish(self, uid: int, g: int, fps: int, source: Any) -> None:
+    async def _out_publish(self, uid: int, g: int, fps: int, source: Any, channel_id: int) -> None:
         if uid in self._out_misconfigured:
             self._pool_event(OutFailed(uid, g, StopReason.CONFIG_INVALID, False, "token belongs to another account"))
             return
@@ -445,7 +448,7 @@ class Service:
             adapter = self._out_adapters.get(uid)
             if adapter is None:
                 raise RuntimeError("output account not logged in")
-            await adapter.publish(g, fps, source)
+            await adapter.publish(g, fps, source, channel_id)
         except Exception as exc:
             self._pool_event(OutFailed(uid, g, StopReason.CONNECT_FAILED, True, repr(exc)))
 
