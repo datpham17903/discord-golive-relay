@@ -36,7 +36,7 @@ from golive_relay.supervisor.outputs_model import (
 from golive_relay.supervisor.retry import RetryPolicy
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
 from golive_relay.supervisor.model import (
-    ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
+    ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
     FatalReason, FirstFrame, FreshFrame, Joined, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
@@ -338,6 +338,10 @@ class Service:
                     self._send(SetOutput(g, e, True))
                     inc = self.sup.status(time.monotonic()).source_incarnation
                     self._pool_event(SessionLive(g, e, 0 if inc is None else inc))
+                case ApplyRouting(routing=r):
+                    if self._adapter is not None:
+                        self._adapter.target_id = r.target_user_id
+                        self._adapter.channel_id = r.channel_id
                 case StartConnect():
                     self._start_connect(a)
                 case CreateOutput(generation=g):

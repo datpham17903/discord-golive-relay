@@ -5,11 +5,12 @@ from __future__ import annotations
 import pytest
 
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
+from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.model import (
-    AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
+    ApplyRouting, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
     EnableChanged, Exit, FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState,
     HoldReason, Joined, OpenGate, OutputReady, ParticipantsChanged, QuarantineRecord, RebuildPipeline,
-    RelayState, RelayVoiceObserved, RequestInputKeyframe, ResetFatal, SetFatalLatch, SetQuarantine,
+    RelayState, RelayVoiceObserved, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine,
     SetRejections, ShowSlate, Shutdown, SourceProgress, SourceStream, StartConnect, StopReason, StreamEnded,
     StreamStarted, StreamUpdated, TargetVoice, TargetVoiceChanged, Teardown, Tick, Watching, WorkerFailed,
 )
@@ -801,3 +802,63 @@ def test_status_fields():
     assert st.source_incarnation == 1 and st.gateway == "fresh" and st.voice_session_baseline == "s1"
     assert st.last_source_progress_age == 1.25 and st.gate_failed == ()
     assert st.desired_enabled is True and st.fatal is None
+
+
+# --------------------------------------------------------------- routing
+
+
+def test_target_change_while_live_stops_and_restarts_with_new_target():
+    sup = make()
+    g, e = relaying(sup)
+    acts = sup.handle(RoutingChanged(Routing(2, CH, {})), 2.0)
+    assert isinstance(acts[0], CloseGate)
+    td = find(acts, Teardown)
+    assert td.reason is StopReason.ROUTING_CHANGED and td.leave_voice is False and td.generation == g
+    assert acts.index(td) < acts.index(find(acts, ApplyRouting))
+    assert not sup.gate_allows(g, e, 2.0) and sup.generation == g + 1
+    assert sup.routing.target_user_id == 2 and sup.status(2.0).state is RelayState.IDLE
+    sup.handle(GatewaySnapshot(IN, stream(owner_id=2, key="k2"), frozenset({2}), False), 3.0)
+    acts = sup.handle(Tick(), 3.5)
+    assert has(acts, StartConnect, generation=g + 1) and find(acts, StartConnect).stream.owner_id == 2
+
+
+def test_channel_change_leaves_voice():
+    sup = make()
+    relaying(sup)
+    acts = sup.handle(RoutingChanged(Routing(SRC, OTHER, {})), 2.0)
+    assert find(acts, Teardown).leave_voice is True
+    assert sup.routing.channel_id == OTHER
+
+
+def test_target_change_same_channel_keeps_voice():
+    sup = make()
+    relaying(sup)
+    acts = sup.handle(RoutingChanged(Routing(2, CH, {})), 2.0)
+    assert find(acts, Teardown).leave_voice is False
+
+
+def test_routing_change_while_disabled_only_updates_cfg():
+    sup = make(enabled=False)
+    acts = sup.handle(RoutingChanged(Routing(2, OTHER, {5: 6})), 1.0)
+    assert acts == [ApplyRouting(Routing(2, OTHER, {5: 6}))]
+    assert sup.status(1.0).state is RelayState.DISABLED and sup.routing.mirrors == {5: 6}
+
+
+def test_routing_change_is_not_a_rejection():
+    q = QuarantineRecord(SRC, "k", 1, 0.0)
+    sup = make(quarantine=q, rej=2)
+    sup.handle(RoutingChanged(Routing(2, CH, {})), 1.0)
+    st = sup.status(1.0)
+    assert st.consecutive_rejections == 2 and st.backoff_until is None and sup.quarantine == q
+    sup2 = make()
+    relaying(sup2)
+    acts = sup2.handle(RoutingChanged(Routing(2, CH, {})), 2.0)
+    assert not has(acts, SetRejections) and sup2.status(2.0).backoff_until is None
+
+
+def test_mirrors_only_change_does_not_stop():
+    sup = make()
+    relaying(sup)
+    acts = sup.handle(RoutingChanged(Routing(SRC, CH, {5: 6})), 2.0)
+    assert acts == [ApplyRouting(Routing(SRC, CH, {5: 6}))]
+    assert sup.status(2.0).state is RelayState.RELAYING

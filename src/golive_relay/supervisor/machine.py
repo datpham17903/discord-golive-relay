@@ -10,20 +10,22 @@ from __future__ import annotations
 
 import random
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 
 from .liveness import LivenessTracker
 from .model import (
-    Action, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
+    Action, ApplyRouting, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
     DURABLE_FATAL, EnableChanged, Event, Exit, FatalReason, FirstFrame, FreshFrame, GateFacts, GatewayChanged,
     GatewaySnapshot, GatewayState, HoldReason, InboundHealth, Joined, LeaveVoice, Liveness, OpenGate, OutputHealth,
     OutputReady, ParticipantsChanged, QuarantineRecord, RebuildPipeline, RelayState, RelayVoiceObserved,
-    RequestInputKeyframe, ResetFatal, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
+    RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, SourceStream, StartConnect, StatusSnapshot, StopReason, StreamEnded, StreamStarted,
     StreamUpdated, TargetVoice, TargetVoiceChanged, Teardown, Tick, Watching, WorkerFailed,
 )
 from .ownership import OwnershipDetector, OwnershipVerdict
 from .predicate import evaluate_gate
+from .routing import Routing
 from .retry import RetryPolicy
 
 _SESSION = frozenset({RelayState.CONNECTING, RelayState.RELAYING, RelayState.HOLD})
@@ -68,8 +70,12 @@ class PersistedStateView:
 
 
 class Supervisor:
-    def __init__(self, cfg: SupervisorConfig, persisted: PersistedStateView, rng: random.Random | None = None) -> None:
+    def __init__(
+        self, cfg: SupervisorConfig, persisted: PersistedStateView, rng: random.Random | None = None,
+        mirrors: Mapping[int, int] | None = None,
+    ) -> None:
         self.cfg = cfg
+        self._mirrors: Mapping[int, int] = dict(mirrors or {})
         self.desired_enabled = persisted.desired_enabled
         self.fatal = persisted.fatal_reason if persisted.fatal_reason in DURABLE_FATAL else None
         self.quarantine = persisted.quarantine
@@ -93,6 +99,10 @@ class Supervisor:
         self.state = self._enable_state()
 
     # ------------------------------------------------------------ public
+
+    @property
+    def routing(self) -> Routing:
+        return Routing(self.cfg.target_user_id, self.cfg.allowed_channel_id, self._mirrors)
 
     def handle(self, event: Event, now: float) -> list[Action]:
         acts: list[Action] = []
@@ -227,6 +237,8 @@ class Supervisor:
                         self.state = self._enable_state()
                 elif self.state not in (RelayState.DISABLED, RelayState.FATAL):
                     self._stop(StopReason.DISABLED, now, acts)
+            case RoutingChanged(routing=r):
+                self._apply_routing(r, now, acts)
             case ResetFatal():
                 if self.state is RelayState.FATAL and self.fatal in DURABLE_FATAL:
                     reset = self.fatal is FatalReason.RELAY_REJECTED_BY_SERVER
@@ -310,6 +322,27 @@ class Supervisor:
             case _:
                 pass  # stale or irrelevant for the current state
 
+    def _apply_routing(self, r: Routing, now: float, acts: list[Action]) -> None:
+        """Not a rejection: no backoff, quarantine and fatal latch are left as they are."""
+        cfg = self.cfg
+        self._mirrors = dict(r.mirrors)
+        if (r.target_user_id, r.channel_id) == (cfg.target_user_id, cfg.allowed_channel_id):
+            acts.append(ApplyRouting(self.routing))
+            return
+        channel_changed = r.channel_id != cfg.allowed_channel_id
+        if self.state in _SESSION:
+            self._stop(StopReason.ROUTING_CHANGED, now, acts, keep_voice=not channel_changed)
+        elif channel_changed and self._in_voice:
+            acts.append(LeaveVoice(StopReason.ROUTING_CHANGED.value))
+            self._in_voice = False
+            self._leave_at = None
+        self.cfg = replace(cfg, target_user_id=r.target_user_id, allowed_channel_id=r.channel_id)
+        if self.state not in (RelayState.DISABLED, RelayState.FATAL):
+            self.state = self._enable_state()
+            self._debounce_since = None
+            self._backoff_until = None
+        acts.append(ApplyRouting(self.routing))
+
     def _mine(self, s: SourceStream | None) -> SourceStream | None:
         """Only the configured target's streams matter; anyone else's are ignored."""
         return s if s is not None and s.owner_id == self.cfg.target_user_id else None
@@ -382,11 +415,12 @@ class Supervisor:
     # -------------------------------------------------------------- stop
 
     def _stop(
-        self, reason: StopReason, now: float, acts: list[Action], retryable: bool = True, detail: str = ""
+        self, reason: StopReason, now: float, acts: list[Action], retryable: bool = True, detail: str = "",
+        keep_voice: bool = False,
     ) -> None:
         in_session = self.state in _SESSION
         ss, media = self._session_stream, self._media_seen
-        keep_voice = reason is StopReason.SOURCE_STOPPED and self._in_voice
+        keep_voice = (reason is StopReason.SOURCE_STOPPED or keep_voice) and self._in_voice
         acts.append(CloseGate(reason.value))
         if in_session:
             acts.append(Teardown(self.generation, not keep_voice, reason))
