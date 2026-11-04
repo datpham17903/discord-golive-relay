@@ -267,22 +267,22 @@ def test_start_carries_assigned_channel():
 def test_set_routing_restarts_only_moved_account():
     p = make(mirrors={})
     t = bring_live(p)
-    acts = p.set_routing(Routing(SRC, CH, {MCH: B}))
+    acts = p.set_routing(Routing(SRC, CH, {MCH: B}), t)
     assert acts == [OutCloseGate(B, "routing_changed"), OutTeardown(B, 1, StopReason.ROUTING_CHANGED)]
     assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, 2, MCH)]
     pool_ready = p.handle(OutJoined(B, 1, 2, "vsB2"), t + 2.0)
     assert pool_ready == []
     p.handle(OutReady(B, 1, 2, "H264"), t + 2.5)
     # removing the mirror moves B back to main; A untouched
-    acts = p.set_routing(Routing(SRC, CH, {}))
+    acts = p.set_routing(Routing(SRC, CH, {}), t + 2.5)
     assert [a.account for a in acts] == [B, B]
-    assert p.set_routing(Routing(SRC, CH, {})) == []
+    assert p.set_routing(Routing(SRC, CH, {}), t + 2.5) == []
 
 
 def test_main_channel_change_moves_non_mirror_accounts_next_session():
     p = make(mirrors={MCH: B})
     t = bring_live(p)
-    assert p.set_routing(Routing(SRC, 700, {MCH: B})) == []
+    assert p.set_routing(Routing(SRC, 700, {MCH: B}), t) == []
     assert p.account_live(A, 1, 1) and p.account_live(B, 1, 1)
     p.handle(SessionEnded(1, StopReason.DISABLED, False), t + 1)
     acts = p.handle(SessionLive(2, 1, 8), t + 10)
@@ -307,7 +307,7 @@ def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
     assert p.channel_of(B) == MCH
     assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     assert p.handle(OutTick(), 10.0) == []
-    assert p.set_routing(Routing(SRC, CH, {MCH: B})) == []
+    assert p.set_routing(Routing(SRC, CH, {MCH: B}), 10.0) == []
     assert p.status(10.0)[1]["state"] == "fatal"
 
 
@@ -317,7 +317,7 @@ def test_stale_channel_participants_ignored_after_mirror_move():
     assert p.handle(MirrorParticipants(B, frozenset({555}), 999), t + 1) == []
     # move B to a new channel; a stale event from the old channel must not block it
     new_ch = 888
-    p.set_routing(Routing(SRC, CH, {new_ch: B}))
+    p.set_routing(Routing(SRC, CH, {new_ch: B}), t + 1)
     acts = p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2)
     acts += p.handle(OutTick(), t + 4)
     assert acts == [OutStart(B, 1, 2, new_ch)]
@@ -327,9 +327,9 @@ def test_events_of_superseded_attempt_in_same_generation_ignored():
     # mirror then unmirror while the first join is still in flight: same generation, new attempt
     p = make(mirrors={})
     t = bring_live(p, (A, B))
-    p.set_routing(Routing(SRC, CH, {MCH: B}))
+    p.set_routing(Routing(SRC, CH, {MCH: B}), t)
     assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, 2, MCH)]
-    acts = p.set_routing(Routing(SRC, CH, {}))
+    acts = p.set_routing(Routing(SRC, CH, {}), t + 2.0)
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.handle(OutTick(), t + 4.0) == [OutStart(B, 1, 3, CH)]
     # the MCH publish (attempt 2) completes late: neither arms nor goes live
@@ -343,3 +343,29 @@ def test_events_of_superseded_attempt_in_same_generation_ignored():
     p.handle(OutJoined(B, 1, 3, "new"), t + 5.0)
     assert p.handle(OutReady(B, 1, 3, "H264"), t + 5.1) == [OutSetLive(B, 1, 1)]
     assert p.handle(OutVoiceObserved(B, "new", CH), t + 5.2) == []
+
+
+def test_set_routing_starts_moved_account_without_waiting_for_tick():
+    p = make(mirrors={})
+    t = bring_live(p)
+    acts = p.set_routing(Routing(SRC, CH, {MCH: B}), t + 5.0)
+    assert acts == [
+        OutCloseGate(B, "routing_changed"), OutTeardown(B, 1, StopReason.ROUTING_CHANGED), OutStart(B, 1, 2, MCH),
+    ]
+
+
+def test_skipped_generation_is_not_restarted_by_routing_or_unblock():
+    p = make(mirrors={}, excluded=(555,))
+    t = bring_live(p)
+    p.handle(OutFailed(B, 1, 1, StopReason.CONNECT_FAILED, False), t)  # non-retryable: wait for next session
+    assert p.set_routing(Routing(SRC, CH, {MCH: B}), t + 5.0) == []
+    assert p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 6.0) == []
+    assert p.handle(MirrorParticipants(B, frozenset(), MCH), t + 7.0) == []
+    assert p.handle(OutTick(), t + 20.0) == []
+
+
+def test_unblocked_mirror_account_starts_in_same_event():
+    p = make(mirrors={MCH: B}, excluded=(555,))
+    t = bring_live(p)
+    p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 1)
+    assert p.handle(MirrorParticipants(B, frozenset(), MCH), t + 10) == [OutStart(B, 1, 2, MCH)]

@@ -112,7 +112,7 @@ class OutputPool:
     def _is_mirror(self, uid: int) -> bool:
         return uid in self._routing.mirrors.values()
 
-    def set_routing(self, routing: Routing) -> list[PoolAction]:
+    def set_routing(self, routing: Routing, now: float) -> list[PoolAction]:
         """Restart only the accounts whose mirror assignment moved them; a main-channel change waits for the next session."""
         out: list[PoolAction] = []
         old_mirrored = set(self._routing.mirrors.values())
@@ -124,8 +124,9 @@ class OutputPool:
             rec.blocked = False
             if self._active(rec):
                 self._stop(rec, "routing_changed", StopReason.ROUTING_CHANGED, out)
-            if self._session is not None and rec.state is OutputState.OFF:
+            if self._restartable(rec):
                 self._enqueue(rec)
+        self._pump(now, out)
         return out
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
@@ -227,6 +228,10 @@ class OutputPool:
         rec.fatal = reason
         rec.state = OutputState.FATAL
         out.append(OutSetFatal(rec.account.user_id, reason, detail))
+
+    def _restartable(self, rec: _Acct) -> bool:
+        s = self._session
+        return s is not None and rec.state is OutputState.OFF and rec.skip_generation != s.generation
 
     def _enqueue(self, rec: _Acct) -> None:
         if not rec.queued:
@@ -340,7 +345,7 @@ class OutputPool:
         if blocked:
             if self._active(rec):
                 self._stop(rec, "excluded_viewer", StopReason.EXCLUDED_VIEWER, out)
-        elif self._session is not None and rec.state is OutputState.OFF:
+        elif self._restartable(rec):
             self._enqueue(rec)
 
     def _pump(self, now: float, out: list[PoolAction]) -> None:

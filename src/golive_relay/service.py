@@ -518,7 +518,7 @@ class Service:
                         adapter.target_id = r.target_user_id
                         adapter.channel_id = r.channel_id
                         asyncio.get_running_loop().call_soon(self._resnapshot, adapter)
-                    for pa in self.pool.set_routing(r):
+                    for pa in self.pool.set_routing(r, time.monotonic()):
                         self._pool_action(pa)
                 case StartConnect():
                     self._start_connect(a)
