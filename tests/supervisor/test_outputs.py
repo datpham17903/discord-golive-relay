@@ -313,6 +313,10 @@ def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
 def test_stale_channel_participants_ignored_after_mirror_move():
     p = make(mirrors={MCH: B}, excluded=(555,))
     t = bring_live(p)
-    # B is routed to a new channel; an event from the old channel must not block it
     assert p.handle(MirrorParticipants(B, frozenset({555}), 999), t + 1) == []
-    assert p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2) != []
+    # move B to a new channel; a stale event from the old channel must not block it
+    new_ch = 888
+    p.set_routing(Routing(SRC, CH, {new_ch: B}))
+    acts = p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2)
+    acts += p.handle(OutTick(), t + 4)
+    assert acts == [OutStart(B, 1, new_ch)]
