@@ -30,7 +30,7 @@ _SILENCE = bytes(AUDIO_FRAME_BYTES)
 
 def _empty_window() -> dict[str, float]:
     return {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0,
-            "audio_played": 0, "audio_held": 0, "audio_late_dropped": 0, "audio_evicted": 0}
+            "audio_played": 0, "audio_held_reads": 0, "audio_late_dropped": 0, "audio_evicted": 0}
 
 
 class Publisher:
@@ -131,7 +131,8 @@ class Publisher:
 
     def take_window(self) -> dict[str, float]:
         """Send counters since the last call: sent, stalls (gaps over 50 ms), max_send_gap_ms, and audio
-        blocks played / held (head not yet due) / late_dropped / evicted (queue overflow)."""
+        blocks played / late_dropped / evicted (queue overflow), and audio_held_reads (silent reads while the
+        head block was not yet due)."""
         with self._lock:
             w, self._window = self._window, _empty_window()
         return w
@@ -210,7 +211,7 @@ class Publisher:
                 return _SILENCE
             while self._audio:
                 if self._audio[0].deadline > now:
-                    self._window["audio_held"] += 1
+                    self._window["audio_held_reads"] += 1
                     return _SILENCE  # hold until the shared-timeline deadline, like video
                 au = self._audio.popleft()
                 if now - au.deadline <= self._max_late:

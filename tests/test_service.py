@@ -509,7 +509,7 @@ def test_status_exposes_audio_counters(tmp_path, slate, source_gop):
     env.svc._adapter = type("A", (), {"take_audio_window": lambda self: {"packets": 50, "silence": 50}})()
     st = env.svc.status_dict()
     assert st["ingress_audio"] == {"packets": 50, "silence": 50}
-    assert {"audio_played", "audio_held", "audio_late_dropped", "audio_evicted"} <= st["ingest_send"].keys()
+    assert {"audio_played", "audio_held_reads", "audio_late_dropped", "audio_evicted"} <= st["ingest_send"].keys()
 
 
 OPERATOR, CMD_CHAN = 50, 60
