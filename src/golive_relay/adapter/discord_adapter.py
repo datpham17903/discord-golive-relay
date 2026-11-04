@@ -391,6 +391,9 @@ class DiscordAdapter:
             self._vc = await channel.connect(
                 cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
             )
+        except BaseException:
+            self._vc = None  # the voice-state echo may already have set it
+            raise
         finally:
             self._voice_state_cb = None
         return self._vc.session_id

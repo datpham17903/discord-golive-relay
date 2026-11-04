@@ -152,3 +152,26 @@ def test_raw_member_role_ids_are_used_over_cached_roles() -> None:
     m.author.roles = []  # role cache incomplete
     a.handle_dispatch("message", m)
     assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE, 702})
+
+
+def test_failed_connect_after_voice_state_echo_clears_voice_client() -> None:
+    a, _ = make()
+    vc = NS(session_id="sess-1")
+
+    class Channel:
+        async def connect(self, cls, **kw):
+            a._own_voice_state(vc, {"channel_id": str(CHAN), "session_id": "sess-1"})
+            raise asyncio.TimeoutError
+
+    a._guild_channel = lambda: Channel()
+
+    async def main():
+        try:
+            await a.join(on_voice_state=lambda: None)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            raise AssertionError("join should fail")
+
+    asyncio.run(main())
+    assert a._vc is None

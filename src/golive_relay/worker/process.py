@@ -687,6 +687,9 @@ def worker_main(ingress: BoundedChannel, egress: BoundedChannel, events: Bounded
 
 # ------------------------------------------------------------------ handle
 
+# multiprocessing's Windows spawn takes no env argument (CreateProcess gets os.environ or a copy of it), so the
+# reduced environment can only be passed by swapping os.environ around proc.start(); spawns now run in threads,
+# so this lock keeps two swaps from interleaving and restoring the wrong environment.
 _spawn_lock = threading.Lock()
 
 
