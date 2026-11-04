@@ -851,9 +851,13 @@ def test_routing_change_is_not_a_rejection():
     st = sup.status(1.0)
     assert st.consecutive_rejections == 2 and st.backoff_until is None and sup.quarantine == q
     sup2 = make()
-    relaying(sup2)
-    acts = sup2.handle(RoutingChanged(Routing(2, CH, {})), 2.0)
-    assert not has(acts, SetRejections) and sup2.status(2.0).backoff_until is None
+    g, _ = relaying(sup2)
+    sup2.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True), 2.0)
+    st = sup2.status(2.0)
+    assert st.state is RelayState.BACKOFF and st.backoff_until == 3.0
+    acts = sup2.handle(RoutingChanged(Routing(2, CH, {})), 2.5)
+    st = sup2.status(2.5)
+    assert not has(acts, SetRejections) and st.state is RelayState.IDLE and st.backoff_until is None
 
 
 def test_mirrors_only_change_does_not_stop():

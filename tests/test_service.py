@@ -283,12 +283,12 @@ class FakeOutAdapter:
     async def start(self, token: str) -> None:
         self.calls.append("start")
 
-    async def publish(self, g, fps, source, channel_id):
+    async def publish(self, g, n, fps, source, channel_id):
         from golive_relay.supervisor.outputs_model import OutJoined, OutReady
 
         self.calls.append("publish")
-        self.events(OutJoined(self.acct.user_id, g, "out-sess"))
-        self.events(OutReady(self.acct.user_id, g, "H264"))
+        self.events(OutJoined(self.acct.user_id, g, n, "out-sess"))
+        self.events(OutReady(self.acct.user_id, g, n, "H264"))
         return "H264"
 
     async def end(self) -> None:
@@ -535,6 +535,33 @@ def test_chat_target_command_persists_and_restarts(tmp_path, slate, source_gop):
     assert "chat_command" in env.logs
 
 
+def test_target_change_during_resume_resnapshots_when_fresh(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.model import GatewayChanged, GatewayState
+
+    env = Env(tmp_path, slate, source_gop)
+    new_target = 777
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        a.events(GatewayChanged(GatewayState.RESUMING))
+        await wait_until(lambda: env.svc.sup.gateway is GatewayState.RESUMING)
+        stream = SourceStream("key-2", new_target, env.chan, 2, None, False)
+        a.snap = GatewaySnapshot(TargetVoice(env.chan, True), stream, frozenset({new_target}), False)
+        snaps = a.calls.count("snapshot")
+        chat(env, f"!relay target {new_target}")
+        await wait_until(lambda: env.svc.sup.routing.target_user_id == new_target)
+        await asyncio.sleep(0.1)
+        assert a.calls.count("snapshot") == snaps  # the cache is not trusted while resuming
+        a.events(GatewayChanged(GatewayState.FRESH))
+        await wait_until(lambda: a.calls.count("snapshot") == snaps + 1)
+        assert env.svc.sup.stream is not None and env.svc.sup.stream.owner_id == new_target
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
 def test_chat_rejection_and_status_reply_without_state_change(tmp_path, slate, source_gop):
     env = Env(tmp_path, slate, source_gop)
 
@@ -611,9 +638,9 @@ def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source
     outs: list = []
 
     class ChannelOut(FakeOutAdapter):
-        async def publish(self, g, fps, source, channel_id):
+        async def publish(self, g, n, fps, source, channel_id):
             self.calls.append(("channel", channel_id))
-            return await super().publish(g, fps, source, channel_id)
+            return await super().publish(g, n, fps, source, channel_id)
 
     def out_factory(acct, events, log):
         a = ChannelOut(acct, events, [])

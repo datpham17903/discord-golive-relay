@@ -61,6 +61,7 @@ class _Acct:
     rejections: int = 0
     generation: int | None = None  # session generation this account is bound to
     incarnation: int | None = None
+    attempt: int = 0  # per-account OutStart counter; events carry it back
     backoff_until: float | None = None
     skip_generation: int | None = None  # non-retryable failure: wait for the next session
     counted_inc: int | None = None  # incarnation whose displacement was already counted
@@ -165,13 +166,13 @@ class OutputPool:
         elif isinstance(event, SessionEnded):
             self._on_ended(event, out)
         elif isinstance(event, OutJoined):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and rec.state is OutputState.JOINING:
                 rec.detector.arm(event.voice_session_id)
         elif isinstance(event, OutReady):
             self._on_ready(event, now, out)
         elif isinstance(event, OutFailed):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and self._active(rec):
                 if event.retryable:
                     self._backoff(rec, event.reason, now, out)
@@ -179,7 +180,7 @@ class OutputPool:
                     rec.skip_generation = rec.generation
                     self._stop(rec, "failed", event.reason, out)
         elif isinstance(event, OutHealth):
-            rec = self._current(event.account, event.generation)
+            rec = self._current(event.account, event.generation, event.attempt)
             if rec is not None and not event.ok and self._active(rec):
                 self._backoff(rec, StopReason.OUTPUT_DEAD, now, out)
         elif isinstance(event, OutVoiceObserved):
@@ -203,9 +204,9 @@ class OutputPool:
     def _active(rec: _Acct) -> bool:
         return rec.state in (OutputState.JOINING, OutputState.READY, OutputState.LIVE)
 
-    def _current(self, account: int, generation: int) -> _Acct | None:
+    def _current(self, account: int, generation: int, attempt: int) -> _Acct | None:
         rec = self._accts.get(account)
-        if rec is None or rec.generation is None or rec.generation != generation:
+        if rec is None or rec.generation is None or rec.generation != generation or rec.attempt != attempt:
             return None
         return rec
 
@@ -286,7 +287,7 @@ class OutputPool:
                         out.append(OutSetRejections(uid, 0))
 
     def _on_ready(self, ev: OutReady, now: float, out: list[PoolAction]) -> None:
-        rec = self._current(ev.account, ev.generation)
+        rec = self._current(ev.account, ev.generation, ev.attempt)
         if rec is None or rec.state is not OutputState.JOINING:
             return
         s = self._session
@@ -364,5 +365,6 @@ class OutputPool:
             rec.generation = s.generation
             rec.incarnation = s.incarnation
             rec.detector.disarm()
-            out.append(OutStart(rec.account.user_id, s.generation, self.channel_of(rec.account.user_id)))
+            rec.attempt += 1
+            out.append(OutStart(rec.account.user_id, s.generation, rec.attempt, self.channel_of(rec.account.user_id)))
             self._next_start = now + self._stagger

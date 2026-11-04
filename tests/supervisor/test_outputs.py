@@ -55,28 +55,29 @@ def bring_live(pool, ids=(A, B), g=1, e=1, inc=7, t=0.0):
         while not any(isinstance(a, OutStart) and a.account == i for a in acts):
             t += 2.0
             acts = pool.handle(OutTick(), t)
-        pool.handle(OutJoined(i, g, f"vs{i}"), t)
-        r = pool.handle(OutReady(i, g, "H264"), t)
+        n = next(a.attempt for a in acts if isinstance(a, OutStart) and a.account == i)
+        pool.handle(OutJoined(i, g, n, f"vs{i}"), t)
+        r = pool.handle(OutReady(i, g, n, "H264"), t)
         assert r == [OutSetLive(i, g, e)]
     return t
 
 
 def test_start_is_staggered_one_per_window():
     p = make((A, B, C))
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     assert p.handle(OutTick(), 1.0) == []
-    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, CH)]
+    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, 1, CH)]
     assert p.handle(OutTick(), 3.9) == []
-    assert p.handle(OutTick(), 4.0) == [OutStart(C, 1, CH)]
+    assert p.handle(OutTick(), 4.0) == [OutStart(C, 1, 1, CH)]
     assert p.handle(OutTick(), 9.0) == []
 
 
 def test_ready_h264_goes_live_and_gate():
     p = make((A,))
     p.handle(SessionLive(1, 1, 7), 0.0)
-    p.handle(OutJoined(A, 1, "vs"), 0.1)
+    p.handle(OutJoined(A, 1, 1, "vs"), 0.1)
     assert not p.account_live(A, 1, 1)
-    assert p.handle(OutReady(A, 1, "H264"), 0.2) == [OutSetLive(A, 1, 1)]
+    assert p.handle(OutReady(A, 1, 1, "H264"), 0.2) == [OutSetLive(A, 1, 1)]
     assert p.account_live(A, 1, 1)
     assert not p.account_live(A, 1, 2)
     assert not p.account_live(A, 2, 1)
@@ -85,8 +86,8 @@ def test_ready_h264_goes_live_and_gate():
 def test_ready_other_codec_backs_off_close_before_teardown():
     p = make((A,))
     p.handle(SessionLive(1, 1, 7), 0.0)
-    p.handle(OutJoined(A, 1, "vs"), 0.1)
-    acts = p.handle(OutReady(A, 1, "VP8"), 0.2)
+    p.handle(OutJoined(A, 1, 1, "vs"), 0.1)
+    acts = p.handle(OutReady(A, 1, 1, "VP8"), 0.2)
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.status(0.2)[0]["state"] == "backoff"
 
@@ -95,10 +96,10 @@ def test_hold_slates_live_accounts_and_late_ready_slates():
     p = make((A, B))
     bring_live(p, (A,))
     p.handle(OutTick(), 2.0)  # B starts
-    p.handle(OutJoined(B, 1, "vsb"), 2.1)
+    p.handle(OutJoined(B, 1, 1, "vsb"), 2.1)
     assert p.handle(SessionHold(1, HoldReason.NO_MEDIA), 3.0) == [OutSlate(A, 1)]
     assert not p.account_live(A, 1, 1)
-    assert p.handle(OutReady(B, 1, "H264"), 3.5) == [OutSlate(B, 1)]
+    assert p.handle(OutReady(B, 1, 1, "H264"), 3.5) == [OutSlate(B, 1)]
     assert p.handle(SessionLive(1, 2, 7), 4.0) == [OutSetLive(A, 1, 2), OutSetLive(B, 1, 2)]
     assert p.account_live(A, 1, 2)
 
@@ -163,33 +164,33 @@ def test_ownership_other_session_is_fatal():
 def test_healthy_observation_and_joining_exempt():
     p = make((A,))
     p.handle(SessionLive(1, 1, 7), 0.0)
-    p.handle(OutJoined(A, 1, "vs"), 0.1)
+    p.handle(OutJoined(A, 1, 1, "vs"), 0.1)
     assert p.handle(OutVoiceObserved(A, "other", None), 0.2) == []  # JOINING: exempt
-    p.handle(OutReady(A, 1, "H264"), 0.3)
+    p.handle(OutReady(A, 1, 1, "H264"), 0.3)
     assert p.handle(OutVoiceObserved(A, "vs", CH), 0.4) == []
 
 
 def test_auth_rejected_is_fatal_and_blocks_start():
     p = make((A, B))
     assert p.handle(OutAuthRejected(A), 0.0) == [OutSetFatal(A, FatalReason.AUTH_REJECTED, "")]
-    assert p.handle(SessionLive(1, 1, 7), 1.0) == [OutStart(B, 1, CH)]
+    assert p.handle(SessionLive(1, 1, 7), 1.0) == [OutStart(B, 1, 1, CH)]
 
 
 def test_persisted_fatal_not_started():
     p = make((A, B), {A: AccountPersisted(FatalReason.AUTH_REJECTED, None, 0)})
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(B, 1, CH)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(B, 1, 1, CH)]
     assert p.handle(OutTick(), 5.0) == []
 
 
 def test_backoff_retry_only_while_live():
     p = make((A,))
     t = bring_live(p, (A,))
-    acts = p.handle(OutFailed(A, 1, StopReason.CONNECT_FAILED, True), t + 1)
+    acts = p.handle(OutFailed(A, 1, 1, StopReason.CONNECT_FAILED, True), t + 1)
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.handle(OutTick(), t + 1.5) == []
-    assert p.handle(OutTick(), t + 2.0) == [OutStart(A, 1, CH)]
+    assert p.handle(OutTick(), t + 2.0) == [OutStart(A, 1, 2, CH)]
     # fail again, then the session ends during backoff: no restart
-    p.handle(OutFailed(A, 1, StopReason.CONNECT_FAILED, True), t + 3)
+    p.handle(OutFailed(A, 1, 2, StopReason.CONNECT_FAILED, True), t + 3)
     p.handle(SessionEnded(1, StopReason.HOLD_EXPIRED, False), t + 3.5)
     assert p.handle(OutTick(), t + 100) == []
     assert p.status(t)[0]["state"] == "off"
@@ -198,7 +199,7 @@ def test_backoff_retry_only_while_live():
 def test_backoff_expiry_after_session_end_does_not_start():
     p = make((A,))
     t = bring_live(p, (A,))
-    p.handle(OutHealth(A, 1, False), t + 1)
+    p.handle(OutHealth(A, 1, 1, False), t + 1)
     p.handle(SessionEnded(1, StopReason.SOURCE_STOPPED, True), t + 1.2)
     assert p.handle(OutTick(), t + 50) == []
 
@@ -206,26 +207,26 @@ def test_backoff_expiry_after_session_end_does_not_start():
 def test_health_ok_ignored():
     p = make((A,))
     t = bring_live(p, (A,))
-    assert p.handle(OutHealth(A, 1, True), t + 1) == []
+    assert p.handle(OutHealth(A, 1, 1, True), t + 1) == []
 
 
 def test_non_retryable_failure_off_until_next_session():
     p = make((A,))
     t = bring_live(p, (A,))
-    acts = p.handle(OutFailed(A, 1, StopReason.CONNECT_FAILED, False), t + 1)
+    acts = p.handle(OutFailed(A, 1, 1, StopReason.CONNECT_FAILED, False), t + 1)
     assert kinds(acts) == [OutCloseGate, OutTeardown]
     assert p.handle(OutTick(), t + 50) == []
     assert p.handle(SessionLive(1, 2, 7), t + 51) == []  # same session
-    assert p.handle(SessionLive(2, 1, 7), t + 52) == [OutStart(A, 2, CH)]
+    assert p.handle(SessionLive(2, 1, 7), t + 52) == [OutStart(A, 2, 2, CH)]
 
 
 def test_stale_generation_ignored():
     p = make((A,))
     p.handle(SessionLive(1, 1, 7), 0.0)
-    assert p.handle(OutJoined(A, 0, "x"), 0.1) == []
-    assert p.handle(OutReady(A, 0, "H264"), 0.2) == []
-    assert p.handle(OutFailed(A, 0, StopReason.CONNECT_FAILED, True), 0.3) == []
-    assert p.handle(OutHealth(A, 0, False), 0.4) == []
+    assert p.handle(OutJoined(A, 0, 1, "x"), 0.1) == []
+    assert p.handle(OutReady(A, 0, 1, "H264"), 0.2) == []
+    assert p.handle(OutFailed(A, 0, 1, StopReason.CONNECT_FAILED, True), 0.3) == []
+    assert p.handle(OutHealth(A, 0, 1, False), 0.4) == []
     assert p.status(0.4)[0]["state"] == "joining"
 
 
@@ -240,7 +241,7 @@ def test_new_generation_tears_down_older_bound_accounts_first():
 def test_one_account_failure_leaves_others_live():
     p = make((A, B))
     t = bring_live(p, (A, B))
-    p.handle(OutFailed(A, 1, StopReason.OUTPUT_DEAD, True), t + 1)
+    p.handle(OutFailed(A, 1, 1, StopReason.OUTPUT_DEAD, True), t + 1)
     assert not p.account_live(A, 1, 1)
     assert p.account_live(B, 1, 1)
     p.handle(OutVoiceObserved(A, "x", None), t + 2)  # A has no voice: ignored
@@ -259,8 +260,8 @@ def test_mirror_account_not_displaced_in_its_channel():
 
 def test_start_carries_assigned_channel():
     p = make(mirrors={MCH: B})
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
-    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, MCH)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
+    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, 1, MCH)]
 
 
 def test_set_routing_restarts_only_moved_account():
@@ -268,10 +269,10 @@ def test_set_routing_restarts_only_moved_account():
     t = bring_live(p)
     acts = p.set_routing(Routing(SRC, CH, {MCH: B}))
     assert acts == [OutCloseGate(B, "routing_changed"), OutTeardown(B, 1, StopReason.ROUTING_CHANGED)]
-    assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, MCH)]
-    pool_ready = p.handle(OutJoined(B, 1, "vsB2"), t + 2.0)
+    assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, 2, MCH)]
+    pool_ready = p.handle(OutJoined(B, 1, 2, "vsB2"), t + 2.0)
     assert pool_ready == []
-    p.handle(OutReady(B, 1, "H264"), t + 2.5)
+    p.handle(OutReady(B, 1, 2, "H264"), t + 2.5)
     # removing the mirror moves B back to main; A untouched
     acts = p.set_routing(Routing(SRC, CH, {}))
     assert [a.account for a in acts] == [B, B]
@@ -285,8 +286,8 @@ def test_main_channel_change_moves_non_mirror_accounts_next_session():
     assert p.account_live(A, 1, 1) and p.account_live(B, 1, 1)
     p.handle(SessionEnded(1, StopReason.DISABLED, False), t + 1)
     acts = p.handle(SessionLive(2, 1, 8), t + 10)
-    assert acts == [OutStart(A, 2, 700)]
-    assert p.handle(OutTick(), t + 12) == [OutStart(B, 2, MCH)]
+    assert acts == [OutStart(A, 2, 2, 700)]
+    assert p.handle(OutTick(), t + 12) == [OutStart(B, 2, 2, MCH)]
 
 
 def test_excluded_viewer_in_mirror_stops_only_that_account():
@@ -298,13 +299,13 @@ def test_excluded_viewer_in_mirror_stops_only_that_account():
     assert p.handle(OutTick(), t + 60) == []  # no backoff restart while the viewer is present
     assert p.account_live(A, 1, 1)
     assert p.handle(MirrorParticipants(A, frozenset({555}), MCH), t + 61) == []  # main channel: supervisor's rule
-    assert p.handle(MirrorParticipants(B, frozenset(), MCH), t + 62) == [OutStart(B, 1, MCH)]
+    assert p.handle(MirrorParticipants(B, frozenset(), MCH), t + 62) == [OutStart(B, 1, 2, MCH)]
 
 
 def test_fatal_mirror_account_keeps_mapping_and_is_unavailable():
     p = make(mirrors={MCH: B}, persisted={B: AccountPersisted(FatalReason.AUTH_REJECTED, None, 0)})
     assert p.channel_of(B) == MCH
-    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, CH)]
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     assert p.handle(OutTick(), 10.0) == []
     assert p.set_routing(Routing(SRC, CH, {MCH: B})) == []
     assert p.status(10.0)[1]["state"] == "fatal"
@@ -319,4 +320,26 @@ def test_stale_channel_participants_ignored_after_mirror_move():
     p.set_routing(Routing(SRC, CH, {new_ch: B}))
     acts = p.handle(MirrorParticipants(B, frozenset({555}), MCH), t + 2)
     acts += p.handle(OutTick(), t + 4)
-    assert acts == [OutStart(B, 1, new_ch)]
+    assert acts == [OutStart(B, 1, 2, new_ch)]
+
+
+def test_events_of_superseded_attempt_in_same_generation_ignored():
+    # mirror then unmirror while the first join is still in flight: same generation, new attempt
+    p = make(mirrors={})
+    t = bring_live(p, (A, B))
+    p.set_routing(Routing(SRC, CH, {MCH: B}))
+    assert p.handle(OutTick(), t + 2.0) == [OutStart(B, 1, 2, MCH)]
+    acts = p.set_routing(Routing(SRC, CH, {}))
+    assert kinds(acts) == [OutCloseGate, OutTeardown]
+    assert p.handle(OutTick(), t + 4.0) == [OutStart(B, 1, 3, CH)]
+    # the MCH publish (attempt 2) completes late: neither arms nor goes live
+    assert p.handle(OutJoined(B, 1, 2, "old"), t + 4.1) == []
+    assert p.handle(OutReady(B, 1, 2, "H264"), t + 4.2) == []
+    assert p.handle(OutFailed(B, 1, 2, StopReason.CONNECT_FAILED, True), t + 4.3) == []
+    assert p.handle(OutHealth(B, 1, 2, False), t + 4.4) == []
+    assert not p.account_live(B, 1, 1) and p.status(t)[1]["state"] == "joining"
+    assert p.handle(OutVoiceObserved(B, "old", None), t + 4.5) == []  # JOINING: exempt, not displaced
+    # the current attempt goes live normally
+    p.handle(OutJoined(B, 1, 3, "new"), t + 5.0)
+    assert p.handle(OutReady(B, 1, 3, "H264"), t + 5.1) == [OutSetLive(B, 1, 1)]
+    assert p.handle(OutVoiceObserved(B, "new", CH), t + 5.2) == []

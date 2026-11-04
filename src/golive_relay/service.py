@@ -41,7 +41,7 @@ from golive_relay.supervisor.machine import PersistedStateView, Supervisor, Supe
 from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
-    FatalReason, FirstFrame, FreshFrame, GatewayState, Joined, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
+    FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
 )
@@ -167,6 +167,7 @@ class Service:
         self._out_tail: dict[int, asyncio.Task] = {}
         self._out_tasks: set[asyncio.Task] = set()
         self._reply_tail: asyncio.Task | None = None
+        self._resnap_pending = False  # routing changed while the gateway was not FRESH
         self._feedback_min = cfg.runtime.feedback_idr_min_interval_ms / 1000.0
         self._adapter: Any = None
         self._worker: Any = None
@@ -331,6 +332,13 @@ class Service:
         if self.sup.state is not before:
             self.log("state", old=before.value, new=self.sup.state.value)
         self._execute(acts)
+        if isinstance(event, GatewaySnapshot):
+            self._resnap_pending = False
+        elif isinstance(event, GatewayChanged) and event.state is GatewayState.FRESH and self._resnap_pending:
+            # the resumed cache now holds the new target's voice, stream and participants
+            self._resnap_pending = False
+            if self._adapter is not None:
+                self._handle(self._adapter.snapshot())
         if isinstance(event, ConfigInvalid):
             self._exit_code = 78
             self._done.set()
@@ -424,8 +432,12 @@ class Service:
 
     def _resnapshot(self, adapter: Any) -> None:
         """After a target/channel change the new target may already be streaming: read the cache now."""
-        if adapter is self._adapter and self.sup.gateway is GatewayState.FRESH:
+        if adapter is not self._adapter:
+            return
+        if self.sup.gateway is GatewayState.FRESH:
             self._handle(adapter.snapshot())
+        else:
+            self._resnap_pending = True
 
     # --------------------------------------------------------------- actions
 
@@ -501,15 +513,15 @@ class Service:
     def _pool_action(self, a: Any) -> None:
         self.metrics.inc(f"action.{type(a).__name__}")
         match a:
-            case OutStart(account=uid, generation=g, channel_id=ch):
+            case OutStart(account=uid, generation=g, attempt=n, channel_id=ch):
                 if self._canvas is None or self._profile is None:
-                    self._pool_event(OutFailed(uid, g, StopReason.CONNECT_FAILED, True, "no canvas"))
+                    self._pool_event(OutFailed(uid, g, n, StopReason.CONNECT_FAILED, True, "no canvas"))
                 else:
                     w, h = self._canvas
                     p = self._profile
                     source = RelayMediaSource(
                         self._out_pubs[uid], VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000))
-                    self._out_queue(uid, self._out_publish, uid, g, p.fps, source, ch)
+                    self._out_queue(uid, self._out_publish, uid, g, n, p.fps, source, ch)
             case OutSetLive(account=uid, generation=g, epoch=e):
                 pub = self._out_pubs[uid]
                 pub.set_slate(self._slate)
@@ -548,9 +560,9 @@ class Service:
         self._out_tasks.add(task)
         task.add_done_callback(self._out_tasks.discard)
 
-    async def _out_publish(self, uid: int, g: int, fps: int, source: Any, channel_id: int) -> None:
+    async def _out_publish(self, uid: int, g: int, n: int, fps: int, source: Any, channel_id: int) -> None:
         if uid in self._out_misconfigured:
-            self._pool_event(OutFailed(uid, g, StopReason.CONFIG_INVALID, False, "token belongs to another account"))
+            self._pool_event(OutFailed(uid, g, n, StopReason.CONFIG_INVALID, False, "token belongs to another account"))
             return
         try:
             if uid not in self._out_adapters and self._out_factory is not None and uid in self._out_tokens:
@@ -559,9 +571,9 @@ class Service:
             adapter = self._out_adapters.get(uid)
             if adapter is None:
                 raise RuntimeError("output account not logged in")
-            await adapter.publish(g, fps, source, channel_id)
+            await adapter.publish(g, n, fps, source, channel_id)
         except Exception as exc:
-            self._pool_event(OutFailed(uid, g, StopReason.CONNECT_FAILED, True, repr(exc)))
+            self._pool_event(OutFailed(uid, g, n, StopReason.CONNECT_FAILED, True, repr(exc)))
 
     async def _out_end(self, uid: int) -> None:
         adapter = self._out_adapters.get(uid)
@@ -907,7 +919,8 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
-                network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs),
+                network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs,
+                excluded_viewer_ids=cfg.authorization.excluded_viewer_ids),
             output_tokens=out_tokens,
         )
         return await svc.run(token)

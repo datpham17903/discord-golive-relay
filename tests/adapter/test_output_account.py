@@ -124,9 +124,9 @@ def test_publish_and_end_order() -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        codec = await a.publish(5, 30, "SRC", CHAN)
+        codec = await a.publish(5, 1, 30, "SRC", CHAN)
         assert codec == "H264"
-        assert events == [OutJoined(USER, 5, "sess"), MirrorParticipants(USER, frozenset(), CHAN), OutReady(USER, 5, "H264")]
+        assert events == [OutJoined(USER, 5, 1, "sess"), MirrorParticipants(USER, frozenset(), CHAN), OutReady(USER, 5, 1, "H264")]
         connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
         assert connect["self_mute"] is True and connect["reconnect"] is False and connect["timeout"] == 15
         cs = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "create_stream")
@@ -175,12 +175,12 @@ def test_dropped_stream_emits_out_health(monkeypatch) -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        await a.publish(5, 30, "SRC", CHAN)
+        await a.publish(5, 1, 30, "SRC", CHAN)
         await asyncio.sleep(0.05)
-        assert OutHealth(USER, 5, False) not in events
+        assert OutHealth(USER, 5, 1, False) not in events
         a._out.connected = False
         await asyncio.sleep(0.05)
-        assert events.count(OutHealth(USER, 5, False)) == 1
+        assert events.count(OutHealth(USER, 5, 1, False)) == 1
         await a.end()
 
     asyncio.run(go())
@@ -192,7 +192,7 @@ def test_end_stops_health_watch(monkeypatch) -> None:
     async def go():
         a, calls, events = make()
         await a.start("tok")
-        await a.publish(5, 30, "SRC", CHAN)
+        await a.publish(5, 1, 30, "SRC", CHAN)
         out = a._out
         await a.end()
         out.connected = False
@@ -231,7 +231,7 @@ def test_publish_joins_passed_channel_and_emits_participants() -> None:
         a, calls, events = make()
         await a.start("tok")
         a._client.voice_states = {77: {5: object(), 6: object()}}
-        await a.publish(5, 30, "SRC", 77)
+        await a.publish(5, 1, 30, "SRC", 77)
         assert ("get_channel", 77) in calls
         assert MirrorParticipants(USER, frozenset({5, 6}), 77) in events
         events.clear()
@@ -242,5 +242,26 @@ def test_publish_joins_passed_channel_and_emits_participants() -> None:
         events.clear()
         await a._client.on_voice_state_update(NS(id=6), NS(channel=NS(id=3)), NS(channel=NS(id=4)))
         assert events == []
+
+    asyncio.run(go())
+
+
+def test_publish_does_not_join_while_excluded_viewer_present() -> None:
+    async def go():
+        calls: list = []
+        events: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, events.append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), excluded_viewer_ids=frozenset({555}),
+        )
+        await a.start("tok")
+        a._client.voice_states = {77: {5: object(), 555: object()}}
+        with pytest.raises(RuntimeError, match="excluded viewer"):
+            await a.publish(5, 1, 30, "SRC", 77)
+        assert not any(isinstance(c, tuple) and c[0] == "connect" for c in calls)
+        assert events == [MirrorParticipants(USER, frozenset({5, 555}), 77)]
+        a._client.voice_states = {77: {5: object()}}
+        await a.publish(5, 2, 30, "SRC", 77)
+        assert any(isinstance(c, tuple) and c[0] == "connect" for c in calls)
 
     asyncio.run(go())
