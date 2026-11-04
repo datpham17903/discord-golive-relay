@@ -1095,3 +1095,68 @@ def test_prejoin_failure_is_reported_and_retried(tmp_path, slate, source_gop):
         await task
 
     asyncio.run(main())
+
+
+def test_runtime_invalid_routing_is_ignored_but_visible(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    relay = env.cfg.discord.expected_relay_user_id
+    bad = {"target_user_id": relay, "channel_id": env.chan, "mirrors": {}}
+
+    def rejected() -> list[dict]:
+        return [kw for name, kw in env.log_kw if name == "state_routing_rejected"]
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        env.store.update(lambda s: replace(s, routing=bad))
+        await wait_until(lambda: rejected())
+        assert rejected()[0]["level"] == "error" and "relay account" in rejected()[0]["error"]
+        assert env.svc.sup.routing.target_user_id == env.target  # still ignored at runtime
+        assert "relay account" in env.svc.status_dict()["routing_error"]
+        chat(env, "!relay status", 1)
+        await wait_until(lambda: a.replies)
+        assert "⚠️" in a.replies[0][2] and "state.json" in a.replies[0][2]
+        env.store.update(lambda s: replace(s, desired_enabled=True))  # same bad routing: no second log
+        await asyncio.sleep(0.2)
+        assert len(rejected()) == 1
+        env.store.update(lambda s: replace(s, routing=None))  # valid again
+        await wait_until(lambda: env.svc.status_dict()["routing_error"] is None)
+        env.store.update(lambda s: replace(s, routing=bad))  # the same bad value is reported again
+        await wait_until(lambda: len(rejected()) == 2)
+        chat(env, "!relay target 779", 2)  # a chat command may replace the reported bad routing
+        assert env.store.load().routing["target_user_id"] == 779
+        await wait_until(lambda: env.svc.status_dict()["routing_error"] is None)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_chat_routing_write_rejects_concurrent_hand_edit(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        hand = {"target_user_id": 778, "channel_id": env.chan, "mirrors": {}}
+        env.store.update(lambda s: replace(s, routing=hand))  # not yet polled
+        chat(env, "!relay target 779", 1)
+        assert env.store.load().routing == hand
+        assert env.svc.sup.routing.target_user_id != 779
+        await wait_until(lambda: a.replies)
+        assert a.replies[0][2].startswith("⚠️") and "state.json vừa thay đổi, thử lại lệnh" in a.replies[0][2]
+        await wait_until(lambda: env.svc.sup.routing.target_user_id == 778)
+        chat(env, "!relay target 779", 2)  # retried after the poll: applies
+        assert env.store.load().routing["target_user_id"] == 779
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_reply_without_adapter_is_logged(tmp_path, slate, source_gop):
+    from golive_relay.control.commands import ChatCommand
+
+    env = Env(tmp_path, slate, source_gop)
+    env.svc._reply(ChatCommand(OPERATOR, CMD_CHAN, 1, "!relay status"), "x")
+    assert ("chat_reply_failed", {"channel": CMD_CHAN, "error": "no adapter"}) in env.log_kw

@@ -148,6 +148,7 @@ class Service:
         if err is not None:
             raise StateCorrupt(f"state.json routing is invalid: {err}; fix or remove the routing entry")
         self._rejected_routing: dict | None = None
+        self._routing_error: str | None = None  # why the routing in state.json is being ignored
         sup_cfg = replace(supervisor_config(cfg), target_user_id=routing.target_user_id,
                           allowed_channel_id=routing.channel_id)
         if st.prejoin_voice is not None:  # chat override persisted in state.json; config is only the default
@@ -381,13 +382,17 @@ class Service:
         if prejoin != self.sup.prejoin_voice:
             self._handle(PrejoinChanged(prejoin))
         routing = Routing.from_persisted(st.routing, config_routing(self.cfg))
-        if routing != self.sup.routing:
-            err = routing_error(routing, self.cfg)
-            if err is None:
+        err = routing_error(routing, self.cfg)
+        if err is None:
+            self._rejected_routing, self._routing_error = None, None
+            if routing != self.sup.routing:
                 self._handle(RoutingChanged(routing))
-            elif st.routing != self._rejected_routing:  # log once per distinct bad entry
+        else:
+            # ignored while running; start-time check stays fail-closed, so make it visible now
+            self._routing_error = err
+            if st.routing != self._rejected_routing:  # log once per distinct bad entry
                 self._rejected_routing = st.routing
-                self.log("state_routing_rejected", error=err)
+                self.log("state_routing_rejected", level="error", error=err)
 
     # ------------------------------------------------------------------ chat
 
@@ -404,7 +409,8 @@ class Service:
             elif isinstance(cmd, Status):
                 states = {row["account"]: row["state"] for row in self.pool.status(time.monotonic())}
                 outcome, text = "status", format_status(old, ctx, self.sup.state.value, states,
-                                                        prejoin=self.sup.prejoin_voice)
+                                                        prejoin=self.sup.prejoin_voice,
+                                                        routing_error=self._routing_error)
             elif isinstance(cmd, SetEnabled):
                 self._set_enabled(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
@@ -417,15 +423,30 @@ class Service:
                 if isinstance(new, str):
                     outcome, text = "rejected", new
                 else:
-                    self.store.update(lambda s: replace(s, routing=new.to_persisted()))
+                    self.store.update(self._routing_write(old, new))
                     self._handle(RoutingChanged(new))
                     outcome, text = "applied", describe_change(cmd, old, new, ctx)
+        except _RoutingMoved:
+            outcome, text = "stale", "⚠️ state.json vừa thay đổi, thử lại lệnh."
         except (OSError, StateCorrupt) as exc:
             self.log("chat_state_write_failed", error=repr(exc))
             outcome, text = "write_failed", "❌ **Không ghi được state.json**; không có gì thay đổi."
         self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
                  outcome=outcome)
         self._reply(ev, text)
+
+    def _routing_write(self, old: Routing, new: Routing) -> Callable[[PersistedState], PersistedState]:
+        """Runs under the state lock: a routing stored since the last poll must not be overwritten."""
+        planned = old.to_persisted()
+
+        def fn(s: PersistedState) -> PersistedState:
+            stored = s.routing if s.routing is not None else config_routing(self.cfg).to_persisted()
+            # an already-reported invalid routing is never applied; a chat command may replace it
+            if stored != planned and (s.routing is None or s.routing != self._rejected_routing):
+                raise _RoutingMoved
+            return replace(s, routing=new.to_persisted())
+
+        return fn
 
     def _routing_context(self) -> RoutingContext:
         accounts = [a.user_id for a in self.cfg.output_accounts()]
@@ -443,6 +464,7 @@ class Service:
         """Replies go out in order, off the ops queue so a slow voice join never delays them."""
         adapter, prev = self._adapter, self._reply_tail
         if adapter is None:
+            self.log("chat_reply_failed", channel=ev.channel_id, error="no adapter")
             return
 
         async def run() -> None:
@@ -1021,6 +1043,7 @@ class Service:
         d["ingest_send"] = self.publisher.take_window()
         d["ingress_audio"] = self._adapter.take_audio_window() if self._adapter is not None else {}
         d["routing"] = self.sup.routing.to_persisted()
+        d["routing_error"] = self._routing_error
         d["accounts"] = [
             {**row, "channel_id": self.pool.channel_of(row["account"]), **self._out_pubs[row["account"]].take_window()}
             for row in self.pool.status(time.monotonic())
@@ -1069,6 +1092,10 @@ class Service:
         st = self.store.update(lambda s: replace(s, desired_enabled=enabled))
         self._handle(EnableChanged(enabled))
         return st
+
+
+class _RoutingMoved(Exception):
+    """state.json routing changed after the chat command was planned; nothing was written."""
 
 
 def _watch_retryable(exc: Exception) -> bool:

@@ -239,6 +239,13 @@ def test_routing_roundtrip_v3(tmp_path: Path) -> None:
         {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 3, "6": 3}},
         {"target_user_id": "1", "channel_id": 2, "mirrors": {}},
         {"target_user_id": 1, "channel_id": 2},
+        {"target_user_id": 0, "channel_id": 2, "mirrors": {}},
+        {"target_user_id": 1, "channel_id": -2, "mirrors": {}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"0": 3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 0}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": -3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"01": 3}},
+        {"target_user_id": 1, "channel_id": 2, "mirrors": {"5": 3, "05": 4}},
     ],
 )
 def test_routing_rejects_bad_shape(tmp_path: Path, routing: dict) -> None:

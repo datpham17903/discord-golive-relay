@@ -70,17 +70,23 @@ def set_account(st: PersistedState, user_id: int, **changes: object) -> Persiste
     return replace(st, accounts={**st.accounts, str(user_id): rec})
 
 
+def _positive_int(v: object) -> bool:
+    return type(v) is int and v > 0
+
+
 def _check_routing(rt: object) -> None:
     if not isinstance(rt, dict) or set(rt) != _ROUTING_KEYS:
         raise ValueError("bad routing")
-    if type(rt["target_user_id"]) is not int or type(rt["channel_id"]) is not int:
+    if not (_positive_int(rt["target_user_id"]) and _positive_int(rt["channel_id"])):
         raise ValueError("bad routing ids")
     mirrors = rt["mirrors"]
     if not isinstance(mirrors, dict):
         raise ValueError("bad routing mirrors")
     accounts = set()
     for ch, acct in mirrors.items():
-        if not (isinstance(ch, str) and ch.isascii() and ch.isdigit()) or type(acct) is not int:
+        # canonical decimal keys only, so two keys can never collapse to the same channel int
+        canonical = isinstance(ch, str) and ch.isascii() and ch.isdigit() and str(int(ch)) == ch and int(ch) > 0
+        if not canonical or not _positive_int(acct):
             raise ValueError("bad routing mirror entry")
         if acct in accounts:
             raise ValueError("routing account mirrored in more than one channel")

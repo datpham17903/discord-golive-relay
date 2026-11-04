@@ -194,3 +194,9 @@ def test_parse_id_edges_and_prefix():
     assert parse("!relayx status", P) is None
     msg = plan_change(SetChannel(999), routing(), ctx())
     assert isinstance(msg, str) and msg.startswith("⚠️") and "voice" in msg
+
+
+def test_status_shows_invalid_state_routing():
+    s = format_status(routing(), ctx(), "IDLE", {}, routing_error="target is a relay account")
+    assert "⚠️" in s and "state.json" in s
+    assert "⚠️" not in format_status(routing(), ctx(), "IDLE", {})

@@ -220,6 +220,7 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
 
 def format_status(
     routing: Routing, ctx: RoutingContext, session: str, account_states: Mapping[int, str], prejoin: bool = False,
+    routing_error: str | None = None,
 ) -> str:
     lines = [
         "📡 **Trạng thái relay**",
@@ -234,4 +235,6 @@ def format_status(
             lines.append(f"  - {_ch(ch)} ← {_user(ctx, acct)}: {account_states.get(acct, 'không rõ')}")
     else:
         lines.append("• Mirror: chưa có mirror")
+    if routing_error is not None:
+        lines.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
     return "\n".join(lines)
