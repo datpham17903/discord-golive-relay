@@ -63,7 +63,7 @@ def test_output_profile():
     cfg = load_config(EXAMPLE)
     prof = cfg.output_profile()
     assert isinstance(prof, OutputProfile)
-    assert (prof.mode, prof.max_width, prof.max_height, prof.fps) == ("auto", 1920, 1080, 60)
+    assert (prof.mode, prof.fixed_width, prof.fixed_height, prof.fps) == ("fixed", 1920, 1080, 60)
     assert prof.video_bitrate_kbps == 8000
     assert prof.keyframe_interval_s == 2
     assert prof.audio_enabled is True

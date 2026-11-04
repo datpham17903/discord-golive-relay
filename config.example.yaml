@@ -25,7 +25,7 @@ codecs:
   video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
 
 quality:
-  mode: auto                 # auto | fixed
+  mode: fixed                # auto | fixed; fixed always outputs fixed_* (lower-resolution sources are scaled up, which needs a re-encode)
   max_width: 1920            # max_* only used in auto; 1080p60 validated live (G2b, 2026-11-01)
   max_height: 1080
   max_fps: 60
