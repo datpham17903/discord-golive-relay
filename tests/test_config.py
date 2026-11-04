@@ -337,3 +337,12 @@ def test_prejoin_voice_is_opt_in(tmp_path):
     assert _load(tmp_path, raw).runtime.prejoin_voice is True
     raw["runtime"]["prejoin_voice"] = "yes"
     assert any("prejoin_voice" in e for e in _errors(tmp_path, raw))
+
+
+def test_control_is_operator_by_user_role_or_neither() -> None:
+    from golive_relay.config import ControlConfig
+
+    c = ControlConfig(operator_user_ids=frozenset({1}), operator_role_ids=frozenset({10}))
+    assert c.is_operator(1, frozenset())
+    assert c.is_operator(2, frozenset({10, 11}))
+    assert not c.is_operator(2, frozenset({11}))

@@ -28,7 +28,7 @@ def make(chat: bool = True, command_channel: int | None = CMD_CHAN, roles: froze
 
 
 def message(author: int = OPERATOR, guild: int | None = GUILD, channel: int = CMD_CHAN, text: str = "!relay status") -> NS:
-    return NS(id=900, author=NS(id=author), guild=NS(id=guild) if guild is not None else None,
+    return NS(id=900, author=NS(id=author), guild=NS(id=guild, get_member=lambda uid: None) if guild is not None else None,
               channel=NS(id=channel), content=text)
 
 
@@ -143,3 +143,12 @@ def test_role_lookup_via_guild_member_when_author_is_not_a_member() -> None:
     m.guild.get_member = lambda uid: NS(roles=[NS(id=ROLE)]) if uid == 51 else None
     a.handle_dispatch("message", m)
     assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE})
+
+
+def test_raw_member_role_ids_are_used_over_cached_roles() -> None:
+    a, out = make(roles=frozenset({ROLE}))
+    m = message(author=51)
+    m.author._roles = [ROLE, 702]
+    m.author.roles = []  # role cache incomplete
+    a.handle_dispatch("message", m)
+    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE, 702})

@@ -187,11 +187,14 @@ class DiscordAdapter:
         author = msg.author.id
         if author in self._relay_ids:
             return
-        roles = getattr(msg.author, "roles", None)
-        if roles is None:
-            member = msg.guild.get_member(author) if hasattr(msg.guild, "get_member") else None
-            roles = getattr(member, "roles", None) or ()
-        role_ids = frozenset(r.id for r in roles)
+        member = msg.author
+        if not hasattr(member, "_roles") and not hasattr(member, "roles"):
+            member = msg.guild.get_member(author)
+        # Raw ids: Member.roles drops ids missing from the guild role cache.
+        raw = getattr(member, "_roles", None)
+        if raw is None:
+            raw = [r.id for r in getattr(member, "roles", ())]
+        role_ids = frozenset(raw)
         if not c.is_operator(author, role_ids):
             return
         if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
