@@ -16,7 +16,7 @@ from golive_relay.media.h264 import is_idr
 from golive_relay.media.slate import build_slate
 from golive_relay.service import Service
 from golive_relay.supervisor.model import (
-    GatewaySnapshot, OpenGate, RelayState, SetRejections, SourceProgress, SourceStream, TargetVoice,
+    GatewaySnapshot, OpenGate, RelayState, SetRejections, SourceProgress, SourceStream, TargetVoice, TargetVoiceChanged,
 )
 from golive_relay.worker.messages import Configure, EgressVideo, SetOutput, WorkerEvent
 
@@ -89,8 +89,10 @@ class FakeAdapter:
     def set_epoch(self, e: int) -> None:
         pass
 
-    async def join(self):
+    async def join(self, on_voice_state=None):
         self.calls.append("join")
+        if on_voice_state is not None:
+            on_voice_state()  # the gateway echoed our voice state
         return "sess-1"
 
     async def watch(self, g, e, stream) -> None:
@@ -830,7 +832,9 @@ def test_session_timing_logged_once_at_open(tmp_path, slate, source_gop):
     asyncio.run(main())
     t = timings(env)
     assert len(t) == 1 and t[0]["outcome"] == "open" and t[0]["prejoined"] is False
-    for k in ("start_from_seen_ms", "watch_sent_from_seen_ms", "watching_from_seen_ms", "joined_ms", "watch_sent_ms",
+    for k in ("start_from_seen_ms", "watch_sent_from_seen_ms", "watching_from_seen_ms", "voice_connected_ms",
+              "voice_state_confirmed_ms", "voice_state_confirmed_from_seen_ms", "voice_connected_from_seen_ms",
+              "start_from_gate_ready_ms", "gate_ready_from_seen_ms", "worker_started_ms", "watch_sent_ms",
               "watching_ms", "first_video_packet_ms", "first_frame_ms", "slate_ready_ms", "slate_ms",
               "output_created_ms", "output_create_ms", "open_gate_ms"):
         assert isinstance(t[0][k], int) and t[0][k] >= 0, k
@@ -883,3 +887,211 @@ def test_full_stream_watch_retries_fast_without_rejoining(tmp_path, slate, sourc
 
     asyncio.run(main())
     assert timings(env)[0]["outcome"] == "connect_failed"
+
+
+def test_watch_is_sent_on_voice_state_echo_before_voice_connects(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        watched = asyncio.Event()
+
+        async def join(on_voice_state=None):
+            a.calls.append("join")
+            on_voice_state()
+            await asyncio.wait_for(watched.wait(), 2.0)  # sequential join-then-watch times out here
+            a.calls.append("voice_connected")
+            return "sess-1"
+
+        async def watch(g, e, stream):
+            a.calls.append("watch")
+            watched.set()
+
+        a.join, a.watch = join, watch
+        a.events(env.snapshot())
+        await wait_until(lambda: "voice_connected" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    calls = env.adapters[0].calls
+    assert calls.index("join") < calls.index("watch") < calls.index("voice_connected")
+    t = timings(env)[0]
+    assert t["voice_state_confirmed_ms"] <= t["watch_sent_ms"] <= t["voice_connected_ms"]
+
+
+def test_join_failure_after_early_watch_fails_the_session(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+
+        async def join(on_voice_state=None):
+            a.calls.append("join")
+            on_voice_state()
+            await asyncio.sleep(0.05)
+            raise RuntimeError("voice handshake failed")
+
+        a.join = join
+        a.events(env.snapshot())
+        await wait_until(lambda: env.svc.sup.state is RelayState.BACKOFF)
+        await wait_until(lambda: "leave" in env.order)
+        assert "watch" in a.calls and env.svc._in_voice is False
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    assert timings(env)[0]["outcome"] == "connect_failed"
+
+
+def test_worker_spawns_concurrently_with_join(tmp_path, slate, source_gop):
+    import threading
+
+    env = Env(tmp_path, slate, source_gop)
+    spawning = threading.Event()
+    real_factory = env.svc._worker_factory
+
+    def factory(profile):
+        spawning.set()
+        return real_factory(profile)
+
+    env.svc._worker_factory = factory
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        joined_before_spawn: list[bool] = []
+
+        async def join(on_voice_state=None):
+            a.calls.append("join")
+            joined_before_spawn.append(not spawning.is_set())
+            on_voice_state()
+            await wait_until(spawning.is_set, timeout=2.0)  # join-then-spawn would time out here
+            return "sess-1"
+
+        a.join = join
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        env.svc.request_shutdown()
+        await task
+        assert joined_before_spawn == [True]  # the spawn no longer runs before the join starts
+
+    asyncio.run(main())
+    assert len(env.workers) == 1 and env.workers[0].stopped
+    assert isinstance(env.workers[0].sent[0], Configure)
+
+
+def test_worker_spawned_after_teardown_is_stopped(tmp_path, slate, source_gop):
+    import threading
+
+    env = Env(tmp_path, slate, source_gop)
+    release = threading.Event()
+    real_factory = env.svc._worker_factory
+    env.svc._worker_factory = lambda p: (release.wait(3.0), real_factory(p))[1]
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(TargetVoiceChanged(TargetVoice(env.chan, False)))  # stream gone while the worker is spawning
+        await wait_until(lambda: env.svc.sup.state is RelayState.IDLE)
+        release.set()
+        await wait_until(lambda: env.workers and env.workers[0].stopped)
+        assert env.svc._worker is None
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_watch_retryable_only_for_stream_full_or_timeout():
+    from discord import ClientException
+
+    from golive_relay.service import _watch_retryable
+
+    assert _watch_retryable(ClientException("Stream connection rejected: stream_full"))
+    assert _watch_retryable(asyncio.TimeoutError())
+    assert not _watch_retryable(ClientException("Stream connection rejected: unauthorized"))
+    assert not _watch_retryable(RuntimeError("target stream changed before watch"))
+
+
+def test_chat_prejoin_toggle_persists_joins_and_leaves(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await asyncio.sleep(0.1)
+        assert "join" not in a.calls  # config default: off
+        chat(env, "!relay prejoin on", 1)
+        assert env.store.load().prejoin_voice is True and env.svc.sup.prejoin_voice is True
+        await wait_until(lambda: "join" in a.calls)
+        chat(env, "!relay status", 2)
+        chat(env, "!relay prejoin off", 3)
+        assert env.store.load().prejoin_voice is False
+        await wait_until(lambda: "leave" in env.order)
+        await wait_until(lambda: len(a.replies) == 3)
+        assert a.replies[0][2].startswith("✅") and "Pre-join: bật" in a.replies[1][2]
+        assert a.replies[2][2].startswith("✅")
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_persisted_prejoin_overrides_config(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True)
+    env.store.update(lambda s: replace(s, prejoin_voice=False))
+    env.svc = Service(env.cfg, env.store, lambda ev, ing, lg: env.adapters.append(FakeAdapter(ev, ing, lg, env.order))
+                      or env.adapters[-1], lambda profile: FakeWorker(source_gop), lambda *a, **k: None,
+                      slate_builder=lambda *a: None, install_signals=False, tick_s=0.02)
+    assert env.svc.sup.prejoin_voice is False
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        env.store.update(lambda s: replace(s, prejoin_voice=True))  # offline edit is picked up
+        await wait_until(lambda: env.svc.sup.prejoin_voice is True)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_prejoin_failure_is_reported_and_retried(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.2,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        real = a.join
+
+        async def join(on_voice_state=None):
+            if a.calls.count("join") == 0:
+                a.calls.append("join")
+                raise RuntimeError("no voice")
+            return await real(on_voice_state)
+
+        a.join = join
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: a.calls.count("join") == 2, timeout=3.0)
+        await wait_until(lambda: env.svc._in_voice)
+        assert "prejoin_failed" in env.logs
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())

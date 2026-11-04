@@ -84,3 +84,28 @@ def test_cache_lookups_for_routing_context() -> None:
     assert a.display_name(8) == "Nick"
     assert a.display_name(9) == "Glob"
     assert a.display_name(10) is None
+
+
+def test_join_reports_voice_state_echo_before_voice_connects() -> None:
+    a, _ = make()
+    vc = NS(session_id="sess-1")
+    seen: list[str] = []
+
+    class Channel:
+        async def connect(self, cls, **kw):
+            a._own_voice_state(vc, {"channel_id": "99", "session_id": "x"})  # another channel: ignored
+            a._own_voice_state(vc, {"channel_id": str(CHAN), "session_id": "sess-1"})
+            seen.append("echo_seen" if a._vc is vc else "echo_missed")
+            await asyncio.sleep(0)
+            seen.append("media_connected")
+            return vc
+
+    a._guild_channel = lambda: Channel()
+
+    async def main():
+        sid = await a.join(on_voice_state=lambda: seen.append("callback"))
+        assert sid == "sess-1" and a._vc is vc
+        a._own_voice_state(vc, {"channel_id": str(CHAN), "session_id": "sess-1"})  # later updates: no callback
+
+    asyncio.run(main())
+    assert seen == ["callback", "echo_seen", "media_connected"]

@@ -100,6 +100,7 @@ class DiscordAdapter:
         self._connect_task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._vc: Any = None
+        self._voice_state_cb: Callable[[], None] | None = None
         self._sc: Any = None
         self._out: Any = None
         self._incarnation = 0
@@ -362,18 +363,36 @@ class DiscordAdapter:
                 cid = data.get("channel_id")
                 adapter._emit(RelayVoiceObserved(data.get("session_id"), int(cid) if cid is not None else None))
                 await super().on_voice_state_update(data)
+                adapter._own_voice_state(self, data)
 
         return RelayParentVoiceClient
 
-    async def join(self) -> str | None:
-        """Connect the parent voice client; returns its voice session id."""
+    async def join(self, on_voice_state: Callable[[], None] | None = None) -> str | None:
+        """Connect the parent voice client; returns its voice session id.
+
+        ``on_voice_state`` is called once the gateway echoes our voice state for the channel, before the voice
+        media session connects. From then on ``watch`` may run: the library only needs the voice client to be
+        registered for the channel and to know its session id when STREAM_CREATE arrives."""
         channel = self._guild_channel()
         if channel is None:
             raise RuntimeError("allowed voice channel not available")
-        self._vc = await channel.connect(
-            cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
-        )
+        self._voice_state_cb = on_voice_state
+        try:
+            self._vc = await channel.connect(
+                cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
+            )
+        finally:
+            self._voice_state_cb = None
         return self._vc.session_id
+
+    def _own_voice_state(self, vc: Any, data: Any) -> None:
+        """The parent client applied our VOICE_STATE_UPDATE: hand it out early when a join is waiting for it."""
+        cb, cid = self._voice_state_cb, data.get("channel_id")
+        if cb is None or cid is None or int(cid) != self.channel_id or not data.get("session_id"):
+            return
+        self._voice_state_cb = None
+        self._vc = vc
+        cb()
 
     async def watch(self, generation: int, epoch: int, stream: SourceStream) -> None:
         """Watch exactly ``stream`` (key and incarnation must match the tracked one)."""

@@ -162,6 +162,20 @@ class RoutingChanged:
 
 
 @dataclass(frozen=True, slots=True)
+class PrejoinChanged:
+    """Runtime override of runtime.prejoin_voice (chat ``prejoin on|off``)."""
+
+    on: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrejoinFailed:
+    """The JoinVoice join failed: the relay is not in voice."""
+
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ResetFatal:
     pass
 
@@ -316,7 +330,7 @@ Event = (
     Tick | EnableChanged | ResetFatal | GatewayChanged | GatewaySnapshot | TargetVoiceChanged | StreamStarted
     | StreamUpdated | StreamEnded | ParticipantsChanged | RelayVoiceObserved | Joined | Watching | FirstFrame
     | OutputReady | ConnectFailed | InboundHealth | OutputHealth | SourceProgress | FreshFrame | WorkerFailed
-    | CodecChanged | AuthRejected | ConfigInvalid | Shutdown | RoutingChanged
+    | CodecChanged | AuthRejected | ConfigInvalid | Shutdown | RoutingChanged | PrejoinChanged | PrejoinFailed
 )
 
 

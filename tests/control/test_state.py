@@ -249,3 +249,20 @@ def test_routing_rejects_bad_shape(tmp_path: Path, routing: dict) -> None:
     (tmp_path / "state.json").write_text(json.dumps(doc))
     with pytest.raises(StateCorrupt):
         StateStore(tmp_path).load()
+
+
+def test_prejoin_override_is_optional_v3_key(tmp_path: Path) -> None:
+    doc = {
+        "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {}, "routing": None,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    store = StateStore(tmp_path)
+    assert store.load().prejoin_voice is None  # nothing persisted: config decides
+    store.update(lambda s: replace(s, prejoin_voice=True))
+    st = StateStore(tmp_path).load()
+    assert st.prejoin_voice is True and st.schema_version == 3
+    doc["prejoin_voice"] = "yes"
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    with pytest.raises(StateCorrupt):
+        store.load()

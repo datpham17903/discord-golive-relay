@@ -970,9 +970,10 @@ def test_watch_failure_retries_fast_without_escalation_or_rejection():
     g, _ = start(sup)
     sup.handle(Joined(g, "s1"), 0.6)
     t = 0.7
-    for _ in range(6):
+    for i in range(6):
         acts = _watch_failed(sup, g, t)
-        assert has(acts, Teardown, generation=g, leave_voice=False)
+        # every third consecutive fast retry leaves voice, so a dead parent voice client is rebuilt
+        assert has(acts, Teardown, generation=g, leave_voice=(i % 3 == 2))
         st = sup.status(t)
         assert st.state is RelayState.BACKOFF and st.backoff_until == pytest.approx(t + 1.0)
         assert st.consecutive_rejections == 0 and not has(acts, SetRejections)
@@ -1008,3 +1009,79 @@ def test_watch_timeout_retries_fast():
     acts = sup.handle(Tick(), 15.5)
     assert has(acts, Teardown, generation=g, leave_voice=False)
     assert sup.status(15.5).backoff_until == pytest.approx(16.5)
+
+
+# ------------------------------------------------- prejoin toggle, prejoin retry, gate_ready
+
+
+def _ev(name):
+    from golive_relay.supervisor import model
+
+    return getattr(model, name)
+
+
+def test_prejoin_toggle_on_joins_and_off_leaves():
+    sup = make()
+    acts = idle_in_channel(sup) + sup.handle(Tick(), 1.0)
+    assert not has(acts, _join_cls())
+    acts = sup.handle(_ev("PrejoinChanged")(True), 2.0)
+    assert [a for a in acts if isinstance(a, _join_cls())] == [_join_cls()()]
+    assert sup.prejoin_voice is True
+    acts = sup.handle(_ev("PrejoinChanged")(False), 3.0)
+    assert has(acts, LeaveVoice_cls()) and sup.prejoin_voice is False
+    assert not has(sup.handle(Tick(), 4.0), _join_cls())
+
+
+def test_prejoin_on_when_target_elsewhere_does_not_join():
+    sup = make()
+    sup.handle(GatewaySnapshot(TargetVoice(OTHER, False), None, frozenset({SRC}), True), 0.0)
+    assert not has(sup.handle(_ev("PrejoinChanged")(True), 1.0), _join_cls())
+
+
+def test_prejoin_off_while_streaming_keeps_session():
+    sup = make(prejoin_voice=True)
+    relaying(sup)
+    acts = sup.handle(_ev("PrejoinChanged")(False), 2.0)
+    assert not has(acts, LeaveVoice_cls()) and not has(acts, Teardown)
+    assert sup.status(2.0).state is RelayState.RELAYING
+
+
+def test_prejoin_failure_clears_voice_and_retries_with_backoff():
+    sup = make(prejoin_voice=True, retry_delays=(5.0, 10.0))
+    assert has(idle_in_channel(sup), _join_cls())
+    acts = sup.handle(_ev("PrejoinFailed")("boom"), 1.0)
+    assert not has(acts, _join_cls())
+    assert not has(sup.handle(Tick(), 5.9), _join_cls())
+    assert has(sup.handle(Tick(), 6.0), _join_cls())
+    sup.handle(_ev("PrejoinFailed")("boom"), 6.5)
+    assert not has(sup.handle(Tick(), 16.4), _join_cls())
+    assert has(sup.handle(Tick(), 16.5), _join_cls())
+
+
+def test_prejoin_failure_ignored_during_session():
+    sup = make(prejoin_voice=True)
+    g, _ = start(sup)
+    sup.handle(_ev("PrejoinFailed")("late"), 0.6)
+    assert sup.status(0.6).state is RelayState.CONNECTING
+    acts = sup.handle(TargetVoiceChanged(NOT_SHARING), 1.0)
+    assert has(acts, Teardown, generation=g, leave_voice=False)  # still believed in voice
+
+
+def test_non_fast_watch_failure_uses_normal_backoff():
+    sup = make(retry_delays=(5.0, 10.0))
+    g, _ = start(sup)
+    sup.handle(Joined(g, "s1"), 0.6)
+    acts = sup.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, "unauthorized", watch_retry=False), 1.0)
+    assert has(acts, Teardown, generation=g, leave_voice=True)
+    assert sup.status(1.0).backoff_until == pytest.approx(6.0)
+
+
+def test_gate_ready_at_is_debounce_start_or_backoff_expiry():
+    sup = make(debounce=0.5, retry_delays=(5.0,))
+    snap(sup, 2.0)
+    assert has(sup.handle(Tick(), 2.5), StartConnect)
+    assert sup.gate_ready_at == 2.0
+    g = sup.generation
+    sup.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, "join"), 3.0)
+    assert has(sup.handle(Tick(), 8.0), StartConnect)
+    assert sup.gate_ready_at == 8.0  # backoff time is not start latency

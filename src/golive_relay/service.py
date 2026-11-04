@@ -23,7 +23,8 @@ from discord.ext.native_voice.media import VideoConfig
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
-    ChatCommand, ParseError, RoutingContext, SetEnabled, Status, describe_change, format_status, parse, plan_change,
+    ChatCommand, ParseError, RoutingContext, SetEnabled, SetPrejoin, Status, describe_change, format_status, parse,
+    plan_change,
 )
 from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
@@ -42,7 +43,8 @@ from golive_relay.supervisor.machine import PersistedStateView, Supervisor, Supe
 from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
-    FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady, QuarantineRecord, RebuildPipeline,
+    FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
+    PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
 )
@@ -61,6 +63,8 @@ LOGIN_STAGGER_S = 2.0
 OUT_LOGIN_WAIT_S = 30.0
 SLATE_CACHE_SIZE = 4
 INCARNATION_ENDED = frozenset({StopReason.SOURCE_STOPPED, StopReason.SOURCE_LEFT_WHITELIST})
+# session_timing milestones also reported relative to stream_seen
+_FROM_SEEN = ("voice_state_confirmed", "watch_sent", "watching", "voice_connected")
 
 
 def supervisor_config(cfg: RelayConfig) -> SupervisorConfig:
@@ -146,6 +150,8 @@ class Service:
         self._rejected_routing: dict | None = None
         sup_cfg = replace(supervisor_config(cfg), target_user_id=routing.target_user_id,
                           allowed_channel_id=routing.channel_id)
+        if st.prejoin_voice is not None:  # chat override persisted in state.json; config is only the default
+            sup_cfg = replace(sup_cfg, prejoin_voice=st.prejoin_voice)
         self.sup = Supervisor(sup_cfg, persisted_view(st), mirrors=routing.mirrors)
         self.publisher = Publisher(
             lambda g, e, now: self.sup.gate_allows(g, e, now), on_need_idr=self._need_idr
@@ -183,6 +189,7 @@ class Service:
         self._timing: dict[str, Any] | None = None  # start milestones of the current generation
         self._gen = 0
         self._epoch = 0
+        self._session_gen: int | None = None  # generation of the running session; None after its Teardown
         self._in_voice = False
         self._session_id: str | None = None
         self._token = ""
@@ -370,6 +377,9 @@ class Service:
             self._handle(EnableChanged(st.desired_enabled))
         if st.fatal_latch is None and self.sup.state is RelayState.FATAL and self.sup.fatal in DURABLE_FATAL:
             self._handle(ResetFatal())
+        prejoin = self.cfg.runtime.prejoin_voice if st.prejoin_voice is None else st.prejoin_voice
+        if prejoin != self.sup.prejoin_voice:
+            self._handle(PrejoinChanged(prejoin))
         routing = Routing.from_persisted(st.routing, config_routing(self.cfg))
         if routing != self.sup.routing:
             err = routing_error(routing, self.cfg)
@@ -393,9 +403,14 @@ class Service:
                 outcome, text = "parse_error", cmd.text
             elif isinstance(cmd, Status):
                 states = {row["account"]: row["state"] for row in self.pool.status(time.monotonic())}
-                outcome, text = "status", format_status(old, ctx, self.sup.state.value, states)
+                outcome, text = "status", format_status(old, ctx, self.sup.state.value, states,
+                                                        prejoin=self.sup.prejoin_voice)
             elif isinstance(cmd, SetEnabled):
                 self._set_enabled(cmd.on)
+                outcome, text = "applied", describe_change(cmd, old, old, ctx)
+            elif isinstance(cmd, SetPrejoin):
+                self.store.update(lambda s: replace(s, prejoin_voice=cmd.on))
+                self._handle(PrejoinChanged(cmd.on))
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
             else:
                 new = plan_change(cmd, old, ctx)
@@ -501,6 +516,7 @@ class Service:
                 case Teardown(generation=g, leave_voice=leave, reason=reason):
                     self._log_timing(g, reason.value)  # a session that never opened is still reported
                     self._pool_event(SessionEnded(g, reason, reason in INCARNATION_ENDED))
+                    self._session_gen = None
                     worker, self._worker = self._worker, None
                     self._slate = self._canvas = None
                     self._queue(self._teardown, worker, leave)
@@ -673,20 +689,17 @@ class Service:
     def _start_connect(self, a: StartConnect) -> None:
         seen = self._seen_at if self._seen_stream == (a.stream.key, a.stream.incarnation) else None
         self._timing = {"generation": a.generation, "start": time.monotonic(), "seen": seen,
-                        "prejoined": self._in_voice, "marks": {}, "extra": {}}
+                        "gate_ready": self.sup.gate_ready_at, "prejoined": self._in_voice, "marks": {}, "extra": {}}
         self._gen, self._epoch = a.generation, a.epoch
         self._canvas = None
         self._worker_dead_reported = False
         try:
             self._profile = self.cfg.output_profile()
-            worker = self._worker_factory(self._profile)
         except Exception as exc:
             self._post(ConnectFailed(a.generation, StopReason.CONNECT_FAILED, True, f"worker: {exc!r}"))
             return
-        self._worker = worker
-        worker.send(Configure(a.generation, a.epoch, self._profile))
-        worker.send(SetOutput(a.generation, a.epoch, False))  # nothing is emitted until the gate opens
-        self._queue(self._connect, a.generation, a.epoch, a.stream, worker)
+        self._session_gen = a.generation
+        self._queue(self._connect, a.generation, a.epoch, a.stream)
 
     def _mark(self, g: int, name: str, **extra: Any) -> None:
         """Record the first time ``name`` happened in generation ``g`` (start milestones, never per packet)."""
@@ -701,13 +714,17 @@ class Service:
         if t is None or t["generation"] != g:
             return
         self._timing = None
-        start, seen = t["start"], t["seen"]
+        start, seen, ready = t["start"], t["seen"], t["gate_ready"]
         fields: dict[str, Any] = {"generation": g, "outcome": outcome, "prejoined": t["prejoined"], **t["extra"]}
         if seen is not None:
             fields["start_from_seen_ms"] = round((start - seen) * 1000)
+        if ready is not None:
+            fields["start_from_gate_ready_ms"] = round((start - ready) * 1000)
+            if seen is not None:
+                fields["gate_ready_from_seen_ms"] = round((ready - seen) * 1000)
         for name, at in t["marks"].items():
             fields[f"{name}_ms"] = round((at - start) * 1000)
-            if seen is not None and name in ("watch_sent", "watching"):
+            if seen is not None and name in _FROM_SEEN:
                 fields[f"{name}_from_seen_ms"] = round((at - seen) * 1000)
         self.log("session_timing", **fields)
 
@@ -718,21 +735,57 @@ class Service:
             raise RuntimeError("adapter not running")
         return self._adapter
 
-    async def _connect(self, g: int, e: int, stream: Any, worker: Any) -> None:
-        if self._worker is not worker:
+    async def _connect(self, g: int, e: int, stream: Any) -> None:
+        """Join and watch back to back like the official client: the watch (gateway op 20) is requested as soon
+        as the gateway echoes our voice state, while the voice media session connects and the worker spawns.
+        Returns only after join, watch and spawn have all settled, so a queued Teardown cleans up all of them."""
+        if self._session_gen != g:
             return
         try:
             adapter = self._need_adapter()
             adapter.set_epoch(e)
-            if not self._in_voice:
-                await self._join(adapter)
-            self._mark(g, "joined")
-            self._handle(Joined(g, self._session_id))
-            if self._worker is not worker:
-                return
         except Exception as exc:
             self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
             return
+        join: asyncio.Task | None = None
+        if not self._in_voice:
+            confirmed = asyncio.Event()
+            join = asyncio.create_task(self._join(adapter, on_voice_state=confirmed.set))
+        spawn = asyncio.create_task(self._spawn_worker(g))
+        try:
+            if join is None:
+                self._mark(g, "voice_connected")
+                self._handle(Joined(g, self._session_id))
+            else:
+                echo = asyncio.create_task(confirmed.wait())
+                await asyncio.wait({join, echo}, return_when=asyncio.FIRST_COMPLETED)
+                echo.cancel()
+                if confirmed.is_set():
+                    self._mark(g, "voice_state_confirmed")
+                elif join.exception() is not None:
+                    self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(join.exception())))
+                    return
+            if self._session_gen != g:
+                return
+            watch = asyncio.create_task(self._watch(adapter, g, e, stream))
+            try:
+                if join is not None:
+                    try:
+                        await join
+                    except Exception as exc:
+                        self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
+                    else:
+                        self._mark(g, "voice_connected")
+                        self._handle(Joined(g, self._session_id))
+            finally:
+                # never cancelled: a stream client cancelled mid-connect would stay registered in the library
+                await asyncio.wait({watch})
+        finally:
+            if join is not None and not join.done():
+                await asyncio.wait({join})
+            await asyncio.wait({spawn})
+
+    async def _watch(self, adapter: Any, g: int, e: int, stream: Any) -> None:
         try:
             self._mark(g, "watch_sent")
             await adapter.watch(g, e, stream)
@@ -742,8 +795,26 @@ class Service:
         self._mark(g, "watching")
         self._handle(Watching(g))
 
-    async def _join(self, adapter: Any) -> None:
-        self._session_id = await adapter.join()
+    async def _spawn_worker(self, g: int) -> None:
+        """The process spawn runs off the event loop, concurrently with join and watch."""
+        profile = self._profile
+        try:
+            worker = await asyncio.to_thread(self._worker_factory, profile)
+        except Exception as exc:
+            if self._session_gen == g:
+                self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, f"worker: {exc!r}"))
+            return
+        if self._session_gen != g:  # torn down while spawning: no Teardown will stop this worker
+            await self._step(asyncio.to_thread, worker.stop)
+            return
+        e = self._epoch  # a RebuildPipeline may have advanced it while spawning
+        self._worker = worker
+        worker.send(Configure(g, e, profile))
+        worker.send(SetOutput(g, e, False))  # nothing is emitted until the gate opens
+        self._mark(g, "worker_started")
+
+    async def _join(self, adapter: Any, **kw: Any) -> None:
+        self._session_id = await adapter.join(**kw)
         self._in_voice = True
 
     async def _prejoin(self) -> None:
@@ -755,6 +826,7 @@ class Service:
             await self._join(adapter)
         except Exception as exc:
             self.log("prejoin_failed", error=repr(exc))  # the next StartConnect joins as usual
+            self._handle(PrejoinFailed(repr(exc)))  # the Supervisor retries the pre-join after a retry delay
 
     async def _create_output(self, g: int, worker: Any) -> None:
         if self._worker is not worker:
@@ -1000,10 +1072,9 @@ class Service:
 
 
 def _watch_retryable(exc: Exception) -> bool:
-    """A watch refusal (STREAM_DELETE before STREAM_CREATE) is a slot race only when the reason is stream_full;
-    unauthorized, invalid_channel and the like keep normal backoff. Timeouts and other watch errors retry fast."""
-    text = str(exc)
-    return "Stream connection rejected" not in text or "stream_full" in text
+    """Fast watch retry only for a slot race: a stream_full refusal or a watch timeout. Any other refusal
+    (unauthorized, invalid_channel, ...) or error keeps normal backoff."""
+    return isinstance(exc, TimeoutError) or "stream_full" in str(exc)
 
 
 def _is_operator(uid: int | None) -> bool:

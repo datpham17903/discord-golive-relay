@@ -16,7 +16,8 @@ from golive_relay.supervisor.model import FatalReason
 from golive_relay.supervisor.outputs_model import AccountPersisted
 
 SCHEMA_VERSION = 3
-# v1 has no ``accounts`` (read as {}); v1/v2 have no ``routing`` (read as None)
+# v1 has no ``accounts`` (read as {}); v1/v2 have no ``routing`` (read as None);
+# ``prejoin_voice`` is an optional v3 key (missing reads as None)
 _READ_VERSIONS = (1, 2, 3)
 _ACCOUNT_KEYS = {"fatal_latch", "quarantine_incarnation", "consecutive_rejections"}
 _ROUTING_KEYS = {"target_user_id", "channel_id", "mirrors"}
@@ -46,6 +47,7 @@ class PersistedState:
     accounts: dict = field(default_factory=dict)
     # {"target_user_id": int, "channel_id": int, "mirrors": {str(channel_id): int(user_id)}}; None = use config
     routing: dict | None = None
+    prejoin_voice: bool | None = None  # chat override of runtime.prejoin_voice; None = use config
 
 
 def _empty_account() -> dict:
@@ -99,6 +101,7 @@ def _parse(raw: bytes) -> PersistedState:
             consecutive_rejections=data["consecutive_rejections"],
             accounts=data["accounts"] if data["schema_version"] >= 2 else {},
             routing=data["routing"] if data["schema_version"] == 3 else None,
+            prejoin_voice=data.get("prejoin_voice") if data["schema_version"] == 3 else None,
         )
         if (
             type(st.revision) is not int
@@ -106,6 +109,7 @@ def _parse(raw: bytes) -> PersistedState:
             or type(st.consecutive_rejections) is not int
             or not (st.fatal_latch is None or isinstance(st.fatal_latch, dict))
             or not (st.quarantine is None or isinstance(st.quarantine, dict))
+            or not (st.prejoin_voice is None or type(st.prejoin_voice) is bool)
         ):
             raise ValueError("bad field type")
         if st.quarantine is not None and (

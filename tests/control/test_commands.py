@@ -6,6 +6,7 @@ from golive_relay.control.commands import (
     RoutingContext,
     SetChannel,
     SetEnabled,
+    SetPrejoin,
     SetTarget,
     Status,
     describe_change,
@@ -140,3 +141,27 @@ def test_display_names_are_sanitized():
         assert "<@" not in o and "@" not in o and "`x`" not in o
     assert "123 everyone x (555)" in outs[0]
     assert "đổi target** thành 999." in outs[1]  # nothing left of the name: ID only
+
+
+def test_parse_prejoin():
+    assert parse("!relay prejoin on", P) == SetPrejoin(True)
+    assert parse("!relay PREJOIN Off", P) == SetPrejoin(False)
+    for bad in ("!relay prejoin", "!relay prejoin yes", "!relay prejoin on off"):
+        e = parse(bad, P)
+        assert isinstance(e, ParseError) and "Cú pháp" in e.text and "`prejoin <on|off>`" in e.text
+    assert "prejoin" in HELP
+
+
+def test_prejoin_plan_and_reply():
+    c, old = ctx(), routing({200: O1})
+    for on in (True, False):
+        assert plan_change(SetPrejoin(on), old, c) is old
+        text = describe_change(SetPrejoin(on), old, old, c)
+        assert text.startswith("✅") and "pre-join" in text and "<@" not in text
+    assert "bật" in describe_change(SetPrejoin(True), old, old, c)
+    assert "tắt" in describe_change(SetPrejoin(False), old, old, c)
+
+
+def test_status_shows_prejoin():
+    assert "Pre-join: bật" in format_status(routing(), ctx(), "IDLE", {}, prejoin=True)
+    assert "Pre-join: tắt" in format_status(routing(), ctx(), "IDLE", {}, prejoin=False)

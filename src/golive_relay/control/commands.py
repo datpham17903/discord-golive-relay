@@ -14,7 +14,8 @@ HELP = (
     "• `target <user_id>` - đổi người được relay\n"
     "• `channel <channel_id>` - đổi kênh voice chính\n"
     "• `mirror <channel_id>` - phát lại sang một kênh voice khác\n"
-    "• `unmirror <channel_id|all>` - gỡ mirror"
+    "• `unmirror <channel_id|all>` - gỡ mirror\n"
+    "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"
 )
 
 _USAGE = {
@@ -25,6 +26,7 @@ _USAGE = {
     "on": "`on`",
     "off": "`off`",
     "status": "`status`",
+    "prejoin": "`prejoin <on|off>`",
 }
 
 
@@ -68,7 +70,12 @@ class RemoveMirror:
     channel_id: int | None  # None = all
 
 
-Command = Status | SetEnabled | SetTarget | SetChannel | AddMirror | RemoveMirror
+@dataclass(frozen=True, slots=True)
+class SetPrejoin:
+    on: bool
+
+
+Command = Status | SetEnabled | SetPrejoin | SetTarget | SetChannel | AddMirror | RemoveMirror
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +126,10 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
         if args:
             return _usage_error(sub, "**Thừa tham số**")
         return Status() if sub == "status" else SetEnabled(sub == "on")
+    if sub == "prejoin":
+        if len(args) != 1 or args[0].lower() not in ("on", "off"):
+            return _usage_error(sub, "**Cần đúng một tham số** `on` hoặc `off`")
+        return SetPrejoin(args[0].lower() == "on")
     if sub in ("target", "channel", "mirror", "unmirror"):
         if len(args) != 1:
             return _usage_error(sub, "**Cần đúng một tham số**")
@@ -136,7 +147,7 @@ def _reject(why: str, usage: str | None = None) -> str:
 
 
 def plan_change(cmd: Command, routing: Routing, ctx: RoutingContext) -> Routing | str:
-    """New routing, or a rejection reply. Status/SetEnabled leave routing unchanged."""
+    """New routing, or a rejection reply. Status/SetEnabled/SetPrejoin leave routing unchanged."""
     if isinstance(cmd, SetTarget):
         if cmd.user_id in ctx.relay_user_ids:
             return _reject(
@@ -183,6 +194,10 @@ def plan_change(cmd: Command, routing: Routing, ctx: RoutingContext) -> Routing 
 def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContext) -> str:
     if isinstance(cmd, SetEnabled):
         return "✅ **Đã bật relay**" if cmd.on else "✅ **Đã tắt relay**"
+    if isinstance(cmd, SetPrejoin):
+        if cmd.on:
+            return "✅ **Đã bật pre-join**: relay vào sẵn kênh voice chính khi target có mặt."
+        return "✅ **Đã tắt pre-join**: relay chỉ vào voice khi target bắt đầu stream."
     if isinstance(cmd, SetTarget):
         return (
             f"✅ **Đã đổi target** thành {_user(ctx, new.target_user_id)}. "
@@ -199,10 +214,13 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
     return "✅ **Xong**"
 
 
-def format_status(routing: Routing, ctx: RoutingContext, session: str, account_states: Mapping[int, str]) -> str:
+def format_status(
+    routing: Routing, ctx: RoutingContext, session: str, account_states: Mapping[int, str], prejoin: bool = False,
+) -> str:
     lines = [
         "📡 **Trạng thái relay**",
         f"• Phiên: **{session}**",
+        f"• Pre-join: {'bật' if prejoin else 'tắt'}",
         f"• Target: {_user(ctx, routing.target_user_id)}",
         f"• Kênh chính: {_ch(routing.channel_id)}",
     ]
