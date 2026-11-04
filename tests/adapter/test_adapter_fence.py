@@ -183,3 +183,23 @@ def test_gateway_exit_emits_auth_rejected_or_invalid() -> None:
         assert isinstance(out[-1], kind)
         if kind is GatewayChanged:
             assert out[-1].state is GatewayState.INVALID
+
+
+def test_ingress_audio_window_counts_packets_and_opus_silence() -> None:
+    a, _ = make()
+    pkt = lambda kind, payload, user=TARGET: NS(user_id=user, media_type=kind, ssrc=8, sequence=None, received_at=None,
+                                                rtcp_time=None, codec="H264", timestamp=0, payload=payload)
+    for p in (pkt("audio", b"\xf8\xff\xfe"), pkt("audio", b"\xf8\xff\xfe"), pkt("audio", b"\x78\x01"),
+              pkt("video", b"\xf8\xff\xfe"), pkt("audio", b"\x78\x01", user=99)):
+        a._on_packet(p)
+    assert a.take_audio_window() == {"packets": 3, "silence": 2}
+    assert a.take_audio_window() == {"packets": 0, "silence": 0}
+
+
+def test_play_passes_configured_audio_bitrate() -> None:
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"}, audio_bitrate_kbps=128)
+    calls: list = []
+    a._out = NS(play=lambda source, **kw: calls.append((source, kw)))
+    a.play("SRC")
+    assert calls == [("SRC", {"bitrate": 128})]

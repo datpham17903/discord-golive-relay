@@ -41,6 +41,7 @@ class OutputAccountAdapter:
         network_stats: bool = False,
         codec_mode: str = "auto_decode",
         excluded_viewer_ids: frozenset[int] = frozenset(),
+        audio_bitrate_kbps: int = 64,
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
@@ -54,6 +55,7 @@ class OutputAccountAdapter:
         )
         self._client_factory = client_factory or discord.Client
         self._network_stats = network_stats
+        self._audio_bitrate_kbps = audio_bitrate_kbps
         self._client: Any = None
         self._gateway_task: asyncio.Task[Any] | None = None
         self._vc: Any = None
@@ -129,7 +131,7 @@ class OutputAccountAdapter:
         )
         codec = self._out.negotiated_video_codec
         self._events(OutReady(self.user_id, generation, attempt, codec))
-        self._out.play(source)
+        self._out.play(source, bitrate=self._audio_bitrate_kbps)
         self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
         return codec
 

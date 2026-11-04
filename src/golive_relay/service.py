@@ -841,6 +841,7 @@ class Service:
         d["adapter_running"] = self._adapter is not None
         d["metrics"] = self.metrics.snapshot()
         d["ingest_send"] = self.publisher.take_window()
+        d["ingress_audio"] = self._adapter.take_audio_window() if self._adapter is not None else {}
         d["routing"] = self.sup.routing.to_persisted()
         d["accounts"] = [
             {**row, "channel_id": self.pool.channel_of(row["account"]), **self._out_pubs[row["account"]].take_window()}
@@ -915,12 +916,15 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
     d = cfg.discord
     with InstanceLocks([d.expected_relay_user_id, *(a.user_id for a in accounts)]):
         svc = Service(
-            cfg, store, lambda events, ingress, lg: DiscordAdapter(cfg, events, ingress, lg, network_stats=cfg.logging.network_stats),
+            cfg, store, lambda events, ingress, lg: DiscordAdapter(
+                cfg, events, ingress, lg, network_stats=cfg.logging.network_stats,
+                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps),
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
                 network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs,
-                excluded_viewer_ids=cfg.authorization.excluded_viewer_ids),
+                excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
+                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps),
             output_tokens=out_tokens,
         )
         return await svc.run(token)

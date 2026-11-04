@@ -24,8 +24,9 @@ class FakeOut:
     def is_connected(self) -> bool:
         return self.connected
 
-    def play(self, source) -> None:
+    def play(self, source, **kw) -> None:
         self.calls.append(("play", source))
+        self.calls.append(("play_kw", kw))
 
     def stop(self) -> None:
         self.calls.append("out.stop")
@@ -263,5 +264,20 @@ def test_publish_does_not_join_while_excluded_viewer_present() -> None:
         a._client.voice_states = {77: {5: object()}}
         await a.publish(5, 2, 30, "SRC", 77)
         assert any(isinstance(c, tuple) and c[0] == "connect" for c in calls)
+
+    asyncio.run(go())
+
+
+def test_publish_plays_with_configured_audio_bitrate() -> None:
+    async def go():
+        calls: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), audio_bitrate_kbps=96,
+        )
+        await a.start("tok")
+        await a.publish(5, 1, 30, "SRC", CHAN)
+        assert ("play_kw", {"bitrate": 96}) in calls
+        await a.end()
 
     asyncio.run(go())

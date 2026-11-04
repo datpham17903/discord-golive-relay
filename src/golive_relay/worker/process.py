@@ -37,7 +37,7 @@ from golive_relay.worker.messages import (
     StopWorker,
     WorkerEvent,
 )
-from golive_relay.worker.timeline import RtpUnwrapper, Timeline
+from golive_relay.worker.timeline import RtpUnwrapper
 
 DECODERS = {"H264": "h264", "H265": "hevc", "VP8": "vp8", "VP9": "vp9", "AV1": "libdav1d"}
 VIDEO_CLOCK_RATE = 90_000
@@ -128,7 +128,6 @@ class Worker:
         self.encoder: Any = None
         self.encoder_name = ""
         self.pix_fmt = "yuv420p"
-        self.timeline = Timeline(AUDIO_PLAYOUT_DELAY_S)
         self.jitter_s = 0.0
         self.output_enabled = True
         self.last_idr = float("-inf")
@@ -169,6 +168,11 @@ class Worker:
         self.resampler: Any = None
         self.pcm = bytearray()
         self.last_audio_deadline = float("-inf")
+        # Audio is timed by local arrival like video, never by the sender's clock (RTCP / abs-send-time:
+        # seconds off live, which put every block outside the publisher's play window). Kept apart
+        # from video's offsets/lateness so audio never moves video's jitter buffer.
+        self.audio_unwrappers: dict[int, RtpUnwrapper] = {}
+        self.audio_offsets: dict[int, collections.deque[tuple[float, float]]] = {}
         self.force_idr = True
 
     def _event(self, kind: str, **data: Any) -> None:
@@ -197,7 +201,6 @@ class Worker:
             if msg.epoch > self.epoch:
                 self.epoch = msg.epoch
                 self._reset_epoch()
-                self.timeline = Timeline(AUDIO_PLAYOUT_DELAY_S)
                 self.announce_fresh = True
             else:
                 self.stats["stale_ignored"] += 1
@@ -606,7 +609,9 @@ class Worker:
         except av.error.FFmpegError:
             self.stats["decode_errors"] += 1
             return
-        base = self.timeline.map(m.ssrc, AUDIO_CLOCK_RATE, m.rtp_ts, m.mono_received, m.rtcp_time_mono)
+        unwrapper = self.audio_unwrappers.setdefault(m.ssrc, RtpUnwrapper(AUDIO_CLOCK_RATE))
+        rtp_s = unwrapper.unwrap(m.rtp_ts) / AUDIO_CLOCK_RATE
+        base = rtp_s + self._audio_offset(m.ssrc, rtp_s, m.mono_received) + AUDIO_PLAYOUT_DELAY_S
         for fr in frames:
             for out in self.resampler.resample(fr):
                 self.pcm += bytes(out.planes[0])[: out.samples * 4]
@@ -622,6 +627,17 @@ class Worker:
             item = EgressAudio(self.generation, self.epoch, block, deadline)
             if not self.egress.put_nowait(item, "audio", len(block)):
                 self.stats["audio_dropped"] += 1
+
+    def _audio_offset(self, ssrc: int, rtp_s: float, arrival: float) -> float:
+        """Minimum recent (arrival - rtp_s) of this audio ssrc, like video's ``_present_at``."""
+        off = arrival - rtp_s
+        q = self.audio_offsets.setdefault(ssrc, collections.deque())
+        while q and q[-1][1] >= off:
+            q.pop()
+        q.append((arrival, off))
+        while q[0][0] < arrival - JITTER_WINDOW_S:
+            q.popleft()
+        return q[0][1]
 
     # ------------------------------------------------------------ stats
 

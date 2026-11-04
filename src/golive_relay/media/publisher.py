@@ -28,6 +28,11 @@ MAX_PCM_BLOCKS = 40  # 800 ms: audio is held as long as video sits in the 600 ms
 _SILENCE = bytes(AUDIO_FRAME_BYTES)
 
 
+def _empty_window() -> dict[str, float]:
+    return {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0,
+            "audio_played": 0, "audio_held": 0, "audio_late_dropped": 0, "audio_evicted": 0}
+
+
 class Publisher:
     def __init__(
         self,
@@ -50,7 +55,7 @@ class Publisher:
         self._await_idr = False  # discard source AUs until an IDR with SPS/PPS
         self._last_idr_id: int | None = None  # idr_pic_id of the last sent AU if it was an IDR, else None
         self._last_send: float | None = None
-        self._window = {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0}
+        self._window = _empty_window()
 
     # ------------------------------------------------------------ control
 
@@ -102,6 +107,7 @@ class Publisher:
             self._audio.append(au)
             while len(self._audio) > MAX_PCM_BLOCKS:
                 self._audio.popleft()
+                self._window["audio_evicted"] += 1
 
     # -------------------------------------------------------------- reads
 
@@ -124,9 +130,10 @@ class Publisher:
         self._last_send = now
 
     def take_window(self) -> dict[str, float]:
-        """Send counters since the last call: sent, stalls (gaps over 50 ms), max_send_gap_ms."""
+        """Send counters since the last call: sent, stalls (gaps over 50 ms), max_send_gap_ms, and audio
+        blocks played / held (head not yet due) / late_dropped / evicted (queue overflow)."""
         with self._lock:
-            w, self._window = self._window, {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0}
+            w, self._window = self._window, _empty_window()
         return w
 
     def _gate_open_locked(self, now: float) -> bool:
@@ -203,8 +210,11 @@ class Publisher:
                 return _SILENCE
             while self._audio:
                 if self._audio[0].deadline > now:
+                    self._window["audio_held"] += 1
                     return _SILENCE  # hold until the shared-timeline deadline, like video
                 au = self._audio.popleft()
                 if now - au.deadline <= self._max_late:
+                    self._window["audio_played"] += 1
                     return au.pcm
+                self._window["audio_late_dropped"] += 1
             return _SILENCE

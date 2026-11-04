@@ -10,6 +10,7 @@ stream; ``resumed`` -> FRESH is therefore emitted after every earlier event
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, Callable
 
@@ -40,6 +41,7 @@ from golive_relay.worker.messages import IngressAudio, IngressVideo
 
 PROGRESS_MIN_INTERVAL_S = 0.25  # 4 per second
 CONNECT_TIMEOUT_S = 15
+OPUS_SILENCE = b"\xf8\xff\xfe"  # the frame a sender emits while muted / silent
 
 
 class _Client(discord.Client):
@@ -68,6 +70,7 @@ class DiscordAdapter:
         paused_verified: bool = False,
         decodable: set[str] | None = None,
         network_stats: bool = False,
+        audio_bitrate_kbps: int = 64,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -88,6 +91,7 @@ class DiscordAdapter:
         self._parent_cls = self._make_parent_cls(
             codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
+        self._audio_bitrate_kbps = audio_bitrate_kbps
         self._watch_cls = nv.StreamClient.with_config(
             codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
@@ -106,6 +110,8 @@ class DiscordAdapter:
         self._video_ssrc: int | None = None
         self._last_seq: dict[int, int | None] = {}
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
+        self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
+        self._audio_window = {"packets": 0, "silence": 0}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -396,7 +402,13 @@ class DiscordAdapter:
         return self._out.negotiated_video_codec
 
     def play(self, source: Any) -> None:
-        self._out.play(source)
+        self._out.play(source, bitrate=self._audio_bitrate_kbps)
+
+    def take_audio_window(self) -> dict[str, int]:
+        """Target audio packets received since the last call, and how many were Opus silence frames."""
+        with self._audio_lock:
+            w, self._audio_window = self._audio_window, {"packets": 0, "silence": 0}
+        return w
 
     def network_stats(self) -> dict[str, dict[str, int]]:
         """Loss/NACK/RTX counters of the watch and own-output clients (empty when disabled or absent)."""
@@ -462,6 +474,9 @@ class DiscordAdapter:
                 self._loop.call_soon_threadsafe(self._request_video, pkt.ssrc)
         else:
             msg = IngressAudio(generation, epoch, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload))
+            with self._audio_lock:
+                self._audio_window["packets"] += 1
+                self._audio_window["silence"] += msg.data == OPUS_SILENCE
         self._ingress(msg)
         fresh = pkt.sequence is None or self._last_seq.get(pkt.ssrc) != pkt.sequence
         self._last_seq[pkt.ssrc] = pkt.sequence

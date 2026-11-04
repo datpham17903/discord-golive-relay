@@ -203,4 +203,20 @@ def test_send_gap_metrics_count_stalls_over_50ms(slate):
     w = e.pub.take_window()
     assert w["sent"] == 4 and w["stalls"] == 1
     assert w["max_send_gap_ms"] == pytest.approx(200.0)
-    assert e.pub.take_window() == {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0}
+    assert e.pub.take_window() == {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0, "audio_played": 0,
+                                   "audio_held": 0, "audio_late_dropped": 0, "audio_evicted": 0}
+
+
+def test_audio_window_counts_played_held_late_and_evicted(slate):
+    e = Env(slate)
+    e.pub.set_source(1, 1)
+    e.pub.offer_audio(EgressAudio(1, 1, b"\x01" * AUDIO_FRAME_BYTES, e.now - 1.0))  # too late
+    e.pub.offer_audio(EgressAudio(1, 1, b"\x02" * AUDIO_FRAME_BYTES, e.now))
+    e.pub.offer_audio(EgressAudio(1, 1, b"\x03" * AUDIO_FRAME_BYTES, e.now + 0.5))  # head in the future
+    assert e.pub.next_audio()[0] == 2
+    assert e.pub.next_audio() == bytes(AUDIO_FRAME_BYTES)
+    for _ in range(MAX_PCM_BLOCKS + 2):
+        e.pub.offer_audio(EgressAudio(1, 1, b"\x04" * AUDIO_FRAME_BYTES, e.now + 1.0))
+    w = e.pub.take_window()
+    assert (w["audio_played"], w["audio_held"], w["audio_late_dropped"], w["audio_evicted"]) == (1, 1, 1, 3)
+    assert e.pub.take_window()["audio_played"] == 0

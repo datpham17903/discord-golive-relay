@@ -131,6 +131,9 @@ class FakeAdapter:
     def display_name(self, uid: int) -> str | None:
         return None
 
+    def take_audio_window(self) -> dict[str, int]:
+        return {"packets": 0, "silence": 0}
+
 
 class Env:
     def __init__(self, tmp_path: Path, slate, source_gop, enabled=True, latch=None) -> None:
@@ -492,8 +495,18 @@ def test_status_network_only_when_enabled(tmp_path, slate, source_gop):
     assert "network" not in env.svc.status_dict()
     env.svc.cfg = replace(env.svc.cfg, logging=replace(env.svc.cfg.logging, network_stats=True))
     assert env.svc.status_dict()["network"] == {}
-    env.svc._adapter = type("A", (), {"network_stats": lambda self: {"watch": {"video_sequence_gaps": 3}}})()
+    env.svc._adapter = type("A", (), {"network_stats": lambda self: {"watch": {"video_sequence_gaps": 3}},
+                                      "take_audio_window": lambda self: {"packets": 0, "silence": 0}})()
     assert env.svc.status_dict()["network"] == {"watch": {"video_sequence_gaps": 3}}
+
+
+def test_status_exposes_audio_counters(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    assert env.svc.status_dict()["ingress_audio"] == {}
+    env.svc._adapter = type("A", (), {"take_audio_window": lambda self: {"packets": 50, "silence": 50}})()
+    st = env.svc.status_dict()
+    assert st["ingress_audio"] == {"packets": 50, "silence": 50}
+    assert {"audio_played", "audio_held", "audio_late_dropped", "audio_evicted"} <= st["ingest_send"].keys()
 
 
 OPERATOR, CMD_CHAN = 50, 60
