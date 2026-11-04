@@ -136,11 +136,11 @@ class FakeAdapter:
 
 
 class Env:
-    def __init__(self, tmp_path: Path, slate, source_gop, enabled=True, latch=None) -> None:
+    def __init__(self, tmp_path: Path, slate, source_gop, enabled=True, latch=None, **runtime_kw) -> None:
         cfg = load_config(ROOT / "config.example.yaml")
         cfg = replace(
             cfg,
-            runtime=replace(cfg.runtime, start_debounce_ms=0),
+            runtime=replace(cfg.runtime, start_debounce_ms=0, **runtime_kw),
             liveness=replace(cfg.liveness, source_dead_timeout_seconds=30.0),
             storage=replace(cfg.storage, state_directory=tmp_path),
         )
@@ -151,6 +151,7 @@ class Env:
         self.adapters: list[FakeAdapter] = []
         self.workers: list[FakeWorker] = []
         self.logs: list = []
+        self.log_kw: list[tuple[str, dict]] = []
 
         def adapter_factory(events, ingress, log):
             a = FakeAdapter(events, ingress, log, self.order)
@@ -163,7 +164,7 @@ class Env:
             return w
 
         self.svc = Service(cfg, self.store, adapter_factory, worker_factory,
-                           lambda name, **kw: self.logs.append(name),
+                           lambda name, **kw: (self.logs.append(name), self.log_kw.append((name, kw))),
                            slate_builder=lambda *a: slate, install_signals=False, tick_s=0.02)
         d = cfg.discord
         self.chan, self.target = d.allowed_voice_channel_id, d.target_user_id
@@ -680,3 +681,205 @@ def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source
         assert await task == 0
 
     asyncio.run(main())
+
+
+# ------------------------------------------------------- start latency / slot race
+
+
+def timings(env) -> list[dict]:
+    return [kw for name, kw in env.log_kw if name == "session_timing"]
+
+
+def test_slate_builds_concurrently_with_create_output(tmp_path, slate, source_gop):
+    import threading
+
+    env = Env(tmp_path, slate, source_gop)
+    created = threading.Event()
+    overlap: list[bool] = []
+
+    def builder(*a):
+        overlap.append(created.wait(2.0))  # sequential (slate, then create) would time out here
+        return slate
+
+    env.svc._slate_builder = builder
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        real = a.create_output
+
+        async def create(g, fps):
+            created.set()
+            return await real(g, fps)
+
+        a.create_output = create
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        assert env.svc.publisher._slate is slate  # set before OutputReady opened the gate
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    assert overlap == [True]
+
+
+def test_slate_is_cached_across_sessions(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.model import StreamEnded, StreamStarted
+
+    env = Env(tmp_path, slate, source_gop)
+    built: list[tuple] = []
+    env.svc._slate_builder = lambda *a: built.append(a) or slate
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        a.events(StreamEnded("key-1", 1))
+        await wait_until(lambda: env.svc.sup.state is RelayState.IDLE)
+        a.events(StreamStarted(SourceStream("key-1", env.target, env.chan, 2, None, False)))
+        await wait_until(lambda: a.calls.count("watch") == 2)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    assert len(built) == 1
+    t = [kw for kw in timings(env) if kw["outcome"] == "open"]
+    assert [kw["slate_cached"] for kw in t] == [False, True]
+
+
+def test_slate_failure_surfaces_and_created_output_is_ended(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    def boom(*a):
+        raise ValueError("slate broke")
+
+    env.svc._slate_builder = boom
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.BACKOFF)
+        await wait_until(lambda: "end_output" in env.order)
+        assert "create_output" in a.calls and "play" not in a.calls
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    t = timings(env)
+    assert t and t[0]["outcome"] == "connect_failed" and "watching_from_seen_ms" in t[0]
+
+
+def test_slate_skipped_when_nothing_publishes(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    cfg = replace(env.cfg, discord=replace(env.cfg.discord, ingest_publishes=False))
+    built: list = []
+    env.svc = Service(cfg, env.store, lambda ev, ing, lg: env.adapters.append(FakeAdapter(ev, ing, lg, env.order))
+                      or env.adapters[-1], lambda profile: FakeWorker(source_gop), lambda *a, **k: None,
+                      slate_builder=lambda *a: built.append(a) or slate, install_signals=False, tick_s=0.02)
+
+    async def main():
+        task = await reach_relaying(env)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    assert built == []
+
+
+def test_pli_does_not_wait_behind_ops_queue(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.model import RequestInputKeyframe
+
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        a, svc = env.adapters[0], env.svc
+        release = asyncio.Event()
+
+        async def slow_op():
+            await release.wait()
+
+        svc._queue(slow_op)
+        svc._on_worker_event(WorkerEvent(svc.sup.generation, svc.sup.epoch, "need_keyframe", {}))
+        await wait_until(lambda: a.calls.count("pli") == 1, timeout=1.0)
+        svc._execute([RequestInputKeyframe(svc.sup.generation, "pli")])
+        await wait_until(lambda: a.calls.count("pli") == 2, timeout=1.0)
+        release.set()
+        svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_session_timing_logged_once_at_open(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    t = timings(env)
+    assert len(t) == 1 and t[0]["outcome"] == "open" and t[0]["prejoined"] is False
+    for k in ("start_from_seen_ms", "watch_sent_from_seen_ms", "watching_from_seen_ms", "joined_ms", "watch_sent_ms",
+              "watching_ms", "first_video_packet_ms", "first_frame_ms", "slate_ready_ms", "slate_ms",
+              "output_created_ms", "output_create_ms", "open_gate_ms"):
+        assert isinstance(t[0][k], int) and t[0][k] >= 0, k
+    assert t[0]["slate_cached"] is False
+
+
+def test_prejoin_joins_before_stream_then_only_watches(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: "join" in a.calls)
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        env.svc.request_shutdown()
+        await task
+        assert a.calls.count("join") == 1
+
+    asyncio.run(main())
+    assert timings(env)[0]["prejoined"] is True
+
+
+def test_full_stream_watch_retries_fast_without_rejoining(tmp_path, slate, source_gop):
+    from discord import ClientException
+
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+
+        async def watch(g, e, stream):
+            a.calls.append("watch")
+            if a.calls.count("watch") == 1:
+                raise ClientException("Stream connection rejected: stream_full")
+
+        a.watch = watch
+        a.events(env.snapshot())
+        await wait_until(lambda: a.calls.count("watch") == 2, timeout=3.0)
+        assert a.calls.count("join") == 1 and "leave" not in env.order
+        assert env.svc.sup.status(time.monotonic()).consecutive_rejections == 0
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    assert timings(env)[0]["outcome"] == "connect_failed"

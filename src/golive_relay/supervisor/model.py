@@ -252,6 +252,7 @@ class ConnectFailed:
     reason: StopReason
     retryable: bool
     detail: str = ""
+    watch_retry: bool = False  # joined, but the watch failed (e.g. stream_full): retry the watch fast
 
 
 @dataclass(frozen=True, slots=True)
@@ -391,6 +392,11 @@ class LeaveVoice:
 
 
 @dataclass(frozen=True, slots=True)
+class JoinVoice:
+    """Pre-join (runtime.prejoin_voice): join the main channel before the target streams."""
+
+
+@dataclass(frozen=True, slots=True)
 class SetFatalLatch:
     reason: FatalReason
     detail: str = ""
@@ -425,7 +431,7 @@ class ApplyRouting:
 
 Action = (
     CloseGate | OpenGate | ShowSlate | StartConnect | CreateOutput | RebuildPipeline | RequestInputKeyframe
-    | Teardown | LeaveVoice | SetFatalLatch | ClearFatalLatch | SetQuarantine | SetRejections | Exit | ApplyRouting
+    | Teardown | LeaveVoice | JoinVoice | SetFatalLatch | ClearFatalLatch | SetQuarantine | SetRejections | Exit | ApplyRouting
 )
 
 

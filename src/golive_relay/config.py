@@ -94,6 +94,7 @@ class RuntimeConfig:
     feedback_idr_min_interval_ms: int
     repeated_rejection_limit: int
     recording_enabled: bool
+    prejoin_voice: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -445,6 +446,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         feedback_idr_min_interval_ms=r.int_("feedback_idr_min_interval_ms", minimum=0),
         repeated_rejection_limit=r.int_("repeated_rejection_limit"),
         recording_enabled=r.only_false("recording_enabled"),
+        prejoin_voice=r.opt_bool("prejoin_voice"),
     )
     if runtime.keyframe_interval_seconds > 2.0:  # num() already rejects values <= 0
         r._err("keyframe_interval_seconds", "must be > 0 and <= 2.0")

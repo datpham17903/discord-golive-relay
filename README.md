@@ -142,7 +142,7 @@ relayctl validate --config config.yaml
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
 | `audio.source` | Audio source | `target_stream_only` | never (only value) |
-| `runtime.start_debounce_ms` | Wait before reacting to a start | `500` | rarely |
+| `runtime.start_debounce_ms` | Wait before reacting to a start | `500` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
 | `runtime.idle_voice_grace_seconds` | Grace while the target is idle in voice | `30` | rarely |
 | `runtime.hold_recovery_timeout_seconds` | How long a HOLD (slate) may last | `15` | rarely |
 | `runtime.connect_timeout_seconds` | Voice connect timeout | `15` | slow networks |
@@ -153,6 +153,7 @@ relayctl validate --config config.yaml
 | `runtime.feedback_idr_min_interval_ms` | Min gap between keyframes forced by viewer feedback | `500` | rarely |
 | `runtime.repeated_rejection_limit` | Consecutive rejected sessions before FATAL | `3` | rarely |
 | `runtime.recording_enabled` | Recording | `false` | never (must be `false`) |
+| `runtime.prejoin_voice` | The ingest joins the main channel while the target is there, before it streams, so a stream start only needs the watch (all start gates still apply; it leaves when the target leaves, the relay is disabled or routing changes). Independently of this setting, a watch refused or timed out while the target streams (for example `stream_full`) is retried about every second for up to 5 minutes, then normal backoff | `false` | slot races on a busy stream |
 | `liveness.source_dead_timeout_seconds` | Seconds without source packets before the relay treats the source as dead (`T_dead`) | `null` | set by section 6 (the service refuses to run while `null`) |
 | `liveness.verified_capability_manifest` | Capability file with the measured value | `manifests/verified-capabilities.json` | different location |
 | `storage.state_directory` | Where `state.json`, `status.json` and the control socket live | `/var/lib/discord-relay` | always on Windows (for example `state`) |

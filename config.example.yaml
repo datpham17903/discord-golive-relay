@@ -52,6 +52,7 @@ runtime:
   feedback_idr_min_interval_ms: 500
   repeated_rejection_limit: 3
   recording_enabled: false
+  prejoin_voice: false        # opt-in: the ingest joins the main channel while the target is there, before it streams
 
 liveness:
   source_dead_timeout_seconds: null   # must be the value measured in M0 before enabling

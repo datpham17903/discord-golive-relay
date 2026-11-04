@@ -866,3 +866,145 @@ def test_mirrors_only_change_does_not_stop():
     acts = sup.handle(RoutingChanged(Routing(SRC, CH, {5: 6})), 2.0)
     assert acts == [ApplyRouting(Routing(SRC, CH, {5: 6}))]
     assert sup.status(2.0).state is RelayState.RELAYING
+
+
+# ------------------------------------------------- slot race: prejoin, debounce, fast watch retry
+
+
+def _join_cls():
+    from golive_relay.supervisor.model import JoinVoice
+
+    return JoinVoice
+
+
+NOT_SHARING = TargetVoice(CH, False)
+
+
+def idle_in_channel(sup, now=0.0, participants=frozenset({SRC})):
+    return sup.handle(GatewaySnapshot(NOT_SHARING, None, participants, True), now)
+
+
+def test_prejoin_off_by_default():
+    sup = make()
+    acts = idle_in_channel(sup) + sup.handle(Tick(), 5.0)
+    assert not has(acts, _join_cls())
+
+
+def test_prejoin_joins_once_when_target_in_channel():
+    sup = make(prejoin_voice=True)
+    acts = idle_in_channel(sup)
+    assert [a for a in acts if isinstance(a, _join_cls())] == [_join_cls()()]
+    assert not has(sup.handle(Tick(), 1.0), _join_cls())
+    assert not has(sup.handle(Tick(), 100.0), LeaveVoice_cls())  # no idle grace while prejoined
+    assert sup.status(100.0).state is RelayState.IDLE
+
+
+def test_prejoin_keeps_join_gates():
+    q = QuarantineRecord(SRC, "k", 1, 0.0)
+    for sup in (
+        make(enabled=False, prejoin_voice=True),
+        make(fatal=FatalReason.AUTH_REJECTED, prejoin_voice=True),
+        make(prejoin_voice=True, excluded_viewer_ids=frozenset({77})),
+    ):
+        acts = idle_in_channel(sup, participants=frozenset({SRC, 77})) + sup.handle(Tick(), 1.0)
+        assert not has(acts, _join_cls())
+    sup = make(prejoin_voice=True)  # quarantined incarnation still streaming
+    sup2 = make(quarantine=q, prejoin_voice=True)
+    acts = snap(sup2, 0.0) + sup2.handle(Tick(), 1.0)
+    assert sup2.status(1.0).state is RelayState.QUARANTINE and not has(acts, _join_cls())
+    sup.handle(TargetVoiceChanged(TargetVoice(OTHER, False)), 0.0)  # gateway never synced
+    assert not has(sup.handle(Tick(), 1.0), _join_cls())
+    sup3 = make(prejoin_voice=True)
+    acts = sup3.handle(GatewaySnapshot(TargetVoice(OTHER, False), None, frozenset({SRC}), True), 0.0)
+    assert not has(acts + sup3.handle(Tick(), 1.0), _join_cls())
+
+
+def test_prejoin_leaves_when_target_leaves_or_disabled():
+    sup = make(prejoin_voice=True)
+    idle_in_channel(sup)
+    assert has(sup.handle(TargetVoiceChanged(TargetVoice(OTHER, False)), 1.0), LeaveVoice_cls())
+    assert has(sup.handle(TargetVoiceChanged(NOT_SHARING), 2.0), _join_cls())  # back in: joins again
+    assert has(sup.handle(EnableChanged(False), 3.0), LeaveVoice_cls())
+    sup = make(prejoin_voice=True)
+    idle_in_channel(sup)
+    assert has(sup.handle(RoutingChanged(Routing(SRC, OTHER, {})), 1.0), LeaveVoice_cls())
+
+
+def test_prejoin_gate_loss_leaves_after_idle_grace():
+    sup = make(prejoin_voice=True, excluded_viewer_ids=frozenset({77}))
+    idle_in_channel(sup)
+    assert not has(sup.handle(ParticipantsChanged(frozenset({SRC, 77})), 1.0), LeaveVoice_cls())
+    assert not has(sup.handle(Tick(), 30.9), LeaveVoice_cls())
+    assert has(sup.handle(Tick(), 31.0), LeaveVoice_cls())
+
+
+def test_prejoin_stays_in_voice_after_stream_ends():
+    sup = make(prejoin_voice=True)
+    g, _ = relaying(sup)
+    acts = sup.handle(TargetVoiceChanged(NOT_SHARING), 2.0)
+    assert has(acts, Teardown, generation=g, leave_voice=False)
+    assert not has(sup.handle(Tick(), 100.0), LeaveVoice_cls())
+
+
+def test_prejoined_stream_start_waits_at_most_debounce():
+    sup = make(prejoin_voice=True, debounce=0.0)
+    idle_in_channel(sup)
+    sup.handle(TargetVoiceChanged(IN), 1.0)
+    acts = sup.handle(StreamStarted(stream()), 1.0)
+    assert has(acts, StartConnect) and not has(acts, _join_cls())
+
+
+def test_already_streaming_when_enabled_starts_within_debounce():
+    sup = make(enabled=False, debounce=0.05)
+    snap(sup, 0.0)
+    assert not has(sup.handle(EnableChanged(True), 1.0), StartConnect)
+    assert has(sup.handle(Tick(), 1.05), StartConnect)
+
+
+def _watch_failed(sup, g, now, detail="Stream connection rejected: stream_full"):
+    return sup.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, detail, watch_retry=True), now)
+
+
+def test_watch_failure_retries_fast_without_escalation_or_rejection():
+    sup = make(retry_delays=(5.0, 10.0))
+    g, _ = start(sup)
+    sup.handle(Joined(g, "s1"), 0.6)
+    t = 0.7
+    for _ in range(6):
+        acts = _watch_failed(sup, g, t)
+        assert has(acts, Teardown, generation=g, leave_voice=False)
+        st = sup.status(t)
+        assert st.state is RelayState.BACKOFF and st.backoff_until == pytest.approx(t + 1.0)
+        assert st.consecutive_rejections == 0 and not has(acts, SetRejections)
+        sc = find(sup.handle(Tick(), t + 1.0), StartConnect)
+        g = sc.generation
+        sup.handle(Joined(g, "s1"), t + 1.0)
+        t += 1.1
+
+
+def test_watch_fast_retry_is_capped_then_normal_backoff():
+    sup = make(retry_delays=(5.0, 10.0), watch_retry_cap=3.0)
+    g, _ = start(sup)
+    sup.handle(Joined(g, "s1"), 0.5)
+    _watch_failed(sup, g, 1.0)
+    g = find(sup.handle(Tick(), 2.0), StartConnect).generation
+    _watch_failed(sup, g, 4.5)  # 3.5 s after the first fast retry: cap reached
+    st = sup.status(4.5)
+    assert st.state is RelayState.BACKOFF and st.backoff_until == pytest.approx(9.5)
+
+
+def test_join_failure_keeps_normal_backoff():
+    sup = make(retry_delays=(5.0, 10.0))
+    g, _ = start(sup)
+    acts = sup.handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, "join"), 1.0)
+    assert has(acts, Teardown, generation=g, leave_voice=True)
+    assert sup.status(1.0).backoff_until == pytest.approx(6.0)
+
+
+def test_watch_timeout_retries_fast():
+    sup = make(retry_delays=(5.0, 10.0), connect_timeout=15.0)
+    g, _ = start(sup)
+    sup.handle(Joined(g, "s1"), 0.6)
+    acts = sup.handle(Tick(), 15.5)
+    assert has(acts, Teardown, generation=g, leave_voice=False)
+    assert sup.status(15.5).backoff_until == pytest.approx(16.5)

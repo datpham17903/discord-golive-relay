@@ -319,3 +319,14 @@ def test_control_config_requires_operators_when_enabled(tmp_path: Path):
     assert any("control.command_prefix" in e for e in _errors(tmp_path, raw))
     raw["control"] = {"bogus": 1}
     assert any("control.bogus" in e for e in _errors(tmp_path, raw))
+
+
+def test_prejoin_voice_is_opt_in(tmp_path):
+    assert load_config(EXAMPLE).runtime.prejoin_voice is False
+    raw = _raw()
+    del raw["runtime"]["prejoin_voice"]
+    assert _load(tmp_path, raw).runtime.prejoin_voice is False
+    raw["runtime"]["prejoin_voice"] = True
+    assert _load(tmp_path, raw).runtime.prejoin_voice is True
+    raw["runtime"]["prejoin_voice"] = "yes"
+    assert any("prejoin_voice" in e for e in _errors(tmp_path, raw))

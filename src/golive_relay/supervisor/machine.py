@@ -17,7 +17,7 @@ from .liveness import LivenessTracker
 from .model import (
     Action, ApplyRouting, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
     DURABLE_FATAL, EnableChanged, Event, Exit, FatalReason, FirstFrame, FreshFrame, GateFacts, GatewayChanged,
-    GatewaySnapshot, GatewayState, HoldReason, InboundHealth, Joined, LeaveVoice, Liveness, OpenGate, OutputHealth,
+    GatewaySnapshot, GatewayState, HoldReason, InboundHealth, Joined, JoinVoice, LeaveVoice, Liveness, OpenGate, OutputHealth,
     OutputReady, ParticipantsChanged, QuarantineRecord, RebuildPipeline, RelayState, RelayVoiceObserved,
     RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, SourceStream, StartConnect, StatusSnapshot, StopReason, StreamEnded, StreamStarted,
@@ -33,6 +33,8 @@ _SESSION = frozenset({RelayState.CONNECTING, RelayState.RELAYING, RelayState.HOL
 _PREFLIGHT_IGNORED = frozenset(
     {"decodable_frame", "incarnation", "relay_channel", "ownership", "liveness", "rtc_ready", "generation_epoch"}
 )
+# Pre-join needs everything a start needs except a stream to watch.
+_PREJOIN_IGNORED = _PREFLIGHT_IGNORED | {"target_streaming", "stream_available", "not_paused"}
 _BACKOFF_REASONS = frozenset(
     {StopReason.HOLD_EXPIRED, StopReason.OUTPUT_DEAD, StopReason.CODEC_MISMATCH, StopReason.CONNECT_FAILED}
 )
@@ -59,6 +61,9 @@ class SupervisorConfig:
     paused_capability_verified: bool = False
     keyframe_methods: tuple[str, ...] = ("pli", "rewatch")
     keyframe_step_seconds: float = 3.0  # wait per recovery step before trying the next one
+    prejoin_voice: bool = False
+    watch_retry_interval: float = 1.0  # watch failed while joined (slot race): retry this fast, jittered
+    watch_retry_cap: float = 300.0  # after this long of fast watch retries, normal backoff resumes
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +94,9 @@ class Supervisor:
         self.epoch = 0
         self._liveness = LivenessTracker(cfg.t_dead)
         self._owner = OwnershipDetector()
-        self._retry = RetryPolicy(cfg.retry_delays, cfg.retry_cooldown, jitter=cfg.retry_jitter, rng=rng)
+        self._rng = rng or random.Random()
+        self._retry = RetryPolicy(cfg.retry_delays, cfg.retry_cooldown, jitter=cfg.retry_jitter, rng=self._rng)
+        self._watch_retry_since: float | None = None
         self._in_voice = False
         self._leave_at: float | None = None
         self._debounce_since: float | None = None
@@ -299,7 +306,7 @@ class Supervisor:
                 if not self._codec_ok(e.negotiated_video_codec):
                     self._stop(StopReason.CODEC_MISMATCH, now, acts)
             case ConnectFailed() as e if self._cur(e):
-                self._stop(e.reason, now, acts, retryable=e.retryable, detail=e.detail)
+                self._stop(e.reason, now, acts, retryable=e.retryable, detail=e.detail, watch_retry=e.watch_retry)
             case InboundHealth() as e if self._cur(e):
                 self._inbound = e.ok
             case OutputHealth() as e if self._cur(e):
@@ -416,11 +423,12 @@ class Supervisor:
 
     def _stop(
         self, reason: StopReason, now: float, acts: list[Action], retryable: bool = True, detail: str = "",
-        keep_voice: bool = False,
+        keep_voice: bool = False, watch_retry: bool = False,
     ) -> None:
         in_session = self.state in _SESSION
         ss, media = self._session_stream, self._media_seen
-        keep_voice = (reason is StopReason.SOURCE_STOPPED or keep_voice) and self._in_voice
+        fast = reason is StopReason.CONNECT_FAILED and watch_retry and retryable and self._fast_watch_retry(now)
+        keep_voice = (reason is StopReason.SOURCE_STOPPED or keep_voice or fast) and self._in_voice
         acts.append(CloseGate(reason.value))
         if in_session:
             acts.append(Teardown(self.generation, not keep_voice, reason))
@@ -454,11 +462,20 @@ class Supervisor:
         elif reason is StopReason.RELAY_DISPLACED and ss is not None:
             self._displaced(ss, acts)
         elif reason in _BACKOFF_REASONS:
-            delay = self._retry.next_delay() if retryable else self.cfg.retry_cooldown
+            if fast:  # not a rejection and no escalation: the next watch should win a freed slot quickly
+                j = self.cfg.retry_jitter
+                delay = self.cfg.watch_retry_interval * (1 + self._rng.uniform(-j, j))
+            else:
+                delay = self._retry.next_delay() if retryable else self.cfg.retry_cooldown
             self._backoff_until = now + delay
             self.state = RelayState.BACKOFF
         else:
             self.state = RelayState.IDLE
+
+    def _fast_watch_retry(self, now: float) -> bool:
+        if self._watch_retry_since is None:
+            self._watch_retry_since = now
+        return now - self._watch_retry_since < self.cfg.watch_retry_cap
 
     def _latch(self, reason: FatalReason, detail: str, acts: list[Action]) -> None:
         acts.append(SetFatalLatch(reason, detail))
@@ -525,15 +542,30 @@ class Supervisor:
                 self._start(now, acts)
             return
         self._debounce_since = None
+        self._watch_retry_since = None
+        prejoin = self.cfg.prejoin_voice and self._prejoin_ok(now)
         if not self._in_voice:
+            if prejoin:
+                acts.append(JoinVoice())
+                self._in_voice = True
+                self._leave_at = None
             return
         t = self.target
         if t is None or t.channel_id != self.cfg.allowed_channel_id:
             acts.append(LeaveVoice("source_left_voice"))
             self._in_voice = False
+        elif prejoin:
+            self._leave_at = None  # stay ready for the next stream start
+        elif self.cfg.prejoin_voice and self._leave_at is None:
+            self._leave_at = now + self.cfg.idle_grace
         elif self._leave_at is not None and now >= self._leave_at:
             acts.append(LeaveVoice("idle_grace"))
             self._in_voice = False
+
+    def _prejoin_ok(self, now: float) -> bool:
+        """Every join gate passes; only the stream itself is missing."""
+        failed = evaluate_gate(self._facts(now)).failed
+        return not (set(failed) - _PREJOIN_IGNORED)
 
     def _backoff(self, now: float, acts: list[Action]) -> None:
         if not self._source_ok(now):
@@ -548,7 +580,10 @@ class Supervisor:
         cfg = self.cfg
         if not (self._joined and self._watching):
             if now - self._connect_started >= cfg.connect_timeout:
-                self._stop(StopReason.CONNECT_FAILED, now, acts, detail="join timeout")
+                if self._joined:
+                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="watch timeout", watch_retry=True)
+                else:
+                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="join timeout")
                 return
         elif not self._has_frame and self._ready_at is not None and now - self._ready_at >= cfg.first_media_timeout:
             self._stop(StopReason.CONNECT_FAILED, now, acts, detail="no first media")
@@ -571,6 +606,7 @@ class Supervisor:
         self._hold_reason = None
         self._hold_deadline = None
         self._retry.reset()
+        self._watch_retry_since = None
         acts.append(OpenGate(self.generation, self.epoch))
 
     def _relaying(self, now: float, acts: list[Action]) -> None:
