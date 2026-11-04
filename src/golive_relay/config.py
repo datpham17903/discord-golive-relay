@@ -18,6 +18,7 @@ from golive_relay.worker.messages import OutputProfile
 
 MAX_INPUT_PIXELS = 3840 * 2160  # decode guard; not configurable in v1
 VIDEO_ENCODERS = ("libx264", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "h264_vaapi")
+VIDEO_MODES = ("transcode", "passthrough")
 HW_DECODE_DEVICES = ("none", "d3d11va", "cuda", "vaapi", "videotoolbox")  # matches hwaccel.HW_DEVICE_ORDER
 MAX_OUTPUT_ACCOUNTS = 9
 _CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -57,6 +58,7 @@ class CodecsConfig:
     output_rids: int
     video_encoder: str = "auto"
     hw_decode: str = "none"
+    video_mode: str = "transcode"
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +111,7 @@ class StorageConfig:
 class LoggingConfig:
     level: str
     include_media: bool
+    network_stats: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -142,6 +145,7 @@ class RelayConfig:
             audio_enabled=self.audio.enabled,
             video_encoder=self.codecs.video_encoder,
             hw_decode=self.codecs.hw_decode,
+            video_mode=self.codecs.video_mode,
         )
 
     def profile_key(self) -> tuple[int, int, int]:
@@ -252,6 +256,17 @@ class _Reader:
             self._err(key, "must be false (not implemented)")
         return False
 
+    def opt_bool(self, key: str) -> bool:
+        """Optional boolean key, False when absent."""
+        self._seen.add(key)
+        if key not in self.data:
+            return False
+        v = self.data[key]
+        if not isinstance(v, bool):
+            self._err(key, "must be a boolean")
+            return False
+        return v
+
     def bool_(self, key: str) -> bool:
         v = self._get(key)
         if not isinstance(v, bool):
@@ -335,14 +350,15 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
 
     r = _Reader("codecs", top._get("codecs"), errors)
     codecs = CodecsConfig(
-        r.str_("parent_codecs", ("auto_decode",)),
-        r.str_("watch_codecs", ("auto_decode",)),
+        r.str_("parent_codecs", ("auto_decode", "h264_only")),
+        r.str_("watch_codecs", ("auto_decode", "h264_only")),
         r.str_("output_codec", ("H264",)),
         r.int_("output_rids"),
         r.opt_str("video_encoder", VIDEO_ENCODERS),
         # Software decode by default: live G2b on an iGPU (Radeon 780M) that was also encoding the
         # source share and the relay, d3d11va raised relay latency from ~80 to ~240 ms.
         r.opt_str("hw_decode", HW_DECODE_DEVICES, default="none"),
+        r.str_("video_mode", VIDEO_MODES) if "video_mode" in r.data else "transcode",
     )
     if codecs.output_rids > 1:
         errors.append("codecs.output_rids: only 1 is supported")
@@ -407,7 +423,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     r.finish()
 
     r = _Reader("logging", top._get("logging"), errors)
-    logging = LoggingConfig(r.str_("level", tuple(sorted(_LOG_LEVELS))), r.only_false("include_media"))
+    logging = LoggingConfig(r.str_("level", tuple(sorted(_LOG_LEVELS))), r.only_false("include_media"), r.opt_bool("network_stats"))
     r.finish()
     top.finish()
 

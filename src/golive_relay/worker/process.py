@@ -1,4 +1,5 @@
-"""PyAV worker process: decode, locked canvas, source-paced H.264 re-encode (hardware when available), Opus -> PCM (spec §9).
+"""PyAV worker process: decode, locked canvas, source-paced H.264 re-encode (hardware when available) or opt-in
+H.264 passthrough, Opus -> PCM (spec §9).
 
 The worker receives no token and writes no media to disk. All queues are
 bounded; late input is dropped, never queued.
@@ -19,6 +20,7 @@ import av
 from av.video.frame import PictureType
 
 from golive_relay.media import hwaccel
+from golive_relay.media.h264 import ensure_low_delay_vui, has_parameter_sets, sps_dimensions
 from golive_relay.worker.canvas import compute_canvas, letterbox
 from golive_relay.worker.ipc import BoundedChannel
 from golive_relay.worker.messages import (
@@ -138,10 +140,13 @@ class Worker:
         self.stats: dict[str, Any] = {
             "frames_out": 0, "idr": 0, "repeats": 0, "decoded": 0, "rate_skipped": 0, "backpressure_skips": 0,
             "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "decode_errors": 0,
-            "stale_ignored": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
+            "stale_ignored": 0, "passthrough_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
 
     def _reset_epoch(self) -> None:
         self.decoder: Any = None
+        self.pt_active = False  # forwarding the target's H.264 without decoding (decided at a source IDR)
+        self.pt_decided = False
+        self.last_pt_idr = float("-inf")
         self.codec = ""
         self.decode_path = ""
         self.hw_idle = 0
@@ -152,7 +157,8 @@ class Worker:
         self.oversize_reported = False
         self.unwrappers: dict[int, RtpUnwrapper] = {}
         self.last_enc_rtp: tuple[int, float] | None = None
-        # (present_at, image, mono_received, rtp_s): frames are shown at their source spacing
+        # (present_at, image, mono_received, rtp_s): frames are shown at their source spacing;
+        # in passthrough the "image" is the encoded access unit (bytes)
         self.jbuf: collections.deque[tuple[float, Any, float, float]] = collections.deque()
         self.offsets: collections.deque[tuple[float, float]] = collections.deque()
         self.lateness: collections.deque[tuple[float, float]] = collections.deque()
@@ -208,8 +214,13 @@ class Worker:
                 self.last_encode_at = float("-inf")
                 self.force_idr = True
                 self.announce_fresh = True
+                if self.pt_active:
+                    self._request_keyframe()  # output restarts from a source IDR
         elif isinstance(msg, ForceIdr):
             self.force_idr = True
+            if self.pt_active:
+                self.last_key_request = float("-inf")  # the service already rate-limits ForceIdr
+                self._emit_need_keyframe()
         elif isinstance(msg, IngressVideo):
             self._video(msg, now)
         elif isinstance(msg, IngressAudio):
@@ -222,16 +233,29 @@ class Worker:
         if reset_decoder:
             self.decoder = None
         self.need_key = True
+        self._emit_need_keyframe()
+
+    def _emit_need_keyframe(self) -> None:
         now = time.monotonic()
         if now - self.last_key_request >= KEYFRAME_REREQUEST_S:
             self.last_key_request = now
             self._event("need_keyframe")
 
     def _video(self, m: IngressVideo, now: float) -> None:
+        assert self.profile is not None
         if now - m.mono_received > INGRESS_MAX_AGE_S:
             self.stats["ingress_dropped"] += 1
+            if self.pt_active:
+                self.jbuf.clear()  # an access unit is never dropped alone
             self._request_keyframe(reset_decoder=True)
             return
+        if m.codec == "H264" and self.profile.video_mode == "passthrough":
+            if self._passthrough(m, now):
+                return
+        elif self.pt_active or self.pt_decided:
+            self.jbuf.clear()  # queued items are encoded units, not frames
+            self.pt_active = self.pt_decided = False
+            self.force_idr = True
         if self.decoder is None or m.codec != self.codec:
             name = DECODERS.get(m.codec)
             if name is None:
@@ -271,6 +295,72 @@ class Worker:
             self._hw_fallback(m.codec)
             self._request_keyframe()
 
+    def _pt_eligible(self, dims: tuple[int, int]) -> bool:
+        assert self.profile is not None
+        p, (w, h) = self.profile, dims
+        fits = (w, h) == (p.fixed_width, p.fixed_height) if p.mode == "fixed" else w <= p.max_width and h <= p.max_height
+        return fits and w * h <= p.max_input_pixels
+
+    def _passthrough(self, m: IngressVideo, now: float) -> bool:
+        """True when passthrough consumed the access unit; False hands it to the decode/encode path."""
+        data = m.data
+        key = _h264_is_idr(data) and has_parameter_sets(data)
+        if key:
+            dims = sps_dimensions(data)
+            if dims is None or not self._pt_eligible(dims):
+                if self.pt_active:  # leave passthrough: the encoder follows from this IDR
+                    self.jbuf.clear()
+                    self.force_idr = True
+                    self.last_enc_rtp, self.last_encode_at = None, float("-inf")
+                self.pt_active, self.pt_decided = False, True
+                return False
+            self._pt_enter(m, dims, now)
+        elif not self.pt_decided or (self.pt_active and self.need_key):
+            self._request_keyframe()
+            return True
+        elif not self.pt_active:
+            return False
+        if not self.output_enabled:
+            return True
+        unwrapper = self.unwrappers.setdefault(m.ssrc, RtpUnwrapper(VIDEO_CLOCK_RATE))
+        rtp_s = unwrapper.unwrap(m.rtp_ts) / VIDEO_CLOCK_RATE
+        if self.jbuf_ssrc != m.ssrc:  # a new RTP clock: old offsets and queued units are meaningless
+            self.jbuf_ssrc = m.ssrc
+            self.jbuf.clear()
+            self.offsets.clear()
+            self.lateness.clear()
+            if not key:
+                self._pt_resync()
+                return True
+        if _h264_is_idr(data):
+            data = ensure_low_delay_vui(data)
+        self.jbuf.append((self._present_at(rtp_s, m.mono_received), data, m.mono_received, rtp_s))
+        if len(self.jbuf) > JITTER_MAX_FRAMES:
+            self.stats["backpressure_skips"] += len(self.jbuf)
+            self._pt_resync()
+        return True
+
+    def _pt_enter(self, m: IngressVideo, dims: tuple[int, int], now: float) -> None:
+        if not self.pt_active:  # transcode -> passthrough: queued frames are images
+            self.jbuf.clear()
+            self.retained = None
+        self.pt_active = self.pt_decided = True
+        self.need_key = False
+        self.last_key_request = float("-inf")
+        self.last_pt_idr = now
+        if self.canvas is None:
+            self.canvas = dims
+            self.announce_fresh = False
+            self._event("first_frame", width=dims[0], height=dims[1], source_width=dims[0], source_height=dims[1],
+                        codec=m.codec, ssrc=m.ssrc, encoder="passthrough", decode="none", frame_format="h264")
+        elif self.announce_fresh:
+            self.announce_fresh = False
+            self._event("fresh_frame")
+
+    def _pt_resync(self) -> None:
+        self.jbuf.clear()
+        self._request_keyframe()
+
     def _hw_fallback(self, codec: str) -> None:
         """Hardware decode can die mid-stream: continue in software from the next keyframe."""
         if self.decode_path != "software":
@@ -289,18 +379,22 @@ class Worker:
         self.need_key = False
         self.last_key_request = float("-inf")
         self.stats["decoded"] += 1
-        if self.canvas is None:
-            self.canvas = compute_canvas(self.profile, f.width, f.height)
+        if self.encoder is None:  # first frame, or left passthrough (the canvas stays locked)
+            first = self.canvas is None
+            if first:
+                self.canvas = compute_canvas(self.profile, f.width, f.height)
             # The probe ran at 640x360; the real canvas can still be refused (size, alignment, level, bitrate).
             if not self._open_encoder([self.encoder_name, *self._fallback_names()]):
-                self.canvas = None
+                if first:
+                    self.canvas = None
                 self._encoder_fatal()
                 return
-            self.announce_fresh = False
-            self._event("first_frame", width=self.canvas[0], height=self.canvas[1],
-                        source_width=f.width, source_height=f.height, codec=m.codec, ssrc=m.ssrc,
-                        encoder=self.encoder_name, decode=self.decode_path, frame_format=f.format.name)
-        elif self.announce_fresh:
+            if first:
+                self.announce_fresh = False
+                self._event("first_frame", width=self.canvas[0], height=self.canvas[1],
+                            source_width=f.width, source_height=f.height, codec=m.codec, ssrc=m.ssrc,
+                            encoder=self.encoder_name, decode=self.decode_path, frame_format=f.format.name)
+        if self.announce_fresh:
             self.announce_fresh = False
             self._event("fresh_frame")
         if not self.output_enabled:
@@ -385,7 +479,12 @@ class Worker:
     def tick(self, now: float) -> None:
         """Encode the oldest due buffered frame, or re-encode the retained one after IDLE_REPEAT_S of silence."""
         self._maybe_stats(now)
-        if self.profile is None or self.encoder is None or not self.output_enabled:
+        if self.profile is None or not self.output_enabled:
+            return
+        if self.pt_active:
+            self._pt_tick(now)
+            return
+        if self.encoder is None:
             return
         if self.jbuf and self.jbuf[0][0] <= now:
             _, img, rcv, rtp_s = self.jbuf.popleft()
@@ -399,6 +498,30 @@ class Worker:
             return
         img, rcv = self.retained
         self._encode(img, rcv, now, True)
+
+    def _pt_tick(self, now: float) -> None:
+        """Forward the oldest due access unit as received; any loss is repaired by a new source IDR."""
+        assert self.profile is not None
+        # A full egress only means the main process has not polled yet: the AU waits in jbuf
+        # (dropping it would freeze viewers until the next source IDR, ~0.7 s live).
+        if self.jbuf and self.jbuf[0][0] <= now and not self.egress.full("video"):
+            _, au, rcv, rtp_s = self.jbuf.popleft()
+            idr = _h264_is_idr(au)
+            item = EgressVideo(self.generation, self.epoch, au, idr, self._frame_time_ms(rtp_s), now, rcv, False)
+            if self.egress.put_nowait(item, "video", len(au)):
+                self.stats["frames_out"] += 1
+                self.stats["passthrough_frames"] += 1
+                self.stats["idr"] += idr
+                if idr:
+                    self.last_pt_idr = now
+            else:
+                self.stats["egress_dropped"] += 1
+                self._pt_resync()
+                if now - self.last_overflow_event >= OVERFLOW_EVENT_INTERVAL_S:
+                    self.last_overflow_event = now
+                    self._event("overflow", channel="egress_video")
+        if now - self.last_pt_idr >= self.profile.keyframe_interval_s * IDR_INTERVAL_MARGIN:
+            self._emit_need_keyframe()
 
     def _frame_time_ms(self, rtp_s: float) -> float:
         """RTP spacing to the next buffered frame, clamped; never from the previous gap, which would
@@ -450,6 +573,8 @@ class Worker:
         self.stats["enc_max_ms"] = max(self.stats["enc_max_ms"], enc_ms)
         for data in packets:  # one packet is one access unit; never joined
             idr = _h264_is_idr(data)
+            if idr:
+                data = ensure_low_delay_vui(data)
             ft = 1000.0 / fps if frame_time_ms is None else frame_time_ms
             item = EgressVideo(self.generation, self.epoch, data, idr, ft, now, rcv, repeated)
             if self.egress.put_nowait(item, "video", len(data)):
@@ -510,7 +635,8 @@ class Worker:
         s["enc_max_ms"] = round(s["enc_max_ms"], 3)
         self.stats["enc_n"] = 0
         self.stats["enc_sum_ms"] = self.stats["enc_max_ms"] = 0.0
-        self._event("stats", encoder=self.encoder_name, decode=self.decode_path,
+        self._event("stats", encoder="passthrough" if self.pt_active else self.encoder_name,
+                    decode="none" if self.pt_active else self.decode_path,
                     jitter_buffer_ms=round(self.jitter_s * 1000.0, 1), **s)
 
     # ------------------------------------------------------------- loop

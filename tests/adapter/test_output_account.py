@@ -193,3 +193,27 @@ def test_end_stops_health_watch(monkeypatch) -> None:
         assert not any(isinstance(e, OutHealth) for e in events)
 
     asyncio.run(go())
+
+
+def test_network_stats_empty_without_client_and_reads_stats() -> None:
+    a, _, _ = make()
+    assert a.network_stats() == {}
+    a._out = type("O", (), {"video_receive_stats": {"rtx_packets_resent": 2}})()
+    assert a.network_stats() == {"rtx_packets_resent": 2}
+
+
+def test_output_stream_client_passes_debug_stats() -> None:
+    from golive_relay.adapter import codecs
+
+    assert codecs.output_stream_client(30, True).enable_debug_stats is True
+    assert codecs.output_stream_client(30).enable_debug_stats is False
+
+
+def test_h264_only_offers_only_h264_for_decode() -> None:
+    from golive_relay.adapter import codecs
+
+    all_codecs = {"AV1", "H265", "H264", "VP8"}
+    assert codecs.advertised(all_codecs, "h264_only") == {"H264"}
+    assert codecs.advertised(all_codecs, "auto_decode") == all_codecs
+    names = [c.name for c in codecs.watch_codecs(codecs.advertised(all_codecs, "h264_only"))]
+    assert names == ["opus", "H264"]

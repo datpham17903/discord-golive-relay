@@ -65,6 +65,7 @@ class DiscordAdapter:
         *,
         paused_verified: bool = False,
         decodable: set[str] | None = None,
+        network_stats: bool = False,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -79,8 +80,14 @@ class DiscordAdapter:
         self.log = log
         self._paused_verified = paused_verified
         decodable = codecs.probe_decoders() if decodable is None else decodable
-        self._parent_cls = self._make_parent_cls(decodable)
-        self._watch_cls = nv.StreamClient.with_config(codecs=codecs.watch_codecs(decodable))
+        modes = getattr(cfg, "codecs", None)
+        self._parent_cls = self._make_parent_cls(
+            codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
+        self._network_stats = network_stats
+        self._watch_cls = nv.StreamClient.with_config(
+            codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
+            enable_debug_stats=network_stats,
+        )
         self._client: _Client | None = None
         self._connect_task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -341,12 +348,21 @@ class DiscordAdapter:
     async def create_output(self, generation: int, fps: int) -> str | None:
         """Create the output Go Live; returns the negotiated video codec."""
         self._out = await self._vc.create_stream(
-            cls=codecs.output_stream_client(fps), reconnect=False, timeout=CONNECT_TIMEOUT_S
+            cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
         return self._out.negotiated_video_codec
 
     def play(self, source: Any) -> None:
         self._out.play(source)
+
+    def network_stats(self) -> dict[str, dict[str, int]]:
+        """Loss/NACK/RTX counters of the watch and own-output clients (empty when disabled or absent)."""
+        stats = {
+            name: dict(getattr(c, "video_receive_stats", None) or {})
+            for name, c in (("watch", self._sc), ("output", self._out))
+            if c is not None
+        }
+        return {k: v for k, v in stats.items() if v}
 
     async def end_output(self) -> None:
         out, self._out = self._out, None

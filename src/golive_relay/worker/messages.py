@@ -54,6 +54,7 @@ class OutputProfile:
     audio_enabled: bool
     video_encoder: str = "auto"  # "auto" | an encoder name from golive_relay.media.hwaccel
     hw_decode: str = "none"  # "none" | "auto" | a hardware device type
+    video_mode: str = "transcode"  # "transcode" | "passthrough" (forward eligible H.264 without re-encoding)
 
 
 @dataclass(frozen=True, slots=True)

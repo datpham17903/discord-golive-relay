@@ -38,6 +38,8 @@ class OutputAccountAdapter:
         *,
         decodable: set[str] | None = None,
         client_factory: Callable[[], Any] | None = None,
+        network_stats: bool = False,
+        codec_mode: str = "auto_decode",
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
@@ -46,9 +48,10 @@ class OutputAccountAdapter:
         self.log = log
         decodable = codecs.probe_decoders() if decodable is None else decodable
         self._parent_cls = self._make_parent_cls(
-            nv.VoiceClient.with_config(codecs=codecs.parent_codecs(decodable))
+            nv.VoiceClient.with_config(codecs=codecs.parent_codecs(codecs.advertised(decodable, codec_mode)))
         )
         self._client_factory = client_factory or discord.Client
+        self._network_stats = network_stats
         self._client: Any = None
         self._gateway_task: asyncio.Task[Any] | None = None
         self._vc: Any = None
@@ -103,7 +106,7 @@ class OutputAccountAdapter:
         )
         self._events(OutJoined(self.user_id, generation, self._vc.session_id))
         self._out = await self._vc.create_stream(
-            cls=codecs.output_stream_client(fps), reconnect=False, timeout=CONNECT_TIMEOUT_S
+            cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
         codec = self._out.negotiated_video_codec
         self._events(OutReady(self.user_id, generation, codec))
@@ -116,6 +119,10 @@ class OutputAccountAdapter:
         while out.is_connected() and vc.is_connected():
             await asyncio.sleep(HEALTH_POLL_S)
         self._events(OutHealth(self.user_id, generation, False))
+
+    def network_stats(self) -> dict[str, int]:
+        """Loss/NACK/RTX counters of the output client (empty when disabled or absent)."""
+        return dict(getattr(self._out, "video_receive_stats", None) or {})
 
     async def end(self) -> None:
         """Stop the output first, then disconnect the stream and leave voice."""

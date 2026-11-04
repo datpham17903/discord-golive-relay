@@ -125,7 +125,7 @@ def test_first_au_idr_with_params_and_gaps(aus640):
     assert {5, 7, 8} <= nal_types(video[0].data)
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert gaps and max(gaps) <= 2.0
+    assert gaps and max(gaps) <= 2.0 + 1e-9
     assert all(v.frame_time_ms == pytest.approx(1000 / FPS) for v in video)
     assert len(fresh_decode([v.data for v in video])) >= len(video) - 1
     first = events.events("first_frame")
@@ -279,7 +279,7 @@ def test_static_source_repeats_and_keeps_idr_gap(aus640):
     assert all(0.49 <= b - a <= 0.56 for a, b in zip(times, times[1:]))
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert len(idr_times) >= 3 and max(gaps) <= 2.0
+    assert len(idr_times) >= 3 and max(gaps) <= 2.0 + 1e-9  # deadlines sit on time.monotonic(), so float rounding
 
 
 def gen_opus(packets: int) -> list[bytes]:
@@ -535,7 +535,7 @@ def test_handle_end_to_end(aus640):
     assert video and video[0].is_idr and {5, 7, 8} <= nal_types(video[0].data)
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert gaps and max(gaps) <= 2.0
+    assert gaps and max(gaps) <= 2.0 + 1e-9
     assert len(fresh_decode([v.data for v in video])) >= len(video) - 2
     assert [e for e in events if e.kind == "first_frame"]
 
@@ -692,3 +692,116 @@ def test_set_output_enable_resets_rate_skip_reference(aus640):
     w.handle(SetOutput(1, 0, False), now)
     w.handle(SetOutput(1, 0, True), now)
     assert w.last_enc_rtp is None and w.last_encode_at == float("-inf")
+
+
+# ------------------------------------------------------------ passthrough
+
+PT = dataclasses.replace(PROFILE, video_mode="passthrough")
+PT_SMALL = dataclasses.replace(PT, max_width=320, max_height=240)
+
+
+@pytest.fixture(scope="module")
+def aus240():
+    return gen_h264(320, 240, 2)
+
+
+def drain(w, now, n=80):
+    for k in range(n):
+        w.tick(now + 0.001 * (k + 1))
+
+
+def test_passthrough_forwards_au_unchanged_without_codecs(aus240):
+    from golive_relay.media.h264 import ensure_low_delay_vui
+
+    w, egress, events = make_worker(PT)
+    now = feed(w, aus240, time.monotonic())
+    drain(w, now)
+    out = egress.video()
+    assert [v.data for v in out] == [ensure_low_delay_vui(a) if _h264_is_idr(a) else a for a in aus240]
+    assert [v.is_idr for v in out] == [_h264_is_idr(a) for a in aus240]
+    assert w.decoder is None and w.encoder is None and w.pt_active
+    assert w.stats["passthrough_frames"] == len(aus240)
+    ff = events.events("first_frame")
+    assert len(ff) == 1 and ff[0].data["encoder"] == "passthrough" and ff[0].data["decode"] == "none"
+    assert (ff[0].data["width"], ff[0].data["height"]) == (320, 240)
+
+
+def test_passthrough_waits_for_idr_with_sps_and_requests_keyframe(aus240):
+    from golive_relay.media.h264 import nal_units
+
+    w, egress, events = make_worker(PT)
+    now = feed(w, aus240[1:6], time.monotonic(), start=1)
+    drain(w, now)
+    assert not egress.video() and events.events("need_keyframe") and not events.events("first_frame")
+    sps_less = b"\x00\x00\x00\x01" + b"".join(b"\x00\x00\x00\x01" + n for t, n in nal_units(aus240[0]) if t == 5)
+    now = feed(w, [sps_less], now + 0.1, start=6)
+    drain(w, now)
+    assert not egress.video() and w.need_key
+    feed(w, [aus240[0]] + aus240[1:3], now + 0.2, start=7)
+    drain(w, now + 1)
+    assert egress.video() and egress.video()[0].is_idr and not w.need_key
+
+
+def test_passthrough_oversized_idr_falls_back_to_transcode_and_returns():
+    a, b, c = gen_h264(320, 240, 1), gen_h264(640, 360, 1), gen_h264(320, 240, 1)
+    w, egress, events = make_worker(PT_SMALL)
+    now = feed(w, a, time.monotonic())
+    drain(w, now)
+    assert w.pt_active and len(egress.video()) == len(a) and w.encoder is None
+    n_a = len(egress.video())
+    now = feed(w, b, now + 0.5, start=100)
+    drain(w, now)
+    assert not w.pt_active and w.encoder is not None and w.decoder is not None
+    out_b = egress.video()[n_a:]
+    assert out_b and out_b[0].is_idr and all(v.data not in b for v in out_b)
+    assert len(events.events("first_frame")) == 1
+    n_b = len(egress.video())
+    now = feed(w, c, now + 0.5, start=200)
+    drain(w, now)
+    assert w.pt_active
+    out_c = egress.video()[n_b:]
+    assert [v.data for v in out_c[1:]] == c[1:] and out_c[0].is_idr
+
+
+def test_passthrough_jbuf_overflow_clears_and_requests_keyframe(aus240):
+    w, egress, events = make_worker(PT)
+    now = time.monotonic()
+    for i, au in enumerate(aus240[:55]):  # never ticked: the jitter buffer fills past its limit
+        w.handle(IngressVideo(1, 0, "H264", 1, i * 3000, None, now, None, au), now)
+    assert not w.jbuf and w.need_key and events.events("need_keyframe")
+    w.handle(IngressVideo(1, 0, "H264", 1, 60 * 3000, None, now, None, aus240[0]), now)
+    assert not w.need_key and len(w.jbuf) == 1
+
+
+def test_passthrough_egress_full_waits_without_dropping(aus240):
+    w, egress, events = make_worker(PT, egress=Sink({"video": 1}))
+    now = feed(w, aus240[:5], time.monotonic())
+    assert len(egress.video()) == 1 and egress.video()[0].is_idr
+    assert not w.need_key and len(w.jbuf) == 4 and not events.events("need_keyframe")
+    egress.capacity = {}  # the main process polled
+    drain(w, now)
+    assert len(egress.video()) == 5 and not w.need_key
+
+
+def test_passthrough_requests_keyframe_when_no_idr_for_interval(aus240):
+    w, egress, events = make_worker(PT)
+    pframes = [a for a in aus240[1:] if not _h264_is_idr(a)][:58]
+    now = feed(w, aus240[:1] + pframes, time.monotonic())  # 1.9 s of P-frames after the IDR (limit 1.7 s)
+    drain(w, now)
+    assert len(events.events("need_keyframe")) == 1
+    assert not w.need_key and len(egress.video()) == 59
+
+
+def test_passthrough_force_idr_requests_keyframe(aus240):
+    w, _, events = make_worker(PT)
+    now = feed(w, aus240[:3], time.monotonic())
+    w.handle(ForceIdr(1, 0), now)
+    assert len(events.events("need_keyframe")) == 1
+
+
+def test_passthrough_mode_uses_transcode_for_other_codecs():
+    w, egress, events = make_worker(PT)
+    now = time.monotonic()
+    w.handle(IngressVideo(1, 0, "H265", 1, 0, None, now, None, b"\x00\x00\x00\x01\x40\x01\x00"), now)
+    assert w.decoder is not None and not w.pt_active and not egress.video()
+    assert not events.events("first_frame")

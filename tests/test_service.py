@@ -468,3 +468,13 @@ def test_mandatory_idr_not_rate_limited_by_feedback(tmp_path, slate, source_gop)
         await task
 
     asyncio.run(main())
+
+
+def test_status_network_only_when_enabled(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    env.svc.cfg = replace(env.svc.cfg, logging=replace(env.svc.cfg.logging, network_stats=False))
+    assert "network" not in env.svc.status_dict()
+    env.svc.cfg = replace(env.svc.cfg, logging=replace(env.svc.cfg.logging, network_stats=True))
+    assert env.svc.status_dict()["network"] == {}
+    env.svc._adapter = type("A", (), {"network_stats": lambda self: {"watch": {"video_sequence_gaps": 3}}})()
+    assert env.svc.status_dict()["network"] == {"watch": {"video_sequence_gaps": 3}}

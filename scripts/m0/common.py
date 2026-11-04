@@ -39,11 +39,25 @@ OUTPUT_CODECS = (
 ParentVoiceClient = nv.VoiceClient.with_config(codecs=list(DECODE_CODECS))
 WatchStreamClient = nv.StreamClient.with_config(codecs=list(DECODE_CODECS))
 
+_VIDEO_PTS = {"AV1": (101, 102), "H265": (103, 104), "H264": (105, 106)}
 
-def output_stream_client(fps: int) -> type[nv.StreamClient]:
-    """Output client: H264 + Opus only, one screen RID."""
+
+def output_codecs(prefer: str) -> tuple[VoiceCodec, ...]:
+    """Publish codec list for G5: ``prefer`` first, H264 as the fallback every viewer decodes."""
+    if prefer == "H264":
+        return OUTPUT_CODECS
+    pt, rtx = _VIDEO_PTS[prefer]
+    return (
+        VoiceCodec.opus(payload_type=120),
+        VoiceCodec.video(prefer, priority=1000, payload_type=pt, rtx_payload_type=rtx, encode=True, decode=True),
+        VoiceCodec.video("H264", priority=2000, payload_type=105, rtx_payload_type=106, encode=True, decode=True),
+    )
+
+
+def output_stream_client(fps: int, codecs: tuple[VoiceCodec, ...] = OUTPUT_CODECS) -> type[nv.StreamClient]:
+    """Output client: H264 + Opus by default, one screen RID."""
     return nv.StreamClient.with_config(
-        codecs=list(OUTPUT_CODECS),
+        codecs=list(codecs),
         video_streams=[VoiceStream.screen(rid="100", quality=100, max_framerate=fps)],
     )
 
