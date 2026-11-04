@@ -64,3 +64,9 @@ logging:
   level: INFO
   include_media: false
   network_stats: false   # opt-in: expose packet loss / NACK / RTX counters in status
+
+control:
+  chat_commands: false        # opt-in: accept relay commands from chat messages
+  command_prefix: "!relay"    # commands look like "!relay status"; no whitespace
+  operator_user_ids: []       # decimal user ID strings allowed to command; non-empty when chat_commands is true
+  command_channel_id: null    # optional decimal channel ID; when set, commands are accepted only there

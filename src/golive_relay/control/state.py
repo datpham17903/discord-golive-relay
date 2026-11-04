@@ -15,9 +15,11 @@ from golive_relay.control.lock import lock_blocking, unlock
 from golive_relay.supervisor.model import FatalReason
 from golive_relay.supervisor.outputs_model import AccountPersisted
 
-SCHEMA_VERSION = 2
-_READ_VERSIONS = (1, 2)  # a v1 file has no ``accounts``; it is read as v2 with accounts = {}
+SCHEMA_VERSION = 3
+# v1 has no ``accounts`` (read as {}); v1/v2 have no ``routing`` (read as None)
+_READ_VERSIONS = (1, 2, 3)
 _ACCOUNT_KEYS = {"fatal_latch", "quarantine_incarnation", "consecutive_rejections"}
+_ROUTING_KEYS = {"target_user_id", "channel_id", "mirrors"}
 _QUARANTINE_KEYS = {"owner_id", "stream_key", "incarnation", "since"}
 
 
@@ -42,6 +44,8 @@ class PersistedState:
     consecutive_rejections: int = 0
     # str(user_id) -> {"fatal_latch": {...}|None, "quarantine_incarnation": int|None, "consecutive_rejections": int}
     accounts: dict = field(default_factory=dict)
+    # {"target_user_id": int, "channel_id": int, "mirrors": {str(channel_id): int(user_id)}}; None = use config
+    routing: dict | None = None
 
 
 def _empty_account() -> dict:
@@ -64,6 +68,23 @@ def set_account(st: PersistedState, user_id: int, **changes: object) -> Persiste
     return replace(st, accounts={**st.accounts, str(user_id): rec})
 
 
+def _check_routing(rt: object) -> None:
+    if not isinstance(rt, dict) or set(rt) != _ROUTING_KEYS:
+        raise ValueError("bad routing")
+    if type(rt["target_user_id"]) is not int or type(rt["channel_id"]) is not int:
+        raise ValueError("bad routing ids")
+    mirrors = rt["mirrors"]
+    if not isinstance(mirrors, dict):
+        raise ValueError("bad routing mirrors")
+    accounts = set()
+    for ch, acct in mirrors.items():
+        if not (isinstance(ch, str) and ch.isascii() and ch.isdigit()) or type(acct) is not int:
+            raise ValueError("bad routing mirror entry")
+        if acct in accounts:
+            raise ValueError("routing account mirrored in more than one channel")
+        accounts.add(acct)
+
+
 def _parse(raw: bytes) -> PersistedState:
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -76,7 +97,8 @@ def _parse(raw: bytes) -> PersistedState:
             fatal_latch=data["fatal_latch"],
             quarantine=data["quarantine"],
             consecutive_rejections=data["consecutive_rejections"],
-            accounts=data["accounts"] if data["schema_version"] == 2 else {},
+            accounts=data["accounts"] if data["schema_version"] >= 2 else {},
+            routing=data["routing"] if data["schema_version"] == 3 else None,
         )
         if (
             type(st.revision) is not int
@@ -106,6 +128,8 @@ def _parse(raw: bytes) -> PersistedState:
                 or type(rec["consecutive_rejections"]) is not int
             ):
                 raise ValueError(f"bad account record {key!r}")
+        if st.routing is not None:
+            _check_routing(st.routing)
         return st
     except (ValueError, KeyError, UnicodeDecodeError) as e:
         raise StateCorrupt(f"state.json is corrupt: {e}") from e

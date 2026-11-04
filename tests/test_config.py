@@ -300,3 +300,22 @@ def test_codec_modes_accept_h264_only(tmp_path):
     assert (cfg.codecs.parent_codecs, cfg.codecs.watch_codecs) == ("h264_only", "h264_only")
     raw["codecs"]["watch_codecs"] = "av1_only"
     assert any("codecs.watch_codecs" in e for e in _errors(tmp_path, raw))
+
+
+def test_control_config_defaults_when_absent_and_example():
+    cfg = load_config(EXAMPLE)
+    assert cfg.control.chat_commands is False and cfg.control.command_prefix == "!relay"
+    assert cfg.control.operator_user_ids == frozenset() and cfg.control.command_channel_id is None
+
+
+def test_control_config_requires_operators_when_enabled(tmp_path: Path):
+    raw = _raw()
+    raw["control"] = {"chat_commands": True, "operator_user_ids": []}
+    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"chat_commands": True, "operator_user_ids": ["42"], "command_channel_id": "7", "command_prefix": "!r"}
+    c = _load(tmp_path, raw).control
+    assert c.operator_user_ids == frozenset({42}) and c.command_channel_id == 7 and c.command_prefix == "!r"
+    raw["control"] = {"command_prefix": "! relay"}
+    assert any("control.command_prefix" in e for e in _errors(tmp_path, raw))
+    raw["control"] = {"bogus": 1}
+    assert any("control.bogus" in e for e in _errors(tmp_path, raw))

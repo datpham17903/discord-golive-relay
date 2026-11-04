@@ -115,6 +115,14 @@ class LoggingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ControlConfig:
+    chat_commands: bool = False
+    command_prefix: str = "!relay"
+    operator_user_ids: frozenset[int] = frozenset()
+    command_channel_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RelayConfig:
     schema_version: int
     discord: DiscordConfig
@@ -126,6 +134,7 @@ class RelayConfig:
     liveness: LivenessConfig
     storage: StorageConfig
     logging: LoggingConfig
+    control: ControlConfig = ControlConfig()
 
     def output_accounts(self) -> list[OutputAccount]:
         return list(self.discord.output_accounts)
@@ -183,6 +192,10 @@ class _Reader:
         for key in self.data:
             if key not in self._seen:
                 self.errors.append(f"{self.name}.{key}: unknown key")
+
+    def _get_optional(self, key: str) -> Any:
+        self._seen.add(key)
+        return self.data.get(key)
 
     def id(self, key: str) -> int:
         v = self._get(key)
@@ -315,6 +328,31 @@ def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str)
     return tuple(out)
 
 
+def _control(section: Any, errors: list[str]) -> ControlConfig:
+    """The optional ``control`` section; absent means chat commands off."""
+    if section is None:
+        return ControlConfig()
+    r = _Reader("control", section, errors)
+    enabled = r.opt_bool("chat_commands")
+    prefix = _optional(r, "command_prefix", "!relay")
+    if not isinstance(prefix, str) or not prefix or any(c.isspace() for c in prefix):
+        r._err("command_prefix", "must be a non-empty string without whitespace")
+        prefix = "!relay"
+    operators = r.ids("operator_user_ids") if "operator_user_ids" in r.data else frozenset()
+    r._seen.add("operator_user_ids")
+    if enabled and not operators:
+        r._err("operator_user_ids", "must not be empty when chat_commands is true")
+    channel = None
+    if _optional(r, "command_channel_id", None) is not None:
+        v = r.data["command_channel_id"]
+        if isinstance(v, str) and v.isascii() and v.isdigit() and int(v) > 0:
+            channel = int(v)
+        else:
+            r._err("command_channel_id", "must be a string of decimal digits")
+    r.finish()
+    return ControlConfig(enabled, prefix, operators, channel)
+
+
 def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     if not isinstance(raw, dict):
         errors.append("config: top level must be a mapping")
@@ -425,6 +463,8 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     r = _Reader("logging", top._get("logging"), errors)
     logging = LoggingConfig(r.str_("level", tuple(sorted(_LOG_LEVELS))), r.only_false("include_media"), r.opt_bool("network_stats"))
     r.finish()
+
+    control = _control(top._get_optional("control"), errors)
     top.finish()
 
     if errors:
@@ -440,6 +480,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         liveness=liveness,
         storage=storage,
         logging=logging,
+        control=control,
     )
 
 
