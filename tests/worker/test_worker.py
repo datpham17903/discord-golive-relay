@@ -125,7 +125,7 @@ def test_first_au_idr_with_params_and_gaps(aus640):
     assert {5, 7, 8} <= nal_types(video[0].data)
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert gaps and max(gaps) <= 2.0
+    assert gaps and max(gaps) <= 2.0 + 1e-9
     assert all(v.frame_time_ms == pytest.approx(1000 / FPS) for v in video)
     assert len(fresh_decode([v.data for v in video])) >= len(video) - 1
     first = events.events("first_frame")
@@ -279,7 +279,7 @@ def test_static_source_repeats_and_keeps_idr_gap(aus640):
     assert all(0.49 <= b - a <= 0.56 for a, b in zip(times, times[1:]))
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert len(idr_times) >= 3 and max(gaps) <= 2.0
+    assert len(idr_times) >= 3 and max(gaps) <= 2.0 + 1e-9  # deadlines sit on time.monotonic(), so float rounding
 
 
 def gen_opus(packets: int) -> list[bytes]:
@@ -535,7 +535,7 @@ def test_handle_end_to_end(aus640):
     assert video and video[0].is_idr and {5, 7, 8} <= nal_types(video[0].data)
     idr_times = [v.deadline for v in video if v.is_idr]
     gaps = [b - a for a, b in zip(idr_times, idr_times[1:])]
-    assert gaps and max(gaps) <= 2.0
+    assert gaps and max(gaps) <= 2.0 + 1e-9
     assert len(fresh_decode([v.data for v in video])) >= len(video) - 2
     assert [e for e in events if e.kind == "first_frame"]
 
