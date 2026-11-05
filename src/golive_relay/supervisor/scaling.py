@@ -31,3 +31,9 @@ class RelayScaler:
             self._current = self._window_max
             self._below_since = None
         return self._current
+
+    def scale_down_in(self, now: float) -> float | None:
+        """Seconds left before a pending scale-down applies; None when none is pending."""
+        if self._below_since is None:
+            return None
+        return max(0.0, self._below_since + self._delay_s - now)

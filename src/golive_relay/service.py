@@ -23,8 +23,8 @@ from discord.ext.native_voice.media import VideoConfig
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
-    ChatCommand, ParseError, RoutingContext, SetEnabled, SetPrejoin, Status, describe_change, format_status, parse,
-    plan_change,
+    ChatCommand, ParseError, RoutingContext, SetEnabled, SetPrejoin, Status, StatusDetails, describe_change,
+    format_status, parse, plan_change,
 )
 from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
@@ -41,10 +41,11 @@ from golive_relay.supervisor.outputs_model import (
 from golive_relay.supervisor.retry import RetryPolicy
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
 from golive_relay.supervisor.routing import Routing
+from golive_relay.supervisor.scaling import RelayScaler, relays_needed
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
     FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
-    PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline,
+    ParticipantsChanged, PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
 )
@@ -91,7 +92,9 @@ def supervisor_config(cfg: RelayConfig) -> SupervisorConfig:
 
 
 def config_routing(cfg: RelayConfig) -> Routing:
-    return Routing(cfg.discord.target_user_id, cfg.discord.allowed_voice_channel_id, {})
+    """Mirror accounts with a fixed channel_id start mirrored there while state.json has no routing."""
+    fixed = {a.channel_id: a.user_id for a in cfg.discord.mirror_accounts if a.channel_id is not None}
+    return Routing(cfg.discord.target_user_id, cfg.discord.allowed_voice_channel_id, fixed)
 
 
 def routing_error(r: Routing, cfg: RelayConfig) -> str | None:
@@ -99,9 +102,12 @@ def routing_error(r: Routing, cfg: RelayConfig) -> str | None:
     outputs = {a.user_id for a in cfg.output_accounts()}
     if r.target_user_id in outputs | {cfg.discord.expected_relay_user_id}:
         return f"target_user_id {r.target_user_id} is a relay account (ingest or output)"
+    fixed = {a.user_id: a.channel_id for a in cfg.discord.mirror_accounts}
     for ch, acct in r.mirrors.items():
-        if acct not in outputs:
-            return f"mirror {ch} uses {acct}, which is not a configured output account"
+        if acct not in fixed:
+            return f"mirror {ch} uses {acct}, which is not a configured mirror account"
+        if fixed[acct] is not None and fixed[acct] != ch:
+            return f"mirror {ch} uses {acct}, which is fixed to channel {fixed[acct]}"
         if ch == r.channel_id:
             return f"mirror {ch} is the main channel"
     return None
@@ -166,6 +172,13 @@ class Service:
             routing=self.sup.routing,
             excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
         )
+        self._scaler = RelayScaler(r.relay_scale_down_seconds)
+        if r.relay_autoscale:
+            self.pool.set_relay_target(0, time.monotonic())  # no session yet: nothing to start or stop
+        self._session_since: float | None = None  # gate first opened in the current session
+        self._out_since: dict[int, float] = {}  # account -> first OutSetLive of its current run
+        self._last_watch_ms: float | None = None  # watch_sent_from_seen_ms of the last logged session
+        self._audio_ok = False  # non-silent target audio in the last status window
         self._out_pubs: dict[int, Publisher] = {
             a.user_id: Publisher(self._out_gate(a.user_id), on_need_idr=self._need_idr) for a in accounts
         }
@@ -304,6 +317,7 @@ class Service:
             now = time.monotonic()
             self._handle(Tick())
             self._pool_event(OutTick())
+            self._scale_relays(now)  # a scale-down is due even when no event arrives
             if now >= next_poll:
                 self._poll_state()
                 next_poll = now + STATE_POLL_S
@@ -353,6 +367,8 @@ class Service:
         if self.sup.state is not before:
             self.log("state", old=before.value, new=self.sup.state.value)
         self._execute(acts)
+        if isinstance(event, (ParticipantsChanged, GatewaySnapshot, RoutingChanged)):
+            self._scale_relays(now)
         if isinstance(event, GatewaySnapshot):
             self._resnap_pending = False
         elif isinstance(event, GatewayChanged) and event.state is GatewayState.FRESH and self._resnap_pending:
@@ -407,10 +423,12 @@ class Service:
             if isinstance(cmd, ParseError):
                 outcome, text = "parse_error", cmd.text
             elif isinstance(cmd, Status):
-                states = {row["account"]: row["state"] for row in self.pool.status(time.monotonic())}
+                now = time.monotonic()
+                states = {row["account"]: row["state"] for row in self.pool.status(now)}
                 outcome, text = "status", format_status(old, ctx, self.sup.state.value, states,
                                                         prejoin=self.sup.prejoin_voice,
-                                                        routing_error=self._routing_error)
+                                                        routing_error=self._routing_error,
+                                                        details=self._status_details(now))
             elif isinstance(cmd, SetEnabled):
                 self._set_enabled(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
@@ -512,6 +530,8 @@ class Service:
                     self._send(SetOutput(g, e, True))
                     inc = self.sup.status(time.monotonic()).source_incarnation
                     self._pool_event(SessionLive(g, e, 0 if inc is None else inc))
+                    if self._session_since is None:
+                        self._session_since = time.monotonic()
                     self._mark(g, "open_gate")
                     self._log_timing(g, "open")
                 case ApplyRouting(routing=r):
@@ -541,6 +561,7 @@ class Service:
                     self._log_timing(g, reason.value)  # a session that never opened is still reported
                     self._pool_event(SessionEnded(g, reason, reason in INCARNATION_ENDED))
                     self._session_gen = None
+                    self._session_since = None
                     worker, self._worker = self._worker, None
                     self._slate = self._canvas = None
                     self._queue(self._teardown, worker, leave)
@@ -584,6 +605,7 @@ class Service:
                         self._out_pubs[uid], VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000))
                     self._out_queue(uid, self._out_publish, uid, g, n, p.fps, source, ch)
             case OutSetLive(account=uid, generation=g, epoch=e):
+                self._out_since.setdefault(uid, time.monotonic())
                 pub = self._out_pubs[uid]
                 pub.set_slate(self._slate)
                 pub.set_source(g, e)
@@ -592,8 +614,10 @@ class Service:
             case OutCloseGate(account=uid):
                 self._out_pubs[uid].close()  # purges, so a closed publisher holds no frames
             case OutTeardown(account=uid):
+                self._out_since.pop(uid, None)
                 self._out_queue(uid, self._out_end, uid)
             case OutSetFatal(account=uid, reason=reason, detail=detail):
+                self._out_since.pop(uid, None)
                 self._persist(lambda s: set_account(
                     s, uid, fatal_latch={"reason": reason.value, "detail": detail, "at": time.time()}))
                 self._out_queue(uid, self._drop_output, uid)
@@ -750,6 +774,7 @@ class Service:
             fields[f"{name}_ms"] = round((at - start) * 1000)
             if seen is not None and name in _FROM_SEEN:
                 fields[f"{name}_from_seen_ms"] = round((at - seen) * 1000)
+        self._last_watch_ms = fields.get("watch_sent_from_seen_ms")
         self.log("session_timing", **fields)
 
     # ----------------------------------------------------------- async steps
@@ -1044,6 +1069,8 @@ class Service:
         d["metrics"] = self.metrics.snapshot()
         d["ingest_send"] = self.publisher.take_window()
         d["ingress_audio"] = self._adapter.take_audio_window() if self._adapter is not None else {}
+        audio = d["ingress_audio"]
+        self._audio_ok = audio.get("packets", 0) > audio.get("silence", 0)
         d["routing"] = self.sup.routing.to_persisted()
         d["routing_error"] = self._routing_error
         d["accounts"] = [
@@ -1055,7 +1082,51 @@ class Service:
             for row in d["accounts"]:
                 a = self._out_adapters.get(row["account"])
                 row["network"] = a.network_stats() if a is not None else {}
+        d["details"] = asdict(self._status_details(time.monotonic()))
         return d
+
+    def _viewers(self) -> int:
+        """Main-channel members other than the target and the configured bot accounts."""
+        bots = {self.sup.routing.target_user_id, self.cfg.discord.expected_relay_user_id,
+                *(a.user_id for a in self.cfg.output_accounts())}
+        return len((self.sup.participants or frozenset()) - bots)
+
+    def _scale_relays(self, now: float) -> None:
+        r = self.cfg.runtime
+        if not r.relay_autoscale:
+            return  # the pool keeps its initial target: every relay account
+        needed = relays_needed(self._viewers(), r.stream_viewer_cap, self.cfg.discord.ingest_publishes)
+        want = self._scaler.update(needed, now)
+        if want != self.pool.relay_summary()["wanted"]:
+            for a in self.pool.set_relay_target(want, now):
+                self._pool_action(a)
+
+    def _status_details(self, now: float) -> StatusDetails:
+        relay = self.pool.relay_summary()
+        roles = {a.user_id: a.role for a in self.cfg.output_accounts()}
+        w, h, fps = self.cfg.profile_key()
+        accounts = []
+        for row in self.pool.status(now):
+            uid, state = row["account"], row["state"]
+            since = self._out_since.get(uid) if state == OutputState.LIVE.value else None
+            accounts.append((uid, roles[uid], self.pool.channel_of(uid), state, None if since is None else now - since))
+        return StatusDetails(
+            session_state=self.sup.state.value,
+            session_uptime_s=None if self._session_since is None else now - self._session_since,
+            viewers=self._viewers(),
+            relay_wanted=relay["wanted"],
+            relay_running=relay["running"],
+            relay_available=relay["available"],
+            relay_short_by=relay["short_by"],
+            scale_down_in_s=self._scaler.scale_down_in(now) if self.cfg.runtime.relay_autoscale else None,
+            prejoin=self.sup.prejoin_voice,
+            debounce_ms=self.cfg.runtime.start_debounce_ms,
+            video_mode=self.cfg.codecs.video_mode,
+            output_size=f"{w}x{h}@{fps}",
+            last_watch_ms=self._last_watch_ms,
+            audio_ok=self._audio_ok,
+            accounts=tuple(accounts),
+        )
 
     def _write_status(self) -> None:
         try:

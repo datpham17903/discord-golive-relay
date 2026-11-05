@@ -188,6 +188,23 @@ discord:
 
 Token files: `relay-token`, `relay-token-2`, `relay-token-3`. Each account has its own quarantine and FATAL latch; one failing output does not stop the others. Output accounts do not watch the target, so they use no extra viewer slot on the target's stream.
 
+Two pools, never mixed:
+
+- **Relay accounts** (`relay_accounts`) add Go Lives in the main channel so more people can watch. They are started in config order. A relay account is never used as a mirror.
+- **Mirror accounts** (`mirror_accounts`) publish in other voice channels: one account per channel, one channel per account. A mirror with `channel_id` is used only for that channel, and starts there on its own while `state.json` has no `routing`. Mirrors without `channel_id` are free for `!relay mirror`. A mirror account is never used as a relay.
+- An old config with only `output_accounts` still runs: those accounts are relay accounts (a deprecation warning is printed). Mirrors then need `mirror_accounts`.
+
+### Relay autoscale
+
+With `runtime.relay_autoscale: true` (the default) only as many relay accounts publish as the main channel needs. Relay accounts publish only while the session is live, and the excluded-viewer and consent checks run before any Go Live, as before.
+
+- N = members of the main channel, not counting the target, the ingest account and every relay or mirror account in the config.
+- One Go Live holds `cap = runtime.stream_viewer_cap` viewers (50). The target's stream holds `cap - 1` (the ingest uses one slot), and the ingest's own Go Live holds `cap` more when `ingest_publishes` is true.
+- Relays needed = ceil(max(0, N - capacity) / cap). With `ingest_publishes: true` and cap 50: 99 people need 0 relays, 100 need 1, 150 need 2 (49 + 50 + 2 x 50 = 199 slots), 200 need 3.
+- More people start relays at once. Fewer people stop the last relay only after the need stayed lower for `runtime.relay_scale_down_seconds` (120 s, 2 minutes) without a break, so a count that flaps around a threshold never stops a relay early.
+- A FATAL or quarantined relay is replaced by the next free relay account. When there are not enough usable relay accounts, `!relay status` shows a ⚠️ shortage.
+- `relay_autoscale: false` keeps every relay account publishing during a session.
+
 ### Approved profile manifest
 
 The service only runs a quality profile that was verified live on that exact relay account and server. Edit `manifests/verified-profiles.json` (gitignored; template: `manifests/verified-profiles.example.json`):
@@ -305,19 +322,19 @@ With `control.chat_commands: true` the ingest account reads messages in the conf
 | Command | What it does |
 | --- | --- |
 | `!relay` | Shows the command list |
-| `!relay status` | Session state, target, main channel, mirrors and their output accounts |
+| `!relay status` | Session state and uptime; target; main channel with its member count N; relays needed/running/available, a ⚠️ shortage warning and the time left before a scale-down; each relay account and each mirror with its state and uptime; pre-join, debounce, video mode and output size; the last watch time and whether the target audio has signal. The same values are in `status.json` under `details` |
 | `!relay on` / `!relay off` | Same as `relayctl enable` / `disable` |
 | `!relay target <user_id>` | Relays another person. The current session stops and starts again when the new target shares in the main channel. A relay account (ingest or output) is refused |
 | `!relay channel <channel_id>` | Moves the main voice channel. The channel must be a voice channel of the guild and not a mirror |
-| `!relay mirror <channel_id>` | Publishes the same stream in another voice channel, using a free output account (the last free one in config order). Needs a free, non-FATAL, non-quarantined output account |
-| `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the output account returns to the main channel |
+| `!relay mirror <channel_id> [account_id]` | Publishes the same stream in another voice channel with a mirror account. With `account_id`, that mirror account is used; it must be free, not FATAL or quarantined, and not fixed to another channel. Without it, the mirror account fixed to this channel is used, else the last free mirror account without a fixed channel. Relay accounts are refused |
+| `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the mirror account stops publishing |
 | `!relay prejoin on` / `!relay prejoin off` | Turns pre-join (`runtime.prejoin_voice`) on or off. `on` joins the main channel as soon as the target is there; `off` leaves voice when the target is not streaming. Stored as `prejoin_voice` in `state.json` and kept across restarts; while nothing is stored the config value is used. `!relay status` shows it |
 
 Who may command: only users listed in `control.operator_user_ids` or members holding a role listed in `control.operator_role_ids`, and only in `control.command_channel_id` when it is set. Messages from anyone else, from other guilds or channels, and from the relay accounts themselves are ignored without a reply. Message text is never logged; the log records the command name, author ID, channel ID and outcome.
 
 Mentions: give every ID as plain decimal digits. A mention such as `<@123>` or `<#123>` is refused with a usage hint. Replies never ping anyone: they are sent with all mentions disabled and without mentioning the author, users are shown as display name plus ID (with `<`, `>`, `@`, backticks, `[`, `]`, `(`, `)`, `*`, `_`, `~`, `|`, `\`, `:` and Unicode format/control characters removed from names), and channels as `<#id>` links.
 
-Changes are written to `routing` in `state.json` and survive restarts; while no routing is stored the `discord.target_user_id` and `discord.allowed_voice_channel_id` from config are used. A routing edited in `state.json` while the service runs is applied within a second, without a chat reply. At start the stored routing is checked: a target that is a relay account, a mirror using an account that is not a configured output account, a mirror on the main channel, or one account in two mirrors stops the service with `state.json routing is invalid` (fix or remove the `routing` entry). An invalid routing written while the service runs is ignored, logged once as `state_routing_rejected` (`level: error`), shown as `routing_error` in `status.json` and as a ⚠️ line in `!relay status`; it will stop the service at the next start. A chat command that changes routing is refused with "state.json vừa thay đổi, thử lại lệnh" when `state.json` routing changed since the service last read it. `relayctl status` shows the current `routing` and the channel of each output account.
+Changes are written to `routing` in `state.json` and survive restarts; while no routing is stored the `discord.target_user_id` and `discord.allowed_voice_channel_id` from config are used, with every mirror account that has a `channel_id` mirrored in its channel. A routing edited in `state.json` while the service runs is applied within a second, without a chat reply. At start the stored routing is checked: a target that is a relay account, a mirror using an account that is not in `mirror_accounts`, a mirror account fixed to another channel, a mirror on the main channel, or one account in two mirrors stops the service with `state.json routing is invalid` (fix or remove the `routing` entry). An invalid routing written while the service runs is ignored, logged once as `state_routing_rejected` (`level: error`), shown as `routing_error` in `status.json` and as a ⚠️ line in `!relay status`; it will stop the service at the next start. A chat command that changes routing is refused with "state.json vừa thay đổi, thử lại lệnh" when `state.json` routing changed since the service last read it. `relayctl status` shows the current `routing` and the channel of each output account.
 
 ## 8. Deploying on a Linux VPS with systemd
 
