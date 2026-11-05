@@ -522,3 +522,82 @@ def test_truncated_name_never_ends_in_space():
     c = ctx(user_name=lambda u: "A" * 31 + " Bcdef" if u == R1 else None)
     s = format_status(routing(), c, _details())
     assert f"**{'A' * 31}**" in s
+
+
+# ------------------------------------------------------------------ op
+
+
+def test_parse_op_commands() -> None:
+    from golive_relay.control.commands import OpAdd, OpList, OpRemove
+
+    assert parse("!relay op list", P) == OpList()
+    assert parse("!relay OP LIST", P) == OpList()
+    assert parse("!relay op add 123456789012345678", P) == OpAdd(123456789012345678)
+    assert parse("!relay op remove 42", P) == OpRemove(42)
+    assert command_name(OpList()) == command_name(OpAdd(1)) == command_name(OpRemove(1)) == "op"
+    for bad in ("!relay op", "!relay op list x", "!relay op add", "!relay op add 1 2", "!relay op remove",
+                "!relay op bogus 1", "!relay op add <@123>", "!relay op add <@!123>", "!relay op add 0",
+                "!relay op add -5", "!relay op add 1e5", "!relay op remove abc", "!relay op add ١٢٣"):
+        r = parse(bad, P)
+        assert isinstance(r, ParseError) and r.text.startswith("❌") and "op" in r.text, bad
+        assert "<@" not in r.text
+
+
+def test_help_lists_op_commands_owner_only() -> None:
+    lines = [ln for ln in HELP.splitlines() if "`op " in ln]
+    assert any("op list" in ln for ln in lines)
+    assert any("op add" in ln and "op remove" in ln and "chủ sở hữu" in ln for ln in lines)
+    assert all("công khai" not in ln for ln in lines)
+
+
+def _ops(**over):
+    from golive_relay.control.commands import OperatorContext
+
+    kw = dict(config_user_ids=frozenset({1}), role_ids=frozenset({500}), added=frozenset({2}), target_user_id=9)
+    return OperatorContext(**{**kw, **over})
+
+
+def test_plan_op_add_and_remove() -> None:
+    from golive_relay.control.commands import OpAdd, OpRemove, describe_op, plan_op
+
+    c = ctx(user_name=lambda u: {3: "Alice <@1>"}.get(u))
+    assert plan_op(OpAdd(3), _ops(), c) == frozenset({2, 3})
+    assert plan_op(OpRemove(2), _ops(), c) == frozenset()
+    added = describe_op(OpAdd(3), c)
+    assert added.startswith("✅") and "Alice" in added and "3" in added and "<@" not in added
+    removed = describe_op(OpRemove(2), c)
+    assert removed.startswith("✅") and "2" in removed
+
+
+def test_plan_op_rejections() -> None:
+    from golive_relay.control.commands import OpAdd, OpRemove, plan_op
+
+    c = ctx(is_bot=lambda u: u == 77)
+    for cmd, why in (
+        (OpAdd(1), "config"),  # config-defined owner already an operator
+        (OpAdd(2), "đã là operator"),
+        (OpAdd(9), "target"),
+        (OpAdd(R1), "bot"),  # relay account
+        (OpAdd(INGEST), "bot"),
+        (OpAdd(77), "bot"),  # any bot account
+        (OpRemove(1), "được khai báo trong config, sửa config để gỡ"),
+        (OpRemove(5), "không phải operator"),
+    ):
+        r = plan_op(cmd, _ops(), c)
+        assert isinstance(r, str) and r.startswith("⚠️") and why in r and "<@" not in r, (cmd, r)
+
+
+def test_format_operators_lists_config_chat_and_roles_without_mentions() -> None:
+    from golive_relay.control.commands import format_operators
+
+    names = {1: "Owner`*", 2: "Helper <@&5>", 123456789012345678: None}
+    c = ctx(user_name=names.get, role_name=lambda r: {500: "Mods @everyone"}.get(r))
+    text = format_operators(_ops(added=frozenset({2, 123456789012345678})), c)
+    assert text.startswith("👥") and "<@" not in text and "@everyone" not in text
+    assert "config" in text and "Owner" in text and "Helper" in text and "Mods" in text and "500" in text
+    assert "123456789012345678" in text  # unknown name: full id
+    assert "`*" not in text
+    empty = format_operators(_ops(config_user_ids=frozenset(), role_ids=frozenset(), added=frozenset()), ctx())
+    assert empty.startswith("👥") and "không có" in empty
+    many = format_operators(_ops(added=frozenset(range(10**17, 10**17 + 300))), ctx())
+    assert len(many) < 2000

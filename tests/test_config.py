@@ -380,6 +380,16 @@ def test_control_is_operator_by_user_role_or_neither() -> None:
     assert c.is_operator(1, frozenset())
     assert c.is_operator(2, frozenset({10, 11}))
     assert not c.is_operator(2, frozenset({11}))
+    assert c.is_owner(1, frozenset()) and c.is_owner(2, frozenset({10}))
+    assert not c.is_owner(3, frozenset()) and not c.is_owner(3, frozenset({11}))
+    # chat-added operators are operators but never owners
+    assert c.is_operator(3, frozenset(), frozenset({3})) and not c.is_operator(4, frozenset(), frozenset({3}))
+
+
+def test_control_public_commands_never_include_op(tmp_path: Path):
+    raw = _raw()
+    raw["control"] = {"public_commands": ["status", "op"]}
+    assert any("control.public_commands" in e for e in _errors(tmp_path, raw))
 
 
 def test_control_config_rejects_bad_command_channel(tmp_path: Path):

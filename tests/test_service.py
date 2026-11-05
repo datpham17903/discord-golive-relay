@@ -133,6 +133,12 @@ class FakeAdapter:
     def display_name(self, uid: int) -> str | None:
         return None
 
+    def is_bot(self, uid: int) -> bool:
+        return False
+
+    def role_name(self, rid: int) -> str | None:
+        return None
+
     def take_audio_window(self) -> dict[str, int]:
         return {"packets": 0, "silence": 0}
 
@@ -146,7 +152,8 @@ class Env:
             runtime=replace(cfg.runtime, start_debounce_ms=0, **runtime_kw),
             liveness=replace(cfg.liveness, source_dead_timeout_seconds=30.0),
             storage=replace(cfg.storage, state_directory=tmp_path),
-            control=replace(cfg.control, command_cooldown_seconds=0, change_cooldown_seconds=0),  # tests opt in
+            control=replace(cfg.control, command_cooldown_seconds=0, change_cooldown_seconds=0,  # tests opt in
+                            operator_user_ids=frozenset({OPERATOR})),
         )
         self.cfg = cfg
         self.store = StateStore(tmp_path)
@@ -517,10 +524,10 @@ def test_status_exposes_audio_counters(tmp_path, slate, source_gop):
 OPERATOR, CMD_CHAN = 50, 60
 
 
-def chat(env, text: str, msg_id: int = 900, voice: int | None = None, author: int = OPERATOR, op: bool = True) -> None:
+def chat(env, text: str, msg_id: int = 900, voice: int | None = None, author: int = OPERATOR) -> None:
     from golive_relay.control.commands import ChatCommand
 
-    env.adapters[-1].events(ChatCommand(author, CMD_CHAN, msg_id, text, author_voice_channel_id=voice, is_operator=op))
+    env.adapters[-1].events(ChatCommand(author, CMD_CHAN, msg_id, text, author_voice_channel_id=voice))
 
 
 def test_chat_target_command_persists_and_restarts(tmp_path, slate, source_gop):
@@ -750,19 +757,19 @@ def test_non_operator_may_use_public_commands_only(tmp_path, slate, source_gop):
         for i, text in enumerate(("!relay target 777", f"!relay channel {mirror_chan}",
                                   "!relay off", "!relay on", "!relay prejoin off", "!relay autoscale on", "!relay",
                                   "!relay wat", "!relay mirror 1 2 3", "!relay mirror <@1>"), start=10):
-            chat(env, text, i, voice=mirror_chan, author=guest, op=False)
+            chat(env, text, i, voice=mirror_chan, author=guest)
         await asyncio.sleep(0.1)
         assert a.replies == [] and env.store.load().revision == rev and env.svc.sup.desired_enabled is True
-        chat(env, "!relay status", 1, author=guest, op=False)
-        chat(env, "!relay mirror", 2, voice=mirror_chan, author=guest, op=False)
+        chat(env, "!relay status", 1, author=guest)
+        chat(env, "!relay mirror", 2, voice=mirror_chan, author=guest)
         await wait_until(lambda: len(a.replies) == 2)
         assert a.replies[0][2].startswith("# 📡") and a.replies[1][2].startswith("✅")
         assert env.svc.sup.routing.mirrors == {mirror_chan: uid}
-        chat(env, "!relay unmirror", 3, voice=mirror_chan, author=guest, op=False)  # unmirror is public by default
+        chat(env, "!relay unmirror", 3, voice=mirror_chan, author=guest)  # unmirror is public by default
         await wait_until(lambda: len(a.replies) == 3)
         assert a.replies[2][2].startswith("✅") and env.svc.sup.routing.mirrors == {}
-        chat(env, f"!relay mirror {mirror_chan}", 4, author=guest, op=False)
-        chat(env, f"!relay unmirror {mirror_chan}", 5, author=guest, op=False)
+        chat(env, f"!relay mirror {mirror_chan}", 4, author=guest)
+        chat(env, f"!relay unmirror {mirror_chan}", 5, author=guest)
         await wait_until(lambda: len(a.replies) == 5)
         assert all(r[2].startswith("✅") for r in a.replies[3:]) and env.svc.sup.routing.mirrors == {}
         env.svc.request_shutdown()
@@ -789,15 +796,15 @@ def test_per_author_cooldown_one_notice_then_silence_operators_exempt(tmp_path, 
     async def main():
         task = await reach_relaying(env)
         a = env.adapters[0]
-        chat(env, "!relay status", 1, author=51, op=False)
+        chat(env, "!relay status", 1, author=51)
         clk.t += 1
-        chat(env, "!relay status", 2, author=51, op=False)
-        chat(env, "!relay status", 3, author=51, op=False)
-        chat(env, "!relay status", 4, author=52, op=False)  # another author is not limited
+        chat(env, "!relay status", 2, author=51)
+        chat(env, "!relay status", 3, author=51)
+        chat(env, "!relay status", 4, author=52)  # another author is not limited
         for mid in (5, 6, 7):
             chat(env, "!relay status", mid)  # operator: exempt
         clk.t += 4
-        chat(env, "!relay status", 8, author=51, op=False)
+        chat(env, "!relay status", 8, author=51)
         await wait_until(lambda: len(a.replies) == 7)
         assert [r[1] for r in a.replies] == [1, 2, 4, 5, 6, 7, 8]
         assert a.replies[1][2] == "⏳ chậm lại chút, thử lại sau 4s"
@@ -824,9 +831,9 @@ def test_global_change_cooldown_blocks_everyone_but_not_status(tmp_path, slate, 
         assert env.svc.sup.prejoin_voice is False
         clk.t += 1
         chat(env, "!relay prejoin on", 2)  # operators are not exempt
-        chat(env, "!relay mirror", 3, author=51, op=False)
+        chat(env, "!relay mirror", 3, author=51)
         chat(env, "!relay status", 4)
-        chat(env, "!relay status", 5, author=52, op=False)
+        chat(env, "!relay status", 5, author=52)
         assert env.svc.sup.prejoin_voice is False and env.store.load().prejoin_voice is False
         clk.t += 2
         chat(env, "!relay prejoin on", 6)
@@ -861,9 +868,9 @@ def test_global_change_cooldown_notifies_a_guest_once_per_window(tmp_path, slate
         chat(env, "!relay prejoin off", 1)
         clk.t += 1
         for i in (2, 3, 4):
-            chat(env, f"!relay mirror {mirror_chan}", i, author=51, op=False)
+            chat(env, f"!relay mirror {mirror_chan}", i, author=51)
         clk.t += 2
-        chat(env, f"!relay mirror {mirror_chan}", 5, author=51, op=False)
+        chat(env, f"!relay mirror {mirror_chan}", 5, author=51)
         await wait_until(lambda: len(a.replies) == 3)
         await asyncio.sleep(0.1)
         texts = [r[2] for r in a.replies]
@@ -890,9 +897,9 @@ def test_global_change_cooldown_does_not_start_the_author_window(tmp_path, slate
         a.voice_ids = frozenset({env.chan, mirror_chan})
         chat(env, "!relay prejoin off", 1)
         clk.t += 1
-        chat(env, f"!relay mirror {mirror_chan}", 2, author=51, op=False)
+        chat(env, f"!relay mirror {mirror_chan}", 2, author=51)
         clk.t += 2  # the stated wait
-        chat(env, f"!relay mirror {mirror_chan}", 3, author=51, op=False)
+        chat(env, f"!relay mirror {mirror_chan}", 3, author=51)
         await wait_until(lambda: len(a.replies) == 3)
         assert a.replies[1][2] == "⏳ vừa có thay đổi, thử lại sau 2s"
         assert a.replies[2][2].startswith("✅") and env.svc.sup.routing.mirrors == {mirror_chan: uid}
@@ -1398,6 +1405,86 @@ def test_chat_routing_write_rejects_concurrent_hand_edit(tmp_path, slate, source
     asyncio.run(main())
 
 
+def test_chat_op_commands_owner_only_persist_and_poll(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    helper, guest = 51, 52
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        chat(env, f"!relay op add {helper}", 1, author=guest)  # guests: silently ignored
+        chat(env, "!relay op list", 2, author=guest)
+        chat(env, "!relay prejoin off", 3, author=helper)  # not yet an operator
+        await asyncio.sleep(0.1)
+        assert a.replies == [] and env.store.load().chat_operator_ids == [] and env.svc.sup.prejoin_voice is True
+        chat(env, f"!relay op add {helper}", 4)
+        assert env.store.load().chat_operator_ids == [helper]
+        chat(env, "!relay prejoin off", 5, author=helper)  # chat-added operator: operator commands
+        assert env.svc.sup.prejoin_voice is False
+        rev = env.store.load().revision
+        chat(env, f"!relay op add {guest}", 6, author=helper)  # but never op add/remove
+        chat(env, f"!relay op remove {helper}", 7, author=helper)
+        assert env.store.load().revision == rev
+        chat(env, "!relay op list", 8, author=helper)
+        chat(env, f"!relay op remove {OPERATOR}", 9)  # config-defined: not removable by chat
+        chat(env, f"!relay op add {env.target}", 10)
+        chat(env, f"!relay op add {env.cfg.discord.expected_relay_user_id}", 11)
+        chat(env, "!relay op add <@52>", 12)
+        assert env.store.load().revision == rev
+        await wait_until(lambda: len(a.replies) == 9)
+        texts = [r[2] for r in a.replies]
+        assert texts[0].startswith("✅") and texts[1].startswith("✅")
+        assert texts[2].startswith("⚠️") and "chủ sở hữu" in texts[2] and texts[3] == texts[2]
+        assert texts[4].startswith("👥") and str(helper) in texts[4]
+        assert texts[5].startswith("⚠️") and "sửa config để gỡ" in texts[5]
+        assert texts[6].startswith("⚠️") and "target" in texts[6]
+        assert texts[7].startswith("⚠️") and "bot" in texts[7]
+        assert texts[8].startswith("❌")
+        assert all("<@" not in t for t in texts)
+        env.store.update(lambda s: replace(s, chat_operator_ids=[guest]))  # hand edit: picked up by the poll
+        await wait_until(lambda: env.svc.cfg.control.is_operator(guest, frozenset(), env.svc._chat_ops))
+        assert not env.svc.cfg.control.is_operator(helper, frozenset(), env.svc._chat_ops)
+        chat(env, f"!relay op remove {guest}", 13)
+        assert env.store.load().chat_operator_ids == []
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+    ops = [kw for name, kw in env.log_kw if name == "chat_command" and kw["command"] in ("OpAdd", "OpRemove")]
+    assert {"command": "OpAdd", "author": OPERATOR, "channel": CMD_CHAN, "user": helper, "outcome": "applied"} in ops
+    assert {"command": "OpAdd", "author": helper, "channel": CMD_CHAN, "user": guest, "outcome": "denied"} in ops
+    assert all("text" not in kw for name, kw in env.log_kw)
+
+
+def test_chat_operators_survive_restart(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+    env.store.update(lambda s: replace(s, chat_operator_ids=[51]))
+    again = Env(tmp_path, slate, source_gop)
+    assert again.svc._chat_ops == frozenset({51})
+
+
+def test_op_add_respects_the_global_change_cooldown_op_list_does_not(tmp_path, slate, source_gop):
+    from golive_relay.control.cooldown import ChatCooldowns
+
+    env = Env(tmp_path, slate, source_gop)
+    env.svc._cooldowns = ChatCooldowns(5, 3, _Clock())
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        chat(env, "!relay op add 51", 1)
+        chat(env, "!relay op add 52", 2)
+        chat(env, "!relay op list", 3)
+        await wait_until(lambda: len(a.replies) == 3)
+        assert env.store.load().chat_operator_ids == [51]
+        texts = [r[2] for r in a.replies]
+        assert texts[0].startswith("✅") and texts[1].startswith("⏳") and texts[2].startswith("👥")
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
 def test_reply_without_adapter_is_logged(tmp_path, slate, source_gop):
     from golive_relay.control.commands import ChatCommand
 
@@ -1521,7 +1608,7 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
         a = env.adapters[0]
         await asyncio.sleep(0.1)
         assert env.svc.pool.relay_summary()["wanted"] == 0  # config: autoscale, nobody watching
-        chat(env, "!relay autoscale off", 1, author=51, op=False)  # operators only: ignored
+        chat(env, "!relay autoscale off", 1, author=51)  # operators only: ignored
         await asyncio.sleep(0.1)
         assert a.replies == [] and env.store.load().relay_autoscale is None
         chat(env, "!relay autoscale off", 2)

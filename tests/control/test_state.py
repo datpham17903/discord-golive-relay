@@ -290,3 +290,20 @@ def test_prejoin_override_is_optional_v3_key(tmp_path: Path) -> None:
     (tmp_path / "state.json").write_text(json.dumps(doc))
     with pytest.raises(StateCorrupt):
         store.load()
+
+
+def test_chat_operator_ids_are_optional_v3_key(tmp_path: Path) -> None:
+    doc = {
+        "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {}, "routing": None,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    store = StateStore(tmp_path)
+    assert store.load().chat_operator_ids == []  # old file without the key: nobody added by chat
+    store.update(lambda s: replace(s, chat_operator_ids=[123456789012345678, 5]))
+    assert StateStore(tmp_path).load().chat_operator_ids == [123456789012345678, 5]
+    for bad in ("5", ["5"], [0], [-1], [True], [5, 5], {"5": 1}):
+        doc["chat_operator_ids"] = bad
+        (tmp_path / "state.json").write_text(json.dumps(doc))
+        with pytest.raises(StateCorrupt):
+            store.load()

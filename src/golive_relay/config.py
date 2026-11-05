@@ -139,8 +139,13 @@ class ControlConfig:
     command_cooldown_seconds: int = 5  # per author; operators are exempt
     change_cooldown_seconds: int = 3  # global, between applied state changes; everyone
 
-    def is_operator(self, user_id: int, role_ids: frozenset[int]) -> bool:
+    def is_owner(self, user_id: int, role_ids: frozenset[int]) -> bool:
+        """Listed in config (user or role): every command, including managing chat-added operators."""
         return user_id in self.operator_user_ids or not self.operator_role_ids.isdisjoint(role_ids)
+
+    def is_operator(self, user_id: int, role_ids: frozenset[int], added: frozenset[int] = frozenset()) -> bool:
+        """An owner or a chat-added operator (``added``, from state.json): every command but `op add/remove`."""
+        return user_id in added or self.is_owner(user_id, role_ids)
 
 
 @dataclass(frozen=True, slots=True)

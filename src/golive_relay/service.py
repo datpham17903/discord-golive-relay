@@ -24,7 +24,8 @@ from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
     COMMAND_NAMES, ChatCommand, ParseError, RoutingContext, resolve_here, SetAutoscale, SetEnabled, SetPrejoin, Status, StatusDetails,
-    command_name, describe_change, format_status, parse, plan_change,
+    OpAdd, OpList, OpRemove, OperatorContext,
+    command_name, describe_change, describe_op, format_operators, format_status, parse, plan_change, plan_op,
 )
 from golive_relay.control.cooldown import ChatCooldowns
 from golive_relay.control.lock import InstanceLocks
@@ -178,6 +179,7 @@ class Service:
         self._autoscale = r.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
         if self._autoscale:
             self.pool.set_relay_target(0, time.monotonic())  # no session yet: nothing to start or stop
+        self._chat_ops = frozenset(st.chat_operator_ids)  # added by `op add`; config owners are not in here
         self._session_since: float | None = None  # gate first opened in the current session
         self._out_since: dict[int, float] = {}  # account -> first OutSetLive of its current run
         self._last_watch_ms: float | None = None  # watch_sent_from_seen_ms of the last logged session
@@ -404,6 +406,7 @@ class Service:
         autoscale = self.cfg.runtime.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
         if autoscale != self._autoscale:
             self._set_autoscale(autoscale)
+        self._chat_ops = frozenset(st.chat_operator_ids)
         routing = Routing.from_persisted(st.routing, config_routing(self.cfg))
         err = routing_error(routing, self.cfg)
         if err is None:
@@ -425,8 +428,9 @@ class Service:
         cmd = parse(ev.text, c.command_prefix, c.public_commands)
         if cmd is None:
             return
-        changing = not isinstance(cmd, (ParseError, Status))
-        if not ev.is_operator:
+        changing = not isinstance(cmd, (ParseError, Status, OpList))
+        operator = c.is_operator(ev.author_id, ev.author_role_ids, self._chat_ops)
+        if not operator:
             if isinstance(cmd, ParseError) or command_name(cmd) not in c.public_commands:
                 return  # no reply to non-operators for invalid or non-public commands: nothing to spam with
             # a change the global cooldown rejects must not start the author window, or its stated wait would lie
@@ -435,10 +439,17 @@ class Service:
                 if wait is not None:
                     self._chat_cooldown(ev, cmd, f"⏳ chậm lại chút, thử lại sau {wait}s" if wait else None)
                     return
+        log_kw = {"user": cmd.user_id} if isinstance(cmd, (OpAdd, OpRemove)) else {}
+        if log_kw and not c.is_owner(ev.author_id, ev.author_role_ids):
+            # chat-added operators may not add others: only config owners manage the list
+            self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
+                     outcome="denied", **log_kw)
+            self._reply(ev, "⚠️ **Chỉ chủ sở hữu** (khai báo trong config) mới thêm hoặc gỡ operator.")
+            return
         if changing:
             wait = self._cooldowns.change_wait()
             if wait:
-                notice = ev.is_operator or self._cooldowns.change_notice(ev.author_id)
+                notice = operator or self._cooldowns.change_notice(ev.author_id)
                 self._chat_cooldown(ev, cmd, f"⏳ vừa có thay đổi, thử lại sau {wait}s" if notice else None)
                 return
         ctx = self._routing_context()
@@ -461,6 +472,16 @@ class Service:
                     self.store.update(lambda s: replace(s, relay_autoscale=cmd.on))
                     self._set_autoscale(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
+            elif isinstance(cmd, OpList):
+                outcome, text = "listed", format_operators(self._operator_context(), ctx)
+            elif isinstance(cmd, (OpAdd, OpRemove)):
+                planned = plan_op(cmd, self._operator_context(), ctx)
+                if isinstance(planned, str):
+                    outcome, text = "rejected", planned
+                else:
+                    st = self.store.update(self._chat_ops_write(cmd))
+                    self._chat_ops = frozenset(st.chat_operator_ids)
+                    outcome, text = "applied", describe_op(cmd, ctx)
             else:
                 resolved = resolve_here(cmd, old, ev.author_voice_channel_id)
                 new = resolved if isinstance(resolved, str) else plan_change(resolved, old, ctx)
@@ -478,7 +499,7 @@ class Service:
         if outcome == "applied":
             self._cooldowns.changed()
         self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
-                 outcome=outcome)
+                 outcome=outcome, **log_kw)
         self._reply(ev, text)
 
     def _chat_cooldown(self, ev: ChatCommand, cmd: Any, text: str | None) -> None:
@@ -501,6 +522,20 @@ class Service:
 
         return fn
 
+    @staticmethod
+    def _chat_ops_write(cmd: OpAdd | OpRemove) -> Callable[[PersistedState], PersistedState]:
+        """Runs under the state lock: applies only this change, so a concurrent hand edit is kept."""
+
+        def fn(s: PersistedState) -> PersistedState:
+            kept = [u for u in s.chat_operator_ids if u != cmd.user_id]
+            return replace(s, chat_operator_ids=kept + [cmd.user_id] if isinstance(cmd, OpAdd) else kept)
+
+        return fn
+
+    def _operator_context(self) -> OperatorContext:
+        c = self.cfg.control
+        return OperatorContext(c.operator_user_ids, c.operator_role_ids, self._chat_ops, self.sup.routing.target_user_id)
+
     def _routing_context(self) -> RoutingContext:
         accounts = [a.user_id for a in self.cfg.output_accounts()]
         mirrors = self.cfg.discord.mirror_accounts
@@ -513,6 +548,8 @@ class Service:
             unavailable=frozenset(r["account"] for r in self.pool.status(time.monotonic()) if r["state"] in bad),
             voice_channel_ids=adapter.voice_channel_ids() if adapter is not None else frozenset(),
             user_name=adapter.display_name if adapter is not None else (lambda _: None),
+            is_bot=adapter.is_bot if adapter is not None else (lambda _: False),
+            role_name=adapter.role_name if adapter is not None else (lambda _: None),
         )
 
     def _reply(self, ev: ChatCommand, text: str) -> None:

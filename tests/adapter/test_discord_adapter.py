@@ -35,19 +35,21 @@ def message(author: int = OPERATOR, guild: int | None = GUILD, channel: int = CM
 def test_operator_message_becomes_chat_command() -> None:
     a, out = make()
     a.handle_dispatch("message", message())
-    assert out == [ChatCommand(OPERATOR, CMD_CHAN, 900, "!relay status", is_operator=True)]
+    assert out == [ChatCommand(OPERATOR, CMD_CHAN, 900, "!relay status")]
+    a.handle_dispatch("message", message(text="hello"))  # owners too: only prefixed messages reach the service
+    assert len(out) == 1
 
 
-def test_non_operator_command_is_passed_on_flagged() -> None:
+def test_non_operator_command_is_passed_on() -> None:
     a, out = make()
     a.handle_dispatch("message", message(author=51))
-    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status", is_operator=False)]
+    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status")]
     a.handle_dispatch("message", message(author=51, text="hello"))  # not a command: never reaches the service
     a.handle_dispatch("message", message(author=51, text=""))
     a.handle_dispatch("message", message(author=51, text="!relayx status"))
     assert len(out) == 1
     a.handle_dispatch("message", message(author=51, text="!RELAY unmirror all"))  # the service decides
-    assert out[-1].is_operator is False and out[-1].text == "!RELAY unmirror all"
+    assert out[-1].text == "!RELAY unmirror all"
 
 
 def test_chat_from_elsewhere_ignored_no_reply() -> None:
@@ -97,6 +99,16 @@ def test_cache_lookups_for_routing_context() -> None:
     assert a.display_name(10) is None
 
 
+def test_cache_lookups_for_operator_list() -> None:
+    a, _ = make()
+    guild = NS(get_member=lambda uid: NS(bot=True) if uid == 8 else None,
+               get_role=lambda rid: NS(name="Mods") if rid == 500 else None)
+    users = {9: NS(bot=True), 11: NS(bot=False)}
+    a._client = NS(get_guild=lambda gid: guild if gid == GUILD else None, get_user=users.get)
+    assert a.is_bot(8) and a.is_bot(9) and not a.is_bot(11) and not a.is_bot(10)
+    assert a.role_name(500) == "Mods" and a.role_name(501) is None
+
+
 def test_join_reports_voice_state_echo_before_voice_connects() -> None:
     a, _ = make()
     vc = NS(session_id="sess-1")
@@ -125,22 +137,16 @@ def test_join_reports_voice_state_echo_before_voice_connects() -> None:
 ROLE = 700
 
 
-def test_role_holder_is_operator_and_role_ids_are_passed() -> None:
+def test_role_ids_are_passed() -> None:
     a, out = make(roles=frozenset({ROLE}))
     m = message(author=51)
     m.author.roles = [NS(id=ROLE), NS(id=701)]
     a.handle_dispatch("message", m)
-    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status", frozenset({ROLE, 701}), is_operator=True)]
+    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status", frozenset({ROLE, 701}))]
 
 
-def test_role_operator_denials() -> None:
+def test_role_holder_elsewhere_is_ignored() -> None:
     a, out = make(roles=frozenset({ROLE}))
-    other = message(author=51)
-    other.author.roles = [NS(id=701)]
-    a.handle_dispatch("message", other)  # wrong role
-    a.handle_dispatch("message", message(author=51))  # not a member, unknown
-    assert [c.is_operator for c in out] == [False, False]
-    out.clear()
     wrong_guild = message(author=51, guild=99)
     wrong_guild.author.roles = [NS(id=ROLE)]
     a.handle_dispatch("message", wrong_guild)
@@ -155,7 +161,7 @@ def test_role_lookup_via_guild_member_when_author_is_not_a_member() -> None:
     m = message(author=51)
     m.guild.get_member = lambda uid: NS(roles=[NS(id=ROLE)]) if uid == 51 else None
     a.handle_dispatch("message", m)
-    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE}) and out[0].is_operator
+    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE})
 
 
 def test_raw_member_role_ids_are_used_over_cached_roles() -> None:
@@ -164,7 +170,7 @@ def test_raw_member_role_ids_are_used_over_cached_roles() -> None:
     m.author._roles = [ROLE, 702]
     m.author.roles = []  # role cache incomplete
     a.handle_dispatch("message", m)
-    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE, 702}) and out[0].is_operator
+    assert len(out) == 1 and out[0].author_role_ids == frozenset({ROLE, 702})
 
 
 def test_failed_connect_after_voice_state_echo_clears_voice_client() -> None:

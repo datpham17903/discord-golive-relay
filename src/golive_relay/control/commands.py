@@ -10,6 +10,7 @@ from typing import Callable, Mapping
 from golive_relay.supervisor.routing import Routing
 
 COMMAND_NAMES = ("status", "mirror", "unmirror", "on", "off", "target", "channel", "prejoin", "autoscale")
+# `op` is deliberately not in COMMAND_NAMES: it can never be made public
 DEFAULT_PUBLIC_COMMANDS = frozenset({"status", "mirror", "unmirror"})
 
 _HELP_LINES = (
@@ -23,6 +24,8 @@ _HELP_LINES = (
     ("unmirror", "• `unmirror <channel_id|all>` - gỡ mirror"),
     ("prejoin", "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"),
     ("autoscale", "• `autoscale <on|off>` - bật hoặc tắt tự động tăng/giảm số relay theo người xem (chỉ operator)"),
+    ("op", "• `op list` - xem danh sách operator"),
+    ("op", "• `op add <user_id>` / `op remove <user_id>` - thêm hoặc gỡ operator (chỉ chủ sở hữu)"),
 )
 
 
@@ -46,6 +49,7 @@ _USAGE = {
     "status": "`status`",
     "prejoin": "`prejoin <on|off>`",
     "autoscale": "`autoscale <on|off>`",
+    "op": "`op list`, `op add <user_id>` hoặc `op remove <user_id>`",
 }
 
 
@@ -59,7 +63,6 @@ class ChatCommand:
     text: str
     author_role_ids: frozenset[int] = frozenset()
     author_voice_channel_id: int | None = None  # author's current voice channel in the configured guild
-    is_operator: bool = False  # listed user or role holder; others may only use public commands
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +107,23 @@ class SetAutoscale:
     on: bool
 
 
-Command = Status | SetEnabled | SetPrejoin | SetAutoscale | SetTarget | SetChannel | AddMirror | RemoveMirror
+@dataclass(frozen=True, slots=True)
+class OpList:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class OpAdd:
+    user_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class OpRemove:
+    user_id: int
+
+
+Command = (Status | SetEnabled | SetPrejoin | SetAutoscale | SetTarget | SetChannel | AddMirror | RemoveMirror
+           | OpList | OpAdd | OpRemove)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +139,16 @@ class RoutingContext:
     voice_channel_ids: frozenset[int]
     user_name: Callable[[int], str | None] = field(default=lambda _: None)
     mirror_fixed: Mapping[int, int] = field(default_factory=dict)  # mirror account -> its fixed channel
+    is_bot: Callable[[int], bool] = field(default=lambda _: False)
+    role_name: Callable[[int], str | None] = field(default=lambda _: None)
+
+
+@dataclass(frozen=True, slots=True)
+class OperatorContext:
+    config_user_ids: frozenset[int]  # owners listed in config
+    role_ids: frozenset[int]  # owner roles listed in config
+    added: frozenset[int]  # chat-added operators (state.json)
+    target_user_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,11 +182,15 @@ class StatusDetails:
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
 
 
-def _user(ctx: RoutingContext, uid: int) -> str:
+def _clean(raw: str | None) -> str:
     # display names are user-controlled: no mention, link, markdown or bidi/format trick may survive into a reply
-    raw = (ctx.user_name(uid) or "").translate(_NAME_UNSAFE)
+    raw = (raw or "").translate(_NAME_UNSAFE)
     raw = "".join(c for c in raw if unicodedata.category(c) not in ("Cf", "Cc") or c.isspace())
-    name = " ".join(raw.split())
+    return " ".join(raw.split())
+
+
+def _user(ctx: RoutingContext, uid: int) -> str:
+    name = _clean(ctx.user_name(uid))
     return f"{name} ({uid})" if name else str(uid)
 
 
@@ -180,7 +213,7 @@ def command_name(cmd: Command) -> str:
     if isinstance(cmd, SetEnabled):
         return "on" if cmd.on else "off"
     return {Status: "status", SetPrejoin: "prejoin", SetAutoscale: "autoscale", SetTarget: "target", SetChannel: "channel",
-            AddMirror: "mirror", RemoveMirror: "unmirror"}[type(cmd)]
+            AddMirror: "mirror", RemoveMirror: "unmirror", OpList: "op", OpAdd: "op", OpRemove: "op"}[type(cmd)]
 
 
 def parse(text: str, prefix: str, public: frozenset[str] = DEFAULT_PUBLIC_COMMANDS) -> Command | ParseError | None:
@@ -198,6 +231,18 @@ def parse(text: str, prefix: str, public: frozenset[str] = DEFAULT_PUBLIC_COMMAN
         if len(args) != 1 or args[0].lower() not in ("on", "off"):
             return _usage_error(sub, "**Cần đúng một tham số** `on` hoặc `off`")
         return (SetPrejoin if sub == "prejoin" else SetAutoscale)(args[0].lower() == "on")
+    if sub == "op":
+        action = args[0].lower() if args else None
+        if action == "list":
+            return OpList() if len(args) == 1 else _usage_error(sub, "**Thừa tham số**")
+        if action not in ("add", "remove"):
+            return _usage_error(sub, "**Thiếu hoặc sai hành động**")
+        if len(args) != 2:
+            return _usage_error(sub, "**Cần đúng một user ID**")
+        n = _parse_id(sub, args[1])
+        if isinstance(n, ParseError):
+            return n
+        return (OpAdd if action == "add" else OpRemove)(n)
     if sub == "mirror":
         if not args:
             return AddMirror(None)
@@ -331,6 +376,58 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
             return f"✅ **Đã gỡ toàn bộ mirror** ({len(old.mirrors)} kênh)."
         return f"✅ **Đã gỡ mirror** {_ch(cmd.channel_id)}; {_user(ctx, old.mirrors[cmd.channel_id])} được giải phóng."
     return "✅ **Xong**"
+
+
+def plan_op(cmd: OpAdd | OpRemove, ops: OperatorContext, ctx: RoutingContext) -> frozenset[int] | str:
+    """New chat-added operator set, or a rejection reply. Owner-only: the caller checks the author."""
+    uid = cmd.user_id
+    if isinstance(cmd, OpAdd):
+        if uid in ctx.relay_user_ids or ctx.is_bot(uid):
+            return _reject(f"**Không thể thêm** {_user(ctx, uid)}: đây là tài khoản bot/relay, không bao giờ là operator.")
+        if uid == ops.target_user_id:
+            return _reject(f"**Không thể thêm** {_user(ctx, uid)}: đây là target của relay.")
+        if uid in ops.config_user_ids:
+            return _reject(f"{_user(ctx, uid)} **đã là operator** (khai báo trong config).")
+        if uid in ops.added:
+            return _reject(f"{_user(ctx, uid)} **đã là operator**.", "`op list` để xem danh sách")
+        return ops.added | {uid}
+    if uid in ops.config_user_ids:
+        return _reject(f"**Không thể gỡ** {_user(ctx, uid)}: được khai báo trong config, sửa config để gỡ.")
+    if uid not in ops.added:
+        return _reject(f"{_user(ctx, uid)} **không phải operator** thêm qua chat.", "`op list` để xem danh sách")
+    return ops.added - {uid}
+
+
+def describe_op(cmd: OpAdd | OpRemove, ctx: RoutingContext) -> str:
+    if isinstance(cmd, OpAdd):
+        return f"✅ **Đã thêm operator** {_user(ctx, cmd.user_id)}."
+    return f"✅ **Đã gỡ operator** {_user(ctx, cmd.user_id)}."
+
+
+def _who(ctx: RoutingContext, uid: int) -> str:
+    """Sanitized name and short id; the full id when the name is unknown."""
+    sid = str(uid)
+    if _user(ctx, uid) == sid:
+        return f"`{sid}`"
+    return f"**{_short(ctx, uid)}**" + (f" `{sid[:4]}…{sid[-4:]}`" if len(sid) > 8 else f" `{sid}`")
+
+
+def format_operators(ops: OperatorContext, ctx: RoutingContext) -> str:
+    def block(title: str, items: list[str]) -> list[str]:
+        return [title, *(f"> {i}" for i in items)] if items else [title, "> không có"]
+
+    roles = []
+    for rid in sorted(ops.role_ids):
+        name = _clean(ctx.role_name(rid))[:32].rstrip()
+        roles.append(f"**{name}** `{rid}`" if name else f"`{rid}`")
+    lines = ["👥 **Operator**",
+             *block("**Chủ sở hữu** (config)", [_who(ctx, u) for u in sorted(ops.config_user_ids)]),
+             *block("**Role chủ sở hữu** (config)", roles),
+             *block("**Thêm qua chat**", [_who(ctx, u) for u in sorted(ops.added)])]
+    out = "\n".join(lines)
+    if len(out) >= _MAX_LEN:
+        out = out[: _MAX_LEN - 2].rsplit("\n", 1)[0] + "\n…"
+    return out
 
 
 def _dur(s: float | None) -> str:
