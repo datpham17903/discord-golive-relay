@@ -88,8 +88,10 @@ IDs (all are long numbers, always written as quoted strings):
 | `guild_id` | the server |
 | `target_user_id` | the person being relayed |
 | `allowed_voice_channel_id` | the voice channel they share in |
-| `expected_relay_user_id` | the ingest relay account |
-| each output account `user_id` | each extra relay account |
+| `expected_relay_user_id` (optional) | the ingest relay account |
+| each output account `user_id` (optional) | each extra relay account |
+
+Account user IDs are optional: `relayctl run` and `relayctl doctor` read them from the token files at startup (one HTTP login per account, no gateway connection) and log `account <credential> -> <id>`. Set one to pin the account; it is checked at login.
 
 Tokens: use a dedicated relay account per token. Log in to Discord in a browser, open developer tools (F12), Network tab, click any request to `discord.com/api`, and copy the `authorization` request header value. Do not log out with the Discord "Log out" button afterwards, because that invalidates the token.
 
@@ -112,21 +114,21 @@ cp config.example.yaml config.yaml          # Windows: Copy-Item config.example.
 relayctl validate --config config.yaml
 ```
 
-`validate` prints every problem at once. Unknown keys are errors. All IDs must be quoted strings. The file is read-only for the relay: it never writes YAML (except `calibrate_tdead.py --write`, section 6).
+`validate` prints every problem at once. Unknown keys are errors. All IDs must be quoted strings. `validate` works offline: when account user IDs are left out it notes that they are resolved at run time and skips the checks that need them (ID clashes, the profile approval of the ingest account). The file is read-only for the relay: it never writes YAML (except `calibrate_tdead.py --write`, section 6).
 
 ### Keys
 
 | Key | Meaning | Default in example | Change when |
 | --- | --- | --- | --- |
 | `schema_version` | Config format | `1` | never |
-| `discord.expected_relay_user_id` | ID of the ingest account | dummy | always |
+| `discord.expected_relay_user_id` | ID of the ingest account; optional, read from the token at startup when absent. Set it to pin the account; it is checked at login | absent | you want to pin the ingest account |
 | `discord.guild_id` | Server ID | dummy | always |
 | `discord.target_user_id` | Person to relay (must differ from the relay) | dummy | always |
 | `discord.allowed_voice_channel_id` | The only voice channel used | dummy | always |
 | `discord.ingest_credential` | Token file name of the ingest account | `relay-token` | you use another file name |
 | `discord.ingest_publishes` | Ingest account also publishes its own Go Live | `true` | set `false` to publish only from output accounts |
-| `discord.relay_accounts` | Extra publish-only accounts for the main channel (list of `{user_id, credential}`); started as viewers grow (`runtime.relay_autoscale`). Relay and mirror accounts together: max 9, never shared | `[]` | the main channel outgrows one Go Live |
-| `discord.mirror_accounts` | Publish-only accounts for other voice channels (list of `{user_id, credential}` plus optional `channel_id`); one account per channel, one channel per account. A `channel_id` fixes the account to that channel (not the main channel, not shared by two mirrors) and starts it there while `state.json` has no routing | `[]` | you mirror the stream into other channels |
+| `discord.relay_accounts` | Extra publish-only accounts for the main channel (list of `{credential}`, optional `user_id`); started as viewers grow (`runtime.relay_autoscale`). Relay and mirror accounts together: max 9, never shared | `[]` | the main channel outgrows one Go Live |
+| `discord.mirror_accounts` | Publish-only accounts for other voice channels (list of `{credential}` plus optional `user_id` and `channel_id`); one account per channel, one channel per account. A `channel_id` fixes the account to that channel (not the main channel, not shared by two mirrors) and starts it there while `state.json` has no routing | `[]` | you mirror the stream into other channels |
 | `discord.output_accounts` | Deprecated alias of `relay_accounts` (Python prints a `FutureWarning` to stderr when the config loads; nothing goes to the JSON log); cannot be combined with the new lists | absent | migrate to `relay_accounts` |
 | `authorization.agreement_ref` | Note pointing to the consent record | placeholder | always |
 | `authorization.excluded_viewer_ids` | Viewer IDs the target asked to exclude | `[]` | the target asks |
@@ -178,15 +180,15 @@ Relative manifest paths are looked up next to the config file.
 
 ### Multiple accounts
 
-Each extra account needs a Discord user ID and its own token file. The credential name must match `[A-Za-z0-9_.-]+` and be unique (also different from `ingest_credential`). Relay accounts publish in the main channel; mirror accounts publish in other channels. An account is in one list only.
+Each extra account needs its own token file; its user ID is read from the token at startup (`user_id` is optional: set it to pin the account; it is checked at login). The credential name must match `[A-Za-z0-9_.-]+` and be unique (also different from `ingest_credential`). Relay accounts publish in the main channel; mirror accounts publish in other channels. An account is in one list only.
 
 ```yaml
 discord:
   ingest_credential: relay-token
   relay_accounts:
-    - {user_id: "111111111111111111", credential: relay-token-2}
+    - {credential: relay-token-2}
   mirror_accounts:
-    - {user_id: "222222222222222222", credential: relay-token-3, channel_id: "333333333333333333"}
+    - {credential: relay-token-3, channel_id: "333333333333333333"}
 ```
 
 Token files: `relay-token`, `relay-token-2`, `relay-token-3`. Each account has its own quarantine and FATAL latch; one failing output does not stop the others. Output accounts do not watch the target, so they use no extra viewer slot on the target's stream.
@@ -495,9 +497,10 @@ After fixing the cause: `relayctl reset-fatal --state-dir DIR` (add `--account I
 | `recording_enabled: must be false (not implemented)` | Leave it `false` (same for `include_media`) |
 | `not operable: liveness.source_dead_timeout_seconds ...` | Do the T_dead calibration (section 6) |
 | `not operable: profile ... not approved` | Add the profile to `verified-profiles.json` (section 5) |
-| `relay_accounts[i]: ...` / `mirror_accounts[i]: ...` | Need `user_id` and `credential` (mirrors may add `channel_id`); IDs and credential names must be unique; a mirror `channel_id` must not be the main channel or another mirror's |
+| `relay_accounts[i]: ...` / `mirror_accounts[i]: ...` | Need `credential` (optional `user_id`; mirrors may add `channel_id`); IDs and credential names must be unique; a mirror `channel_id` must not be the main channel or another mirror's |
 | `output_accounts: deprecated; cannot be combined ...` | Move the entries to `relay_accounts` and remove `output_accounts` |
 | `state.json routing is invalid` (`mirror ... is not a configured mirror account`) after switching to `output_accounts` or `relay_accounts` | Every `output_accounts` entry is a relay account. Move the accounts used by the stored mirrors to `mirror_accounts`, or remove the `routing` entry from `state.json` (run `!relay unmirror` before upgrading) |
+| `credential X: cannot resolve user id ...` / `credential X: account ... is ...` | At startup the token `X` was rejected or Discord was unreachable, or the account it belongs to is the target or another configured account. Check the token file `X` |
 | `no credential: ...` | Set `RELAY_TOKEN_DIR` (or systemd `LoadCredential`); file name must equal the credential name |
 
 ## 11. What is verified live

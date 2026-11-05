@@ -7,14 +7,16 @@ from pathlib import Path
 import pytest
 import yaml
 
-from golive_relay.config import ConfigInvalid, check_operable, load_config
+from golive_relay.config import ConfigInvalid, apply_account_ids, check_operable, load_config, unresolved_credentials
 from golive_relay.worker.messages import OutputProfile
 
 EXAMPLE = Path(__file__).resolve().parent.parent / "config.example.yaml"
 
 
 def _raw() -> dict:
-    return yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8"))
+    raw["discord"].setdefault("expected_relay_user_id", "100000000000000001")  # the example resolves it at startup
+    return raw
 
 
 def _load(tmp_path: Path, raw: dict):
@@ -475,3 +477,54 @@ def test_example_defaults_debounce_100_prejoin_true():
     assert cfg.runtime.start_debounce_ms == 100 and cfg.runtime.prejoin_voice is True
     assert cfg.discord.relay_accounts == () and cfg.discord.mirror_accounts == ()
     assert "output_accounts" not in _raw()["discord"]
+
+
+def test_credential_only_accounts_parse_with_unresolved_ids(tmp_path):
+    raw = _with_pools([{"credential": "r2"}, {"user_id": "6", "credential": "r3"}],
+                      [{"credential": "m1", "channel_id": "900"}])
+    del raw["discord"]["expected_relay_user_id"]
+    cfg = _load(tmp_path, raw)
+    d = cfg.discord
+    assert d.expected_relay_user_id == 0
+    assert [(a.user_id, a.credential, a.role, a.channel_id) for a in d.output_accounts] == [
+        (0, "r2", "relay", None), (6, "r3", "relay", None), (0, "m1", "mirror", 900)]
+    assert unresolved_credentials(cfg) == ["relay-token", "r2", "m1"]
+    assert unresolved_credentials(_load(tmp_path, _raw())) == []
+    raw = _with_pools([{"credential": "r2"}, {"credential": "r2"}], [])
+    assert any("relay_accounts[1]" in e and "credential" in e for e in _errors(tmp_path, raw))
+
+
+def test_apply_account_ids_fills_ids_and_keeps_explicit_ones(tmp_path):
+    raw = _with_pools([{"credential": "r2"}, {"user_id": "6", "credential": "r3"}], [{"credential": "m1"}])
+    del raw["discord"]["expected_relay_user_id"]
+    cfg = apply_account_ids(_load(tmp_path, raw), {"relay-token": 11, "r2": 12, "m1": 13})
+    d = cfg.discord
+    assert d.expected_relay_user_id == 11
+    assert [(a.user_id, a.credential, a.role) for a in d.output_accounts] == [
+        (12, "r2", "relay"), (6, "r3", "relay"), (13, "m1", "mirror")]
+    assert unresolved_credentials(cfg) == []
+
+
+def test_apply_account_ids_revalidates_resolved_ids(tmp_path):
+    raw = _with_pools([{"credential": "r2"}], [{"user_id": "6", "credential": "m1"}])
+    del raw["discord"]["expected_relay_user_id"]
+    cfg = _load(tmp_path, raw)
+    target = cfg.discord.target_user_id
+    with pytest.raises(ConfigInvalid) as ei:
+        apply_account_ids(cfg, {"relay-token": 11, "r2": 11})
+    assert any("r2" in e and "relay-token" in e for e in ei.value.errors)
+    with pytest.raises(ConfigInvalid) as ei:
+        apply_account_ids(cfg, {"relay-token": 11, "r2": 6})
+    assert any("r2" in e and "m1" in e for e in ei.value.errors)
+    with pytest.raises(ConfigInvalid) as ei:
+        apply_account_ids(cfg, {"relay-token": target, "r2": 12})
+    assert any("relay-token" in e and "target_user_id" in e for e in ei.value.errors)
+
+
+def test_check_operable_skips_profile_while_ingest_id_unresolved(tmp_path):
+    raw = _raw()
+    del raw["discord"]["expected_relay_user_id"]
+    raw["liveness"]["source_dead_timeout_seconds"] = 5
+    cfg = _load(tmp_path, raw)
+    cap, prof = _manifests(cfg, listed=False)
+    assert check_operable(cfg, cap, prof) == []

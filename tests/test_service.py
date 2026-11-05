@@ -142,6 +142,7 @@ class Env:
         cfg = load_config(ROOT / "config.example.yaml")
         cfg = replace(
             cfg,
+            discord=replace(cfg.discord, expected_relay_user_id=100000000000000001),  # resolved at startup by relayctl run
             runtime=replace(cfg.runtime, start_debounce_ms=0, **runtime_kw),
             liveness=replace(cfg.liveness, source_dead_timeout_seconds=30.0),
             storage=replace(cfg.storage, state_directory=tmp_path),
@@ -1492,6 +1493,7 @@ def test_extra_relay_stays_while_watched_then_stops_and_leaves(tmp_path, slate, 
         assert env.svc.pool.relay_summary()["wanted"] == 0  # lowered at once
         st = env.svc.status_dict()
         assert st["details"]["relay_kept"] == 1
+        assert list(st["details"]["relay_kept_ids"]) == [r1]
         assert next(r for r in st["accounts"] if r["account"] == r1)["viewers"] == 1  # the target is not counted
         await asyncio.sleep(0.8)  # well past the idle time: someone still watches
         assert env.svc.pool.account_live(r1, env.svc._gen, env.svc._epoch) and "out_end" not in env.order

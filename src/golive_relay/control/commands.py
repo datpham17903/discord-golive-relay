@@ -147,6 +147,7 @@ class StatusDetails:
     viewer_cap: int = 50  # viewers one Go Live carries
     ingest_publishes: bool = False
     fatal_reason: str | None = None
+    relay_kept_ids: tuple[int, ...] = ()  # exactly the extra relays counted in relay_kept
 
 
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
@@ -365,7 +366,7 @@ def _short(ctx: RoutingContext, uid: int) -> str:
     raw = _user(ctx, uid)
     name = raw[: -len(f" ({uid})")] if raw != str(uid) else ""
     if name:
-        return name[:32]
+        return name[:32].rstrip()
     sid = str(uid)
     return sid if len(sid) <= 8 else f"{sid[:4]}…{sid[-4:]}"
 
@@ -427,9 +428,7 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
         relay_head.append(f"> {_capacity_bar(d.viewers, total)} sức chứa {d.viewers}/{total}")
         if d.relay_short_by > 0:
             relay_head.append(f"> ⚠️ thiếu {d.relay_short_by} relay")
-        # extra relays kept for their viewers: assume the least-watched stop-less live ones
-        watched = sorted((a for a in relays if a[3] == "live" and a[6] is None and a[5]), key=lambda a: a[5])
-        kept = {a[0] for a in watched[: d.relay_kept]}
+        kept = set(d.relay_kept_ids)
         for uid, _, _, state, _, viewers, stop_in in relays:
             line = f"> {_ACCOUNT_DOT.get(state, '⚪')} **{_short(ctx, uid)}**"
             if state == "live":

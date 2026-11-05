@@ -384,7 +384,7 @@ def test_only_first_n_relays_start():
     assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     assert p.handle(OutTick(), 2.0) == []
     assert p.handle(OutTick(), 10.0) == []
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 3, "short_by": 0, "kept": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 3, "short_by": 0, "kept": 0, "kept_ids": ()}
 
 
 def test_raising_n_starts_next_relay_immediately():
@@ -407,7 +407,7 @@ def test_lowering_n_stops_last_relay_without_penalty():
     assert row["state"] == "off" and row["backoff_in"] is None and row["consecutive_rejections"] == 1
     assert p.account_live(A, 1, 1)
     assert p.handle(OutTick(), t + 100.0) == []
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 2, "short_by": 0, "kept": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 2, "short_by": 0, "kept": 0, "kept_ids": ()}
     # raising again restarts B in the same session
     assert p.set_relay_target(2, t + 101.0) == [OutStart(B, 1, 2, CH)]
 
@@ -421,9 +421,9 @@ def test_fatal_relay_replaced_by_next():
         OutCloseGate(A, "auth_rejected"), OutTeardown(A, 1, StopReason.AUTH_REJECTED),
         OutSetFatal(A, FatalReason.AUTH_REJECTED, ""), OutStart(C, 1, 1, CH),
     ]
-    assert p.relay_summary() == {"wanted": 2, "running": 2, "available": 2, "short_by": 0, "kept": 0}
+    assert p.relay_summary() == {"wanted": 2, "running": 2, "available": 2, "short_by": 0, "kept": 0, "kept_ids": ()}
     p.handle(OutAuthRejected(B), t + 10.0)
-    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0}
+    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0, "kept_ids": ()}
 
 
 def test_quarantined_relay_replaced_by_next():
@@ -440,9 +440,9 @@ def test_relay_failed_for_session_replaced_by_next():
     assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     p.handle(OutFailed(A, 1, 1, StopReason.CONFIG_INVALID, False), 0.5)
     assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, 1, CH)]  # after the start stagger
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 1, "short_by": 0, "kept": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 1, "short_by": 0, "kept": 0, "kept_ids": ()}
     p.set_relay_target(2, 1.0)
-    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0}
+    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0, "kept_ids": ()}
     # next session A gets a fresh chance
     p.handle(SessionEnded(1, StopReason.SHUTDOWN, False), 2.0)
     assert p.handle(SessionLive(2, 2, 7), 10.0) == [OutStart(A, 2, 2, CH)]
@@ -522,6 +522,7 @@ def test_surplus_relay_kept_while_watched_and_stopped_after_idle():
     p.handle(OutViewers(B, frozenset({901})), t)
     assert p.set_relay_target(1, t + 1.0) == []
     assert p.relay_summary()["kept"] == 1
+    assert p.relay_summary()["kept_ids"] == (B,)  # the later one in config order is the extra
     assert p.handle(OutTick(), t + 500.0) == []
     p.handle(OutViewers(B, frozenset()), t + 500.0)
     assert p.relay_summary()["kept"] == 0
@@ -614,3 +615,4 @@ def test_kept_counts_only_relays_with_known_viewers():
     p.handle(OutReady(B, 1, n, "H264"), t + 4.0)
     p.handle(OutViewers(B, frozenset({901})), t + 4.0)
     assert p.relay_summary()["kept"] == 1
+    assert p.relay_summary()["kept_ids"] == (B,)

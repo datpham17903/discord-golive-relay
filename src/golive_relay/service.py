@@ -1172,6 +1172,7 @@ class Service:
             relay_available=relay["available"],
             relay_short_by=relay["short_by"],
             relay_kept=relay["kept"],
+            relay_kept_ids=relay["kept_ids"],
             prejoin=self.sup.prejoin_voice,
             autoscale=self._autoscale,
             debounce_ms=self.cfg.runtime.start_debounce_ms,

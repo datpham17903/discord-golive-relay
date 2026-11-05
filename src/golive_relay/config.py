@@ -10,7 +10,7 @@ import re
 import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 import yaml
 
@@ -37,7 +37,7 @@ class ConfigInvalid(Exception):
 
 @dataclass(frozen=True, slots=True)
 class DiscordConfig:
-    expected_relay_user_id: int
+    expected_relay_user_id: int  # 0 until resolved from the ingest token at startup (see apply_account_ids)
     guild_id: int
     target_user_id: int
     allowed_voice_channel_id: int
@@ -338,12 +338,12 @@ def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str)
         allowed = {"user_id", "credential", "channel_id"} if role == "mirror" else {"user_id", "credential"}
         for i, item in enumerate(raw):
             where = f"{key}[{i}]"
-            if not isinstance(item, dict) or not {"user_id", "credential"} <= set(item) <= allowed:
-                r._err(where, "must be a mapping with exactly user_id and credential"
-                       + (" (and optional channel_id)" if role == "mirror" else ""))
+            if not isinstance(item, dict) or not {"credential"} <= set(item) <= allowed:
+                r._err(where, "must be a mapping with credential and optional user_id"
+                       + (" and channel_id" if role == "mirror" else ""))
                 continue
-            uid, cred = item["user_id"], item["credential"]
-            if not (isinstance(uid, str) and uid.isascii() and uid.isdigit() and int(uid) > 0):
+            uid, cred = item.get("user_id", "0"), item["credential"]  # "0": resolved from the token at startup
+            if "user_id" in item and not (isinstance(uid, str) and uid.isascii() and uid.isdigit() and int(uid) > 0):
                 r._err(where, "user_id must be a string of decimal digits")
                 continue
             if not isinstance(cred, str) or not _CREDENTIAL_RE.fullmatch(cred):
@@ -361,7 +361,7 @@ def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str)
                 if channel in fixed_channels:
                     r._err(where, "channel_id is already fixed to another mirror account")
                     continue
-            if int(uid) in seen_ids:
+            if int(uid) and int(uid) in seen_ids:
                 r._err(where, "user_id must differ from the target, the ingest relay and other output accounts")
                 continue
             if cred in seen_creds:
@@ -375,6 +375,40 @@ def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str)
     if total > MAX_OUTPUT_ACCOUNTS:
         r._err(lists[0][0], f"at most {MAX_OUTPUT_ACCOUNTS} accounts in total")
     return tuple(out)
+
+
+def unresolved_credentials(cfg: RelayConfig) -> list[str]:
+    """Credential names whose user ID is not in the config (ingest first); resolved from the token at startup."""
+    d = cfg.discord
+    out = [d.ingest_credential] if not d.expected_relay_user_id else []
+    return out + [a.credential for a in d.output_accounts if not a.user_id]
+
+
+def apply_account_ids(cfg: RelayConfig, ids: Mapping[str, int]) -> RelayConfig:
+    """Fill the missing user IDs from ``ids`` (credential name -> ID) and re-check every ID rule.
+
+    Raises ``ConfigInvalid`` naming the credentials when a resolved ID clashes.
+    """
+    d = cfg.discord
+    d = replace(
+        d,
+        expected_relay_user_id=d.expected_relay_user_id or ids.get(d.ingest_credential, 0),
+        output_accounts=tuple(a if a.user_id else replace(a, user_id=ids.get(a.credential, 0)) for a in d.output_accounts),
+    )
+    errors: list[str] = []
+    owner: dict[int, str] = {}
+    for cred, uid in ((d.ingest_credential, d.expected_relay_user_id), *((a.credential, a.user_id) for a in d.output_accounts)):
+        if not uid:
+            errors.append(f"credential {cred}: user id not resolved")
+        elif uid == d.target_user_id:
+            errors.append(f"credential {cred}: account {uid} is discord.target_user_id")
+        elif uid in owner:
+            errors.append(f"credential {cred}: account {uid} is the same as credential {owner[uid]}")
+        else:
+            owner[uid] = cred
+    if errors:
+        raise ConfigInvalid(errors)
+    return replace(cfg, discord=d)
 
 
 def _control(section: Any, errors: list[str]) -> ControlConfig:
@@ -423,9 +457,9 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         errors.append("config.schema_version: unsupported (expected 1)")
 
     r = _Reader("discord", top._get("discord"), errors)
-    discord = DiscordConfig(
-        r.id("expected_relay_user_id"), r.id("guild_id"), r.id("target_user_id"), r.id("allowed_voice_channel_id")
-    )
+    relay_id = r.id("expected_relay_user_id") if "expected_relay_user_id" in r.data else 0  # 0: resolved at startup
+    r._seen.add("expected_relay_user_id")
+    discord = DiscordConfig(relay_id, r.id("guild_id"), r.id("target_user_id"), r.id("allowed_voice_channel_id"))
     ingest_credential = _optional(r, "ingest_credential", "relay-token")
     if not isinstance(ingest_credential, str) or not _CREDENTIAL_RE.fullmatch(ingest_credential):
         r._err("ingest_credential", "must match [A-Za-z0-9_.-]+")
@@ -577,6 +611,8 @@ def check_operable(cfg: RelayConfig, capability_manifest: dict, profile_manifest
         if not isinstance(live, dict) or live.get("source_dead_timeout_seconds") is None:
             errors.append("capability manifest: live.source_dead_timeout_seconds is not measured")
 
+    if not cfg.discord.expected_relay_user_id:
+        return errors  # the profile is approved per ingest account; checked once its ID is resolved
     w, h, fps = cfg.profile_key()
     relay_id, guild_id = str(cfg.discord.expected_relay_user_id), str(cfg.discord.guild_id)
     profiles = profile_manifest.get("profiles") if isinstance(profile_manifest, dict) else None

@@ -1,3 +1,4 @@
+import re
 from dataclasses import replace
 
 from golive_relay.control.commands import (
@@ -377,10 +378,11 @@ def test_status_shows_shortage_warning():
 
 
 def test_status_relay_lines_show_viewers_kept_and_idle_stop():
-    d = _details(relay_wanted=0, relay_running=3, relay_kept=1, accounts=(
+    d = _details(relay_wanted=0, relay_running=4, relay_kept=1, relay_kept_ids=(34,), accounts=(
         (R1, "relay", 100, "live", 65.0, 0, 12.2),
         (32, "relay", 100, "live", 5.0, None, None),
         (33, "relay", 100, "live", 5.0, 7, None),
+        (34, "relay", 100, "live", 5.0, 9, None),
     ))
     lines = format_status(routing(), ctx(), d).splitlines()
     r1 = next(x for x in lines if "**31**" in x)
@@ -388,7 +390,9 @@ def test_status_relay_lines_show_viewers_kept_and_idle_stop():
     r3 = next(x for x in lines if "**33**" in x)
     assert "👁 0" in r1 and "*tắt sau 13s nếu không ai xem*" in r1 and "giữ" not in r1
     assert "👁 ?" in r2 and "tắt sau" not in r2 and "giữ" not in r2
-    assert "👁 7" in r3 and "*giữ vì còn người xem*" in r3
+    r4 = next(x for x in lines if "**34**" in x)
+    assert "👁 7" in r3 and "giữ" not in r3  # only the pool's kept ids are tagged, not the least watched
+    assert "👁 9" in r4 and "*giữ vì còn người xem*" in r4
 
 
 def test_status_account_state_dots():
@@ -436,7 +440,7 @@ def test_status_stays_under_discord_limit():
                  relay_running=25, command_cooldown_s=5, change_cooldown_s=3)
     s = format_status(routing(), c, d)
     assert len(s) < 2000 and "<@" not in s
-    assert "relay khác" in s or "mirror khác" in s
+    assert re.search(r"^> \+\d+ relay khác$", s, re.M) and re.search(r"^> \+\d+ mirror khác$", s, re.M)
 
 
 def test_parse_bare_mirror_forms():
@@ -512,3 +516,9 @@ def test_status_shows_public_commands_and_cooldowns():
     line = s.splitlines()[-1]
     assert "lệnh công khai: status, mirror" in line and "cooldown 5s/3s" in line
     assert "công khai: không có" in format_status(routing(), ctx(), _details())
+
+
+def test_truncated_name_never_ends_in_space():
+    c = ctx(user_name=lambda u: "A" * 31 + " Bcdef" if u == R1 else None)
+    s = format_status(routing(), c, _details())
+    assert f"**{'A' * 31}**" in s

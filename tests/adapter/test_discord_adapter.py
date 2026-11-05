@@ -209,3 +209,12 @@ def test_author_voice_channel_filled_from_member_voice_state() -> None:
     nochan.author.voice = NS(channel=None)
     a.handle_dispatch("message", nochan)
     assert [c.author_voice_channel_id for c in out] == [77, None, None, None]
+
+
+def test_explicit_relay_id_mismatch_is_config_invalid() -> None:
+    from golive_relay.supervisor.model import ConfigInvalid
+
+    a, out = make()
+    a._client = NS(user=NS(id=99))
+    a._on_ready()
+    assert any(isinstance(e, ConfigInvalid) for e in out)

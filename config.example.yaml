@@ -2,16 +2,17 @@
 schema_version: 1
 
 discord:
-  expected_relay_user_id: "100000000000000001"
+  # expected_relay_user_id: "100000000000000001"   # optional: set it to pin the ingest account; it is checked at login
   guild_id: "100000000000000002"
   target_user_id: "100000000000000003"
   allowed_voice_channel_id: "100000000000000004"
   ingest_credential: relay-token   # credential name of the account that watches the target
   ingest_publishes: true           # the ingest account also publishes its own Go Live
   relay_accounts: []               # extra Go Lives in the main channel, started as viewers grow (relay + mirror at most 9), e.g.:
-  #  - {user_id: "100000000000000005", credential: relay-token-2}
+  #  - {credential: relay-token-2}                                # user IDs are read from the tokens at startup
   mirror_accounts: []              # Go Lives in other voice channels, one account per channel; channel_id optional, e.g.:
-  #  - {user_id: "100000000000000006", credential: relay-token-3, channel_id: "100000000000000007"}
+  #  - {credential: relay-token-3, channel_id: "100000000000000007"}
+  #  - {user_id: "100000000000000006", credential: relay-token-4}  # user_id optional: pins the account, checked at login
 
 authorization:
   agreement_ref: "local-agreement-record"

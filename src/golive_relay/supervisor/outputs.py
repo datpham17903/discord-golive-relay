@@ -157,13 +157,18 @@ class OutputPool:
         # relays with no known viewers (still joining) are not "kept because watched"
         unknown = sum(1 for uid in self._relays if self._active(self._accts[uid]) and uid not in waiting
                       and not self._accts[uid].viewers)
+        kept = max(0, running - self._relay_target - len(waiting) - unknown)
+        # the watched ones that would stop first, the last in config order (the tie order of _surplus_stops)
+        watched = [uid for uid in self._relays if self._active(self._accts[uid]) and uid not in waiting
+                   and self._accts[uid].viewers]
         return {
             "wanted": self._relay_target,
             "running": running,
             "available": available,
             "short_by": max(0, self._relay_target - available),
             # extra relays that stay because they have (or may still have) viewers
-            "kept": max(0, running - self._relay_target - len(waiting) - unknown),
+            "kept": kept,
+            "kept_ids": tuple(watched[len(watched) - kept:]) if kept else (),
         }
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
