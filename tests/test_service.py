@@ -1427,19 +1427,17 @@ def test_chat_op_commands_owner_only_persist_and_poll(tmp_path, slate, source_go
         assert env.store.load().revision == rev
         chat(env, "!relay op list", 8, author=helper)
         chat(env, f"!relay op remove {OPERATOR}", 9)  # config-defined: not removable by chat
-        chat(env, f"!relay op add {env.target}", 10)
         chat(env, f"!relay op add {env.cfg.discord.expected_relay_user_id}", 11)
         chat(env, "!relay op add <@52>", 12)
         assert env.store.load().revision == rev
-        await wait_until(lambda: len(a.replies) == 9)
+        await wait_until(lambda: len(a.replies) == 8)
         texts = [r[2] for r in a.replies]
         assert texts[0].startswith("✅") and texts[1].startswith("✅")
         assert texts[2].startswith("⚠️") and "chủ sở hữu" in texts[2] and texts[3] == texts[2]
         assert texts[4].startswith("👥") and str(helper) in texts[4]
         assert texts[5].startswith("⚠️") and "sửa config để gỡ" in texts[5]
-        assert texts[6].startswith("⚠️") and "target" in texts[6]
-        assert texts[7].startswith("⚠️") and "bot" in texts[7]
-        assert texts[8].startswith("❌")
+        assert texts[6].startswith("⚠️") and "bot" in texts[6]
+        assert texts[7].startswith("❌")
         assert all("<@" not in t for t in texts)
         env.store.update(lambda s: replace(s, chat_operator_ids=[guest]))  # hand edit: picked up by the poll
         await wait_until(lambda: env.svc.cfg.control.is_operator(guest, frozenset(), env.svc._chat_ops))

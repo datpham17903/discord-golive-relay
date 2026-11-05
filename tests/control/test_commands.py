@@ -562,6 +562,7 @@ def test_plan_op_add_and_remove() -> None:
 
     c = ctx(user_name=lambda u: {3: "Alice <@1>"}.get(u))
     assert plan_op(OpAdd(3), _ops(), c) == frozenset({2, 3})
+    assert plan_op(OpAdd(9), _ops(), c) == frozenset({2, 9})  # the target may be an operator
     assert plan_op(OpRemove(2), _ops(), c) == frozenset()
     added = describe_op(OpAdd(3), c)
     assert added.startswith("✅") and "Alice" in added and "3" in added and "<@" not in added
@@ -576,7 +577,6 @@ def test_plan_op_rejections() -> None:
     for cmd, why in (
         (OpAdd(1), "config"),  # config-defined owner already an operator
         (OpAdd(2), "đã là operator"),
-        (OpAdd(9), "target"),
         (OpAdd(R1), "bot"),  # relay account
         (OpAdd(INGEST), "bot"),
         (OpAdd(77), "bot"),  # any bot account
@@ -596,6 +596,7 @@ def test_format_operators_lists_config_chat_and_roles_without_mentions() -> None
     assert text.startswith("👥") and "<@" not in text and "@everyone" not in text
     assert "config" in text and "Owner" in text and "Helper" in text and "Mods" in text and "500" in text
     assert "123456789012345678" in text  # unknown name: full id
+    assert "`123456789012345678`" in format_operators(_ops(added=frozenset({123456789012345678})), ctx(user_name=lambda u: "Bob"))  # full id with a name
     assert "`*" not in text
     empty = format_operators(_ops(config_user_ids=frozenset(), role_ids=frozenset(), added=frozenset()), ctx())
     assert empty.startswith("👥") and "không có" in empty

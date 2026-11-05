@@ -384,8 +384,6 @@ def plan_op(cmd: OpAdd | OpRemove, ops: OperatorContext, ctx: RoutingContext) ->
     if isinstance(cmd, OpAdd):
         if uid in ctx.relay_user_ids or ctx.is_bot(uid):
             return _reject(f"**Không thể thêm** {_user(ctx, uid)}: đây là tài khoản bot/relay, không bao giờ là operator.")
-        if uid == ops.target_user_id:
-            return _reject(f"**Không thể thêm** {_user(ctx, uid)}: đây là target của relay.")
         if uid in ops.config_user_ids:
             return _reject(f"{_user(ctx, uid)} **đã là operator** (khai báo trong config).")
         if uid in ops.added:
@@ -405,11 +403,11 @@ def describe_op(cmd: OpAdd | OpRemove, ctx: RoutingContext) -> str:
 
 
 def _who(ctx: RoutingContext, uid: int) -> str:
-    """Sanitized name and short id; the full id when the name is unknown."""
+    """Sanitized name and full id (copyable for `op remove`)."""
     sid = str(uid)
     if _user(ctx, uid) == sid:
         return f"`{sid}`"
-    return f"**{_short(ctx, uid)}**" + (f" `{sid[:4]}…{sid[-4:]}`" if len(sid) > 8 else f" `{sid}`")
+    return f"**{_short(ctx, uid)}** `{sid}`"
 
 
 def format_operators(ops: OperatorContext, ctx: RoutingContext) -> str:
