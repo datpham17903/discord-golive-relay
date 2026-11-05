@@ -14,7 +14,7 @@ HELP = (
     "• `on` / `off` - bật hoặc tắt relay\n"
     "• `target <user_id>` - đổi người được relay\n"
     "• `channel <channel_id>` - đổi kênh voice chính\n"
-    "• `mirror <channel_id>` - phát lại sang một kênh voice khác\n"
+    "• `mirror <channel_id> [account_id]` - phát lại sang một kênh voice khác (có thể chỉ định tài khoản mirror)\n"
     "• `unmirror <channel_id|all>` - gỡ mirror\n"
     "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"
 )
@@ -22,7 +22,7 @@ HELP = (
 _USAGE = {
     "target": "`target <user_id>`",
     "channel": "`channel <channel_id>`",
-    "mirror": "`mirror <channel_id>`",
+    "mirror": "`mirror <channel_id> [account_id]`",
     "unmirror": "`unmirror <channel_id|all>`",
     "on": "`on`",
     "off": "`off`",
@@ -65,6 +65,7 @@ class SetChannel:
 @dataclass(frozen=True, slots=True)
 class AddMirror:
     channel_id: int
+    account: int | None = None  # None = relay picks the account
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,11 +88,31 @@ class ParseError:
 
 @dataclass(frozen=True, slots=True)
 class RoutingContext:
-    relay_user_ids: frozenset[int]
-    output_order: tuple[int, ...]
+    relay_user_ids: frozenset[int]  # ingest, relay and mirror accounts
+    mirror_order: tuple[int, ...]
     unavailable: frozenset[int]
     voice_channel_ids: frozenset[int]
     user_name: Callable[[int], str | None] = field(default=lambda _: None)
+    mirror_fixed: Mapping[int, int] = field(default_factory=dict)  # mirror account -> its fixed channel
+
+
+@dataclass(frozen=True, slots=True)
+class StatusDetails:
+    session_state: str
+    session_uptime_s: float | None
+    viewers: int
+    relay_wanted: int
+    relay_running: int
+    relay_available: int
+    relay_short_by: int
+    scale_down_in_s: float | None
+    prejoin: bool
+    debounce_ms: int
+    video_mode: str
+    output_size: str
+    last_watch_ms: float | None
+    audio_ok: bool
+    accounts: tuple[tuple[int, str, int | None, str, float | None], ...]  # (uid, role, channel_id, state, uptime_s)
 
 
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
@@ -134,7 +155,15 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
         if len(args) != 1 or args[0].lower() not in ("on", "off"):
             return _usage_error(sub, "**Cần đúng một tham số** `on` hoặc `off`")
         return SetPrejoin(args[0].lower() == "on")
-    if sub in ("target", "channel", "mirror", "unmirror"):
+    if sub == "mirror":
+        if len(args) not in (1, 2):
+            return _usage_error(sub, "**Cần kênh và tùy chọn một tài khoản**")
+        ids = [_parse_id(sub, a) for a in args]
+        for n in ids:
+            if isinstance(n, ParseError):
+                return n
+        return AddMirror(*ids)
+    if sub in ("target", "channel", "unmirror"):
         if len(args) != 1:
             return _usage_error(sub, "**Cần đúng một tham số**")
         if sub == "unmirror" and args[0].lower() == "all":
@@ -142,7 +171,7 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
         n = _parse_id(sub, args[0])
         if isinstance(n, ParseError):
             return n
-        return {"target": SetTarget, "channel": SetChannel, "mirror": AddMirror, "unmirror": RemoveMirror}[sub](n)
+        return {"target": SetTarget, "channel": SetChannel, "unmirror": RemoveMirror}[sub](n)
     return ParseError(HELP)
 
 
@@ -176,14 +205,34 @@ def plan_change(cmd: Command, routing: Routing, ctx: RoutingContext) -> Routing 
             )
         if ch not in ctx.voice_channel_ids:
             return _reject(f"**Kênh** {_ch(ch)} không phải kênh voice của server.", "`mirror <channel_id>` với kênh voice")
-        used = set(routing.mirrors.values())
-        free = [a for a in ctx.output_order if a not in used and a not in ctx.unavailable]
-        if not free:
+        used = {a: c for c, a in routing.mirrors.items()}
+        if cmd.account is not None:
+            acct = cmd.account
+            if acct not in ctx.mirror_order:
+                if acct in ctx.relay_user_ids:
+                    why = "đây là tài khoản relay, không dùng làm mirror."
+                else:
+                    why = "không phải tài khoản mirror trong config."
+                return _reject(f"**Không thể dùng** {_user(ctx, acct)}: {why}", "`status` để xem tài khoản mirror")
+            if acct in used:
+                return _reject(
+                    f"**Tài khoản** {_user(ctx, acct)} đang mirror {_ch(used[acct])}.", f"`unmirror {used[acct]}` trước"
+                )
+            if acct in ctx.unavailable:
+                return _reject(f"**Tài khoản** {_user(ctx, acct)} đang lỗi, không dùng được.")
+            fixed = ctx.mirror_fixed.get(acct)
+            if fixed is not None and fixed != ch:
+                return _reject(f"**Tài khoản** {_user(ctx, acct)} được cố định cho kênh {_ch(fixed)}.")
+            return replace(routing, mirrors={**routing.mirrors, ch: acct})
+        usable = [a for a in ctx.mirror_order if a not in used and a not in ctx.unavailable]
+        own = [a for a in usable if ctx.mirror_fixed.get(a) == ch]
+        free = [a for a in usable if a not in ctx.mirror_fixed]
+        if not own and not free:
             return _reject(
-                f"**Hết tài khoản output** cho mirror: đang mirror {len(used)} kênh.",
+                f"**Hết tài khoản mirror** cho kênh này: đang mirror {len(used)} kênh.",
                 "`unmirror <channel_id>` để giải phóng một tài khoản",
             )
-        return replace(routing, mirrors={**routing.mirrors, ch: free[-1]})
+        return replace(routing, mirrors={**routing.mirrors, ch: own[0] if own else free[-1]})
     if isinstance(cmd, RemoveMirror):
         if cmd.channel_id is None:
             if not routing.mirrors:
@@ -220,8 +269,10 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
 
 def format_status(
     routing: Routing, ctx: RoutingContext, session: str, account_states: Mapping[int, str], prejoin: bool = False,
-    routing_error: str | None = None,
+    routing_error: str | None = None, details: StatusDetails | None = None,
 ) -> str:
+    if details is not None:
+        return _format_details(routing, ctx, details, routing_error)
     lines = [
         "📡 **Trạng thái relay**",
         f"• Phiên: **{session}**",
@@ -235,6 +286,48 @@ def format_status(
             lines.append(f"  - {_ch(ch)} ← {_user(ctx, acct)}: {account_states.get(acct, 'không rõ')}")
     else:
         lines.append("• Mirror: chưa có mirror")
+    if routing_error is not None:
+        lines.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
+    return "\n".join(lines)
+
+
+def _dur(s: float | None) -> str:
+    if s is None:
+        return "-"
+    t = int(s)
+    h, m, sec = t // 3600, t // 60 % 60, t % 60
+    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s" if m else f"{sec}s"
+
+
+def _format_details(routing: Routing, ctx: RoutingContext, d: StatusDetails, routing_error: str | None) -> str:
+    relay = f"• Relay (cần/đang chạy/có sẵn): {d.relay_wanted}/{d.relay_running}/{d.relay_available}"
+    if d.relay_short_by > 0:
+        relay += f" ⚠️ **thiếu {d.relay_short_by} tài khoản**"
+    if d.scale_down_in_s is not None:
+        relay += f", giảm sau {int(d.scale_down_in_s)}s"
+    lines = [
+        "📡 **Trạng thái relay**",
+        f"• Phiên: **{d.session_state}**, chạy {_dur(d.session_uptime_s)}",
+        f"• Target: {_user(ctx, routing.target_user_id)}",
+        f"• Kênh chính: {_ch(routing.channel_id)}, {d.viewers} người",
+        relay,
+    ]
+    rows = {uid: (state, up) for uid, _, _, state, up in d.accounts}
+    for uid, role, _, state, up in d.accounts:
+        if role == "relay":
+            lines.append(f"  - relay {_user(ctx, uid)}: {state}, {_dur(up)}")
+    if routing.mirrors:
+        for ch, acct in routing.mirrors.items():
+            state, up = rows.get(acct, ("không rõ", None))
+            lines.append(f"• Mirror {_ch(ch)} ← {_user(ctx, acct)}: {state}, {_dur(up)}")
+    else:
+        lines.append("• Mirror: chưa có mirror")
+    lines.append(
+        f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, debounce {d.debounce_ms}ms, "
+        f"video {d.video_mode}, {d.output_size}"
+    )
+    watch = "-" if d.last_watch_ms is None else f"{int(d.last_watch_ms)}ms"
+    lines.append(f"• Hiệu năng: watch gần nhất {watch}, audio {'có tín hiệu' if d.audio_ok else 'im lặng'}")
     if routing_error is not None:
         lines.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
     return "\n".join(lines)

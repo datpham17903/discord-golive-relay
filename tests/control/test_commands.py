@@ -9,6 +9,7 @@ from golive_relay.control.commands import (
     SetPrejoin,
     SetTarget,
     Status,
+    StatusDetails,
     describe_change,
     format_status,
     parse,
@@ -18,9 +19,10 @@ from golive_relay.supervisor.routing import Routing
 
 P = "!relay"
 INGEST, O1, O2, O3 = 10, 21, 22, 23
+R1 = 31  # relay account, never a mirror
 CTX_KW = dict(
-    relay_user_ids=frozenset({INGEST, O1, O2, O3}),
-    output_order=(O1, O2, O3),
+    relay_user_ids=frozenset({INGEST, R1, O1, O2, O3}),
+    mirror_order=(O1, O2, O3),
     unavailable=frozenset(),
     voice_channel_ids=frozenset({100, 200, 300, 400}),
 )
@@ -56,6 +58,9 @@ def test_parse_commands():
     assert parse("!relay target 5", P) == SetTarget(5)
     assert parse("!relay channel 5", P) == SetChannel(5)
     assert parse("!relay mirror 5", P) == AddMirror(5)
+    assert parse("!relay mirror 5 22", P) == AddMirror(5, 22)
+    assert isinstance(parse("!relay mirror 5 22 23", P), ParseError)
+    assert isinstance(parse("!relay mirror 5 <@22>", P), ParseError)
     assert parse("!relay unmirror ALL", P) == RemoveMirror(None)
     assert parse("!relay unmirror 5", P) == RemoveMirror(5)
     for bad in ("!relay target", "!relay target 0", "!relay target -1", "!relay target 1 2", "!relay status x"):
@@ -200,3 +205,96 @@ def test_status_shows_invalid_state_routing():
     s = format_status(routing(), ctx(), "IDLE", {}, routing_error="target is a relay account")
     assert "⚠️" in s and "state.json" in s
     assert "⚠️" not in format_status(routing(), ctx(), "IDLE", {})
+
+
+def test_mirror_with_explicit_account():
+    r = plan_change(AddMirror(200, O1), routing(), ctx())
+    assert r.mirrors == {200: O1}
+    msg = plan_change(AddMirror(300, O1), r, ctx())
+    assert msg.startswith("⚠️") and "<#200>" in msg  # already mirroring another channel
+    msg = plan_change(AddMirror(300, O2), r, ctx(unavailable=frozenset({O2})))
+    assert msg.startswith("⚠️")
+
+
+def test_mirror_rejects_relay_account():
+    for uid in (R1, INGEST):
+        msg = plan_change(AddMirror(200, uid), routing(), ctx())
+        assert msg.startswith("⚠️") and "relay" in msg
+
+
+def test_mirror_rejects_account_fixed_to_other_channel():
+    c = ctx(mirror_fixed={O3: 300})
+    msg = plan_change(AddMirror(200, O3), routing(), c)
+    assert msg.startswith("⚠️") and "<#300>" in msg
+    assert plan_change(AddMirror(300, O3), routing(), c).mirrors == {300: O3}
+    # without an account a fixed one is never borrowed by another channel
+    assert plan_change(AddMirror(200), routing(), c).mirrors == {200: O2}
+
+
+def test_mirror_prefers_fixed_account_for_channel():
+    c = ctx(mirror_fixed={O1: 200, O3: 300})
+    assert plan_change(AddMirror(200), routing(), c).mirrors == {200: O1}
+    # fixed account unusable: fall back to the last free unfixed one
+    assert plan_change(AddMirror(200), routing(), ctx(mirror_fixed={O1: 200}, unavailable=frozenset({O1}))).mirrors == {
+        200: O3
+    }
+    msg = plan_change(AddMirror(400), routing({200: O1}), ctx(mirror_fixed={O2: 300, O3: 300}))
+    assert msg.startswith("⚠️")
+
+
+def test_mirror_rejects_unknown_account():
+    msg = plan_change(AddMirror(200, 999), routing(), ctx())
+    assert msg.startswith("⚠️") and "999" in msg
+
+
+def _details(**over):
+    kw = dict(
+        session_state="LIVE",
+        session_uptime_s=3725.0,
+        viewers=120,
+        relay_wanted=1,
+        relay_running=1,
+        relay_available=2,
+        relay_short_by=0,
+        scale_down_in_s=None,
+        prejoin=True,
+        debounce_ms=100,
+        video_mode="passthrough",
+        output_size="1920x1080@60",
+        last_watch_ms=412.0,
+        audio_ok=True,
+        accounts=(
+            (R1, "relay", 100, "live", 65.0),
+            (32, "relay", 100, "off", None),
+            (O1, "mirror", 200, "ready", 12.0),
+            (O2, "mirror", None, "off", None),
+        ),
+    )
+    kw.update(over)
+    return StatusDetails(**kw)
+
+
+def test_status_details_layout():
+    c = ctx(user_name=lambda u: {555: "<@1> Alice", R1: "Relay1", O1: "Mir1"}.get(u))
+    s = format_status(routing({200: O1}), c, "ACTIVE", {}, details=_details())
+    lines = s.splitlines()
+    assert lines[0].startswith("📡")
+    assert "LIVE" in lines[1] and "1h02m05s" in lines[1]
+    assert "Alice (555)" in lines[2]
+    assert "<#100>" in lines[3] and "120" in lines[3]
+    assert "1/1/2" in lines[4] and "⚠️" not in lines[4]
+    assert "Relay1 (31)" in s and "live" in s and "1m05s" in s and "32" in s
+    assert "<#200>" in s and "Mir1 (21)" in s and "ready" in s
+    assert "bật" in s and "100ms" in s and "passthrough" in s and "1920x1080@60" in s
+    assert "412ms" in s and "audio" in s.lower()
+    assert "<@" not in s
+
+
+def test_status_shows_shortage_warning():
+    d = _details(relay_wanted=3, relay_running=2, relay_available=2, relay_short_by=1, scale_down_in_s=None)
+    s = format_status(routing(), ctx(), "ACTIVE", {}, details=d)
+    relay_line = s.splitlines()[4]
+    assert "⚠️" in relay_line and "thiếu 1" in relay_line
+    s = format_status(routing(), ctx(), "ACTIVE", {}, details=_details(scale_down_in_s=42.4, last_watch_ms=None, audio_ok=False))
+    assert "giảm sau 42s" in s.splitlines()[4]
+    assert "⚠️" not in s.splitlines()[4]

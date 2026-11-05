@@ -450,11 +450,13 @@ class Service:
 
     def _routing_context(self) -> RoutingContext:
         accounts = [a.user_id for a in self.cfg.output_accounts()]
+        mirrors = self.cfg.discord.mirror_accounts
         bad = {OutputState.FATAL.value, OutputState.QUARANTINE.value}
         adapter = self._adapter
         return RoutingContext(
             relay_user_ids=frozenset({self.cfg.discord.expected_relay_user_id, *accounts}),
-            output_order=tuple(accounts),
+            mirror_order=tuple(a.user_id for a in mirrors),
+            mirror_fixed={a.user_id: a.channel_id for a in mirrors if a.channel_id is not None},
             unavailable=frozenset(r["account"] for r in self.pool.status(time.monotonic()) if r["state"] in bad),
             voice_channel_ids=adapter.voice_channel_ids() if adapter is not None else frozenset(),
             user_name=adapter.display_name if adapter is not None else (lambda _: None),
