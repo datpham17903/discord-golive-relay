@@ -35,6 +35,8 @@ class OutputState(Enum):
 class OutputAccount:
     user_id: int
     credential: str  # credential name, e.g. "relay-token-2"
+    role: str = "relay"  # "relay" (autoscaled main-channel Go Live) or "mirror" (Go Live in another channel)
+    channel_id: int | None = None  # mirror only: the one channel this account is fixed to
 
 
 @dataclass(frozen=True, slots=True)

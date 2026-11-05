@@ -1027,7 +1027,7 @@ def test_watch_retryable_only_for_stream_full_or_timeout():
 
 
 def test_chat_prejoin_toggle_persists_joins_and_leaves(tmp_path, slate, source_gop):
-    env = Env(tmp_path, slate, source_gop)
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=False)
 
     async def main():
         task = asyncio.create_task(env.svc.run("tok"))
@@ -1035,7 +1035,7 @@ def test_chat_prejoin_toggle_persists_joins_and_leaves(tmp_path, slate, source_g
         a = env.adapters[0]
         a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
         await asyncio.sleep(0.1)
-        assert "join" not in a.calls  # config default: off
+        assert "join" not in a.calls  # config: off
         chat(env, "!relay prejoin on", 1)
         assert env.store.load().prejoin_voice is True and env.svc.sup.prejoin_voice is True
         await wait_until(lambda: "join" in a.calls)

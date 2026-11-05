@@ -98,7 +98,7 @@ Store each token as a one-line text file (name = credential name):
 | File | Used by |
 | --- | --- |
 | `secrets/relay-token` | `relayctl run`, ingest account (`discord.ingest_credential`) |
-| `secrets/relay-token-2`, ... | `relayctl run`, output accounts (`credential` in `output_accounts`) |
+| `secrets/relay-token-2`, ... | `relayctl run`, relay and mirror accounts (`credential` in `relay_accounts` / `mirror_accounts`) |
 | `secrets/relay.token`, `secrets/relay2.token` | M0 spikes (paths set in `scripts/m0/m0.json`) |
 
 On Linux restrict them: `chmod 600 secrets/*`. The relay never reads tokens from YAML or the command line.
@@ -125,7 +125,9 @@ relayctl validate --config config.yaml
 | `discord.allowed_voice_channel_id` | The only voice channel used | dummy | always |
 | `discord.ingest_credential` | Token file name of the ingest account | `relay-token` | you use another file name |
 | `discord.ingest_publishes` | Ingest account also publishes its own Go Live | `true` | set `false` to publish only from output accounts |
-| `discord.output_accounts` | Extra publish-only accounts, max 9 (list of `{user_id, credential}`) | `[]` | you want more relay Go Lives |
+| `discord.relay_accounts` | Extra publish-only accounts for the main channel (list of `{user_id, credential}`); started as viewers grow (`runtime.relay_autoscale`). Relay and mirror accounts together: max 9, never shared | `[]` | the main channel outgrows one Go Live |
+| `discord.mirror_accounts` | Publish-only accounts for other voice channels (list of `{user_id, credential}` plus optional `channel_id`); one account per channel, one channel per account. A `channel_id` fixes the account to that channel (not the main channel, not shared by two mirrors) and starts it there while `state.json` has no routing | `[]` | you mirror the stream into other channels |
+| `discord.output_accounts` | Deprecated alias of `relay_accounts` (logs a warning); cannot be combined with the new lists | absent | migrate to `relay_accounts` |
 | `authorization.agreement_ref` | Note pointing to the consent record | placeholder | always |
 | `authorization.excluded_viewer_ids` | Viewer IDs the target asked to exclude | `[]` | the target asks |
 | `codecs.parent_codecs`, `watch_codecs` | Video codecs the relay offers to decode. `h264_only` makes Discord send the target's stream as H.264 for every viewer of it (it picks a codec all participants decode), so passthrough always applies; `auto_decode` offers every codec PyAV decodes | `h264_only` | rarely |
@@ -142,7 +144,7 @@ relayctl validate --config config.yaml
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
 | `audio.source` | Audio source | `target_stream_only` | never (only value) |
-| `runtime.start_debounce_ms` | Wait before reacting to a start | `500` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
+| `runtime.start_debounce_ms` | Wait before reacting to a start | `100` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
 | `runtime.idle_voice_grace_seconds` | Grace while the target is idle in voice | `30` | rarely |
 | `runtime.hold_recovery_timeout_seconds` | How long a HOLD (slate) may last | `15` | rarely |
 | `runtime.connect_timeout_seconds` | Voice connect timeout | `15` | slow networks |
@@ -153,7 +155,10 @@ relayctl validate --config config.yaml
 | `runtime.feedback_idr_min_interval_ms` | Min gap between keyframes forced by viewer feedback | `500` | rarely |
 | `runtime.repeated_rejection_limit` | Consecutive rejected sessions before FATAL | `3` | rarely |
 | `runtime.recording_enabled` | Recording | `false` | never (must be `false`) |
-| `runtime.prejoin_voice` | The ingest joins the main channel while the target is there, before it streams, so a stream start only needs the watch (all start gates still apply; it leaves when the target leaves, the relay is disabled or routing changes; a failed pre-join is retried after the normal retry delays). `!relay prejoin on|off` overrides it at runtime (stored in `state.json`). Without pre-join the ingest joins and watches back to back, like clicking a Go Live in the official client. Independently of this setting, a watch refused with `stream_full` or timed out while the target streams is retried about every second for up to 5 minutes, then normal backoff; every third such retry in a row leaves and re-joins voice. Other watch refusals use normal backoff | `false` | slot races on a busy stream |
+| `runtime.prejoin_voice` | The ingest joins the main channel while the target is there, before it streams, so a stream start only needs the watch (all start gates still apply; it leaves when the target leaves, the relay is disabled or routing changes; a failed pre-join is retried after the normal retry delays). `!relay prejoin on|off` overrides it at runtime (stored in `state.json`). Without pre-join the ingest joins and watches back to back, like clicking a Go Live in the official client. Independently of this setting, a watch refused with `stream_full` or timed out while the target streams is retried about every second for up to 5 minutes, then normal backoff; every third such retry in a row leaves and re-joins voice. Other watch refusals use normal backoff | `true` | set `false` to stay out of voice until the target streams |
+| `runtime.relay_autoscale` | Start relay accounts only as needed: with N main-channel members (not counting the target and configured bot accounts), relays needed = ceil((N - capacity) / `stream_viewer_cap`), where capacity is `stream_viewer_cap - 1`, plus `stream_viewer_cap` when `ingest_publishes`. `false` = every relay account always publishes | `true` | you want all relays live at once |
+| `runtime.relay_scale_down_seconds` | How long the need must stay lower before the last relay stops; growth starts relays at once | `120` | rarely |
+| `runtime.stream_viewer_cap` | Viewers one Go Live can hold | `50` | only for tests |
 | `liveness.source_dead_timeout_seconds` | Seconds without source packets before the relay treats the source as dead (`T_dead`) | `null` | set by section 6 (the service refuses to run while `null`) |
 | `liveness.verified_capability_manifest` | Capability file with the measured value | `manifests/verified-capabilities.json` | different location |
 | `storage.state_directory` | Where `state.json`, `status.json` and the control socket live | `/var/lib/discord-relay` | always on Windows (for example `state`) |
@@ -170,14 +175,15 @@ Relative manifest paths are looked up next to the config file.
 
 ### Multiple accounts
 
-Each output account needs a Discord user ID and its own token file. The credential name must match `[A-Za-z0-9_.-]+` and be unique (also different from `ingest_credential`).
+Each extra account needs a Discord user ID and its own token file. The credential name must match `[A-Za-z0-9_.-]+` and be unique (also different from `ingest_credential`). Relay accounts publish in the main channel; mirror accounts publish in other channels. An account is in one list only.
 
 ```yaml
 discord:
   ingest_credential: relay-token
-  output_accounts:
+  relay_accounts:
     - {user_id: "111111111111111111", credential: relay-token-2}
-    - {user_id: "222222222222222222", credential: relay-token-3}
+  mirror_accounts:
+    - {user_id: "222222222222222222", credential: relay-token-3, channel_id: "333333333333333333"}
 ```
 
 Token files: `relay-token`, `relay-token-2`, `relay-token-3`. Each account has its own quarantine and FATAL latch; one failing output does not stop the others. Output accounts do not watch the target, so they use no extra viewer slot on the target's stream.
@@ -343,7 +349,7 @@ install -m 0600 secrets/relay-token-2 /etc/discord-relay/token-2
 
 The manifests go in `/etc/discord-relay/manifests/` because relative paths in the config are resolved next to the config file. The config should keep `storage.state_directory: /var/lib/discord-relay` (the unit's `StateDirectory=discord-relay`).
 
-Edit `deploy/systemd/discord-relay.service`: it has one `LoadCredential` line for the ingest token. Add one line per output account, with the credential name from `output_accounts` on the left:
+Edit `deploy/systemd/discord-relay.service`: it has one `LoadCredential` line for the ingest token. Add one line per output account, with the credential name from `relay_accounts` or `mirror_accounts` on the left:
 
 ```
 LoadCredential=relay-token:/etc/discord-relay/token
@@ -460,7 +466,8 @@ After fixing the cause: `relayctl reset-fatal --state-dir DIR` (add `--account I
 | `recording_enabled: must be false (not implemented)` | Leave it `false` (same for `include_media`) |
 | `not operable: liveness.source_dead_timeout_seconds ...` | Do the T_dead calibration (section 6) |
 | `not operable: profile ... not approved` | Add the profile to `verified-profiles.json` (section 5) |
-| `output_accounts[i]: ...` | Need exactly `user_id` and `credential`; IDs and credential names must be unique |
+| `relay_accounts[i]: ...` / `mirror_accounts[i]: ...` | Need `user_id` and `credential` (mirrors may add `channel_id`); IDs and credential names must be unique; a mirror `channel_id` must not be the main channel or another mirror's |
+| `output_accounts: deprecated; cannot be combined ...` | Move the entries to `relay_accounts` and remove `output_accounts` |
 | `no credential: ...` | Set `RELAY_TOKEN_DIR` (or systemd `LoadCredential`); file name must equal the credential name |
 
 ## 11. What is verified live

@@ -8,8 +8,10 @@ discord:
   allowed_voice_channel_id: "100000000000000004"
   ingest_credential: relay-token   # credential name of the account that watches the target
   ingest_publishes: true           # the ingest account also publishes its own Go Live
-  output_accounts: []              # extra publish-only accounts, at most 9, e.g.:
+  relay_accounts: []               # extra Go Lives in the main channel, started as viewers grow (relay + mirror at most 9), e.g.:
   #  - {user_id: "100000000000000005", credential: relay-token-2}
+  mirror_accounts: []              # Go Lives in other voice channels, one account per channel; channel_id optional, e.g.:
+  #  - {user_id: "100000000000000006", credential: relay-token-3, channel_id: "100000000000000007"}
 
 authorization:
   agreement_ref: "local-agreement-record"
@@ -41,7 +43,7 @@ audio:
   source: target_stream_only
 
 runtime:
-  start_debounce_ms: 500
+  start_debounce_ms: 100
   idle_voice_grace_seconds: 30
   hold_recovery_timeout_seconds: 15
   connect_timeout_seconds: 15
@@ -52,7 +54,10 @@ runtime:
   feedback_idr_min_interval_ms: 500
   repeated_rejection_limit: 3
   recording_enabled: false
-  prejoin_voice: false        # opt-in: the ingest joins the main channel while the target is there, before it streams
+  prejoin_voice: true         # the ingest joins the main channel while the target is there, before it streams
+  relay_autoscale: true       # start relay_accounts only when the main channel needs them; false = all relays always publish
+  relay_scale_down_seconds: 120   # stop the last relay only after this long below its threshold
+  stream_viewer_cap: 50       # viewers one Go Live can hold
 
 liveness:
   source_dead_timeout_seconds: null   # must be the value measured in M0 before enabling

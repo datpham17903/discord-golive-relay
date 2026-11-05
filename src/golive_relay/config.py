@@ -7,6 +7,7 @@ config is read-only; nothing here writes YAML.
 from __future__ import annotations
 
 import re
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -39,9 +40,17 @@ class DiscordConfig:
     guild_id: int
     target_user_id: int
     allowed_voice_channel_id: int
-    output_accounts: tuple[OutputAccount, ...] = ()
+    output_accounts: tuple[OutputAccount, ...] = ()  # every extra account: relay accounts, then mirror accounts
     ingest_credential: str = "relay-token"
     ingest_publishes: bool = True
+
+    @property
+    def relay_accounts(self) -> tuple[OutputAccount, ...]:
+        return tuple(a for a in self.output_accounts if a.role == "relay")
+
+    @property
+    def mirror_accounts(self) -> tuple[OutputAccount, ...]:
+        return tuple(a for a in self.output_accounts if a.role == "mirror")
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +103,10 @@ class RuntimeConfig:
     feedback_idr_min_interval_ms: int
     repeated_rejection_limit: int
     recording_enabled: bool
-    prejoin_voice: bool = False
+    prejoin_voice: bool = True
+    relay_autoscale: bool = True
+    relay_scale_down_seconds: float = 120.0
+    stream_viewer_cap: int = 50
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,15 +282,15 @@ class _Reader:
             self._err(key, "must be false (not implemented)")
         return False
 
-    def opt_bool(self, key: str) -> bool:
-        """Optional boolean key, False when absent."""
+    def opt_bool(self, key: str, default: bool = False) -> bool:
+        """Optional boolean key, ``default`` when absent."""
         self._seen.add(key)
         if key not in self.data:
-            return False
+            return default
         v = self.data[key]
         if not isinstance(v, bool):
             self._err(key, "must be a boolean")
-            return False
+            return default
         return v
 
     def bool_(self, key: str) -> bool:
@@ -296,36 +308,68 @@ def _optional(r: _Reader, key: str, default: Any) -> Any:
 
 
 def _output_accounts(r: _Reader, discord: DiscordConfig, ingest_credential: str) -> tuple[OutputAccount, ...]:
-    raw = _optional(r, "output_accounts", [])
-    if not isinstance(raw, list):
-        r._err("output_accounts", "must be a list of {user_id, credential}")
-        return ()
-    if len(raw) > MAX_OUTPUT_ACCOUNTS:
-        r._err("output_accounts", f"at most {MAX_OUTPUT_ACCOUNTS} accounts")
+    """Extra accounts: ``relay_accounts`` then ``mirror_accounts``; ``output_accounts`` is a deprecated alias of relays."""
+    if "output_accounts" in r.data:
+        if "relay_accounts" in r.data or "mirror_accounts" in r.data:
+            r._err("output_accounts", "deprecated; cannot be combined with relay_accounts or mirror_accounts")
+            r._seen.update(("output_accounts", "relay_accounts", "mirror_accounts"))
+            return ()
+        warnings.warn(
+            "discord.output_accounts is deprecated; read as discord.relay_accounts", FutureWarning, stacklevel=2
+        )
+        lists = (("output_accounts", "relay"),)
+    else:
+        lists = (("relay_accounts", "relay"), ("mirror_accounts", "mirror"))
     out: list[OutputAccount] = []
     seen_ids = {discord.target_user_id, discord.expected_relay_user_id} - {0}
     seen_creds = {ingest_credential}
-    for i, item in enumerate(raw):
-        where = f"output_accounts[{i}]"
-        if not isinstance(item, dict) or set(item) != {"user_id", "credential"}:
-            r._err(where, "must be a mapping with exactly user_id and credential")
+    fixed_channels: set[int] = set()
+    total = 0
+    for key, role in lists:
+        raw = _optional(r, key, [])
+        if not isinstance(raw, list):
+            r._err(key, "must be a list of {user_id, credential}")
             continue
-        uid, cred = item["user_id"], item["credential"]
-        if not (isinstance(uid, str) and uid.isascii() and uid.isdigit() and int(uid) > 0):
-            r._err(where, "user_id must be a string of decimal digits")
-            continue
-        if not isinstance(cred, str) or not _CREDENTIAL_RE.fullmatch(cred):
-            r._err(where, "credential must match [A-Za-z0-9_.-]+")
-            continue
-        if int(uid) in seen_ids:
-            r._err(where, "user_id must differ from the target, the ingest relay and other output accounts")
-            continue
-        if cred in seen_creds:
-            r._err(where, "credential must be unique (also vs ingest_credential)")
-            continue
-        seen_ids.add(int(uid))
-        seen_creds.add(cred)
-        out.append(OutputAccount(int(uid), cred))
+        total += len(raw)
+        allowed = {"user_id", "credential", "channel_id"} if role == "mirror" else {"user_id", "credential"}
+        for i, item in enumerate(raw):
+            where = f"{key}[{i}]"
+            if not isinstance(item, dict) or not {"user_id", "credential"} <= set(item) <= allowed:
+                r._err(where, "must be a mapping with exactly user_id and credential"
+                       + (" (and optional channel_id)" if role == "mirror" else ""))
+                continue
+            uid, cred = item["user_id"], item["credential"]
+            if not (isinstance(uid, str) and uid.isascii() and uid.isdigit() and int(uid) > 0):
+                r._err(where, "user_id must be a string of decimal digits")
+                continue
+            if not isinstance(cred, str) or not _CREDENTIAL_RE.fullmatch(cred):
+                r._err(where, "credential must match [A-Za-z0-9_.-]+")
+                continue
+            channel = item.get("channel_id")
+            if channel is not None:
+                if not (isinstance(channel, str) and channel.isascii() and channel.isdigit() and int(channel) > 0):
+                    r._err(where, "channel_id must be a string of decimal digits")
+                    continue
+                channel = int(channel)
+                if channel == discord.allowed_voice_channel_id:
+                    r._err(where, "channel_id must differ from allowed_voice_channel_id")
+                    continue
+                if channel in fixed_channels:
+                    r._err(where, "channel_id is already fixed to another mirror account")
+                    continue
+            if int(uid) in seen_ids:
+                r._err(where, "user_id must differ from the target, the ingest relay and other output accounts")
+                continue
+            if cred in seen_creds:
+                r._err(where, "credential must be unique (also vs ingest_credential)")
+                continue
+            seen_ids.add(int(uid))
+            seen_creds.add(cred)
+            if channel is not None:
+                fixed_channels.add(channel)
+            out.append(OutputAccount(int(uid), cred, role, channel))
+    if total > MAX_OUTPUT_ACCOUNTS:
+        r._err(lists[0][0], f"at most {MAX_OUTPUT_ACCOUNTS} accounts in total")
     return tuple(out)
 
 
@@ -448,7 +492,10 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         feedback_idr_min_interval_ms=r.int_("feedback_idr_min_interval_ms", minimum=0),
         repeated_rejection_limit=r.int_("repeated_rejection_limit"),
         recording_enabled=r.only_false("recording_enabled"),
-        prejoin_voice=r.opt_bool("prejoin_voice"),
+        prejoin_voice=r.opt_bool("prejoin_voice", default=True),
+        relay_autoscale=r.opt_bool("relay_autoscale", default=True),
+        relay_scale_down_seconds=(r.num("relay_scale_down_seconds") or 120.0) if "relay_scale_down_seconds" in r.data else 120.0,
+        stream_viewer_cap=r.int_("stream_viewer_cap") if "stream_viewer_cap" in r.data else 50,
     )
     if runtime.keyframe_interval_seconds > 2.0:  # num() already rejects values <= 0
         r._err("keyframe_interval_seconds", "must be > 0 and <= 2.0")
