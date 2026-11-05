@@ -145,6 +145,7 @@ class Env:
             runtime=replace(cfg.runtime, start_debounce_ms=0, **runtime_kw),
             liveness=replace(cfg.liveness, source_dead_timeout_seconds=30.0),
             storage=replace(cfg.storage, state_directory=tmp_path),
+            control=replace(cfg.control, command_cooldown_seconds=0, change_cooldown_seconds=0),  # tests opt in
         )
         self.cfg = cfg
         self.store = StateStore(tmp_path)
@@ -515,10 +516,10 @@ def test_status_exposes_audio_counters(tmp_path, slate, source_gop):
 OPERATOR, CMD_CHAN = 50, 60
 
 
-def chat(env, text: str, msg_id: int = 900, voice: int | None = None) -> None:
+def chat(env, text: str, msg_id: int = 900, voice: int | None = None, author: int = OPERATOR, op: bool = True) -> None:
     from golive_relay.control.commands import ChatCommand
 
-    env.adapters[-1].events(ChatCommand(OPERATOR, CMD_CHAN, msg_id, text, author_voice_channel_id=voice))
+    env.adapters[-1].events(ChatCommand(author, CMD_CHAN, msg_id, text, author_voice_channel_id=voice, is_operator=op))
 
 
 def test_chat_target_command_persists_and_restarts(tmp_path, slate, source_gop):
@@ -712,6 +713,131 @@ def test_bare_mirror_uses_operator_voice_channel(tmp_path, slate, source_gop):
         assert await task == 0
 
     asyncio.run(main())
+
+
+def test_bare_mirror_without_voice_or_from_main_channel_is_refused(tmp_path, slate, source_gop):
+    uid, mirror_chan = 424242, 999
+    env = _multi_env(tmp_path, slate, source_gop, uid, lambda acct, events, log: FakeOutAdapter(acct, events, []),
+                     role="mirror")
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        a.voice_ids = frozenset({env.chan, mirror_chan})
+        chat(env, "!relay mirror", 1)
+        chat(env, "!relay mirror", 2, voice=env.chan)
+        await wait_until(lambda: len(a.replies) == 2)
+        assert all(r[2].startswith("⚠️") for r in a.replies)
+        assert env.svc.sup.routing.mirrors == {}
+        assert (env.store.load().routing or {}).get("mirrors", {}) == {}
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_non_operator_may_use_public_commands_only(tmp_path, slate, source_gop):
+    uid, mirror_chan, guest = 424242, 999, 51
+    env = _multi_env(tmp_path, slate, source_gop, uid, lambda acct, events, log: FakeOutAdapter(acct, events, []),
+                     role="mirror")
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        a.voice_ids = frozenset({env.chan, mirror_chan, 998})
+        rev = env.store.load().revision
+        for i, text in enumerate(("!relay unmirror all", "!relay target 777", f"!relay channel {mirror_chan}",
+                                  "!relay off", "!relay on", "!relay prejoin off", "!relay", "!relay wat",
+                                  "!relay mirror 1 2 3", "!relay mirror <@1>"), start=10):
+            chat(env, text, i, voice=mirror_chan, author=guest, op=False)
+        await asyncio.sleep(0.1)
+        assert a.replies == [] and env.store.load().revision == rev and env.svc.sup.desired_enabled is True
+        chat(env, "!relay status", 1, author=guest, op=False)
+        chat(env, "!relay mirror", 2, voice=mirror_chan, author=guest, op=False)
+        await wait_until(lambda: len(a.replies) == 2)
+        assert a.replies[0][2].startswith("📡") and a.replies[1][2].startswith("✅")
+        assert env.svc.sup.routing.mirrors == {mirror_chan: uid}
+        chat(env, "!relay unmirror", 3, voice=mirror_chan, author=guest, op=False)
+        await asyncio.sleep(0.1)
+        assert len(a.replies) == 2 and env.svc.sup.routing.mirrors == {mirror_chan: uid}
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 1000.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_per_author_cooldown_one_notice_then_silence_operators_exempt(tmp_path, slate, source_gop):
+    from golive_relay.control.cooldown import ChatCooldowns
+
+    env = Env(tmp_path, slate, source_gop)
+    clk = _Clock()
+    env.svc._cooldowns = ChatCooldowns(5, 3, clk)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        chat(env, "!relay status", 1, author=51, op=False)
+        clk.t += 1
+        chat(env, "!relay status", 2, author=51, op=False)
+        chat(env, "!relay status", 3, author=51, op=False)
+        chat(env, "!relay status", 4, author=52, op=False)  # another author is not limited
+        for mid in (5, 6, 7):
+            chat(env, "!relay status", mid)  # operator: exempt
+        clk.t += 4
+        chat(env, "!relay status", 8, author=51, op=False)
+        await wait_until(lambda: len(a.replies) == 7)
+        assert [r[1] for r in a.replies] == [1, 2, 4, 5, 6, 7, 8]
+        assert a.replies[1][2] == "⏳ chậm lại chút, thử lại sau 4s"
+        assert all(r[2].startswith("📡") for i, r in enumerate(a.replies) if i != 1)
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    outcomes = [kw["outcome"] for name, kw in env.log_kw if name == "chat_command"]
+    assert outcomes.count("cooldown") == 2
+
+
+def test_global_change_cooldown_blocks_everyone_but_not_status(tmp_path, slate, source_gop):
+    from golive_relay.control.cooldown import ChatCooldowns
+
+    env = Env(tmp_path, slate, source_gop)
+    clk = _Clock()
+    env.svc._cooldowns = ChatCooldowns(5, 3, clk)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        chat(env, "!relay prejoin off", 1)
+        assert env.svc.sup.prejoin_voice is False
+        clk.t += 1
+        chat(env, "!relay prejoin on", 2)  # operators are not exempt
+        chat(env, "!relay mirror", 3, author=51, op=False)
+        chat(env, "!relay status", 4)
+        chat(env, "!relay status", 5, author=52, op=False)
+        assert env.svc.sup.prejoin_voice is False and env.store.load().prejoin_voice is False
+        clk.t += 2
+        chat(env, "!relay prejoin on", 6)
+        assert env.svc.sup.prejoin_voice is True
+        await wait_until(lambda: len(a.replies) == 6)
+        texts = [r[2] for r in a.replies]
+        assert texts[0].startswith("✅") and texts[5].startswith("✅")
+        assert texts[1] == texts[2] == "⏳ vừa có thay đổi, thử lại sau 2s"
+        assert texts[3].startswith("📡") and texts[4].startswith("📡")
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+    cooled = [kw for name, kw in env.log_kw if name == "chat_command" and kw["outcome"] == "cooldown"]
+    assert [kw["command"] for kw in cooled] == ["SetPrejoin", "AddMirror"]
+    assert all("text" not in kw for kw in cooled)
 
 
 def test_failed_mirror_publish_logs_output_failed(tmp_path, slate, source_gop):

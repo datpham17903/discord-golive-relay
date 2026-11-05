@@ -306,14 +306,43 @@ def test_codec_modes_accept_h264_only(tmp_path):
 
 def test_control_config_defaults_when_absent_and_example():
     cfg = load_config(EXAMPLE)
-    assert cfg.control.chat_commands is False and cfg.control.command_prefix == "!relay"
+    assert cfg.control.chat_commands is True and cfg.control.command_prefix == "!relay"
     assert cfg.control.operator_user_ids == frozenset() and cfg.control.command_channel_id is None
+    assert cfg.control.public_commands == frozenset({"status", "mirror"})
+    assert (cfg.control.command_cooldown_seconds, cfg.control.change_cooldown_seconds) == (5, 3)
+    from golive_relay.config import ControlConfig
+
+    d = ControlConfig()
+    assert d.chat_commands is True and d.public_commands == frozenset({"status", "mirror"})
+    assert (d.command_cooldown_seconds, d.change_cooldown_seconds) == (5, 3)
 
 
-def test_control_config_requires_operators_when_enabled(tmp_path: Path):
+def test_control_public_commands_and_cooldowns(tmp_path: Path):
+    raw = _raw()
+    raw["control"] = {}
+    c = _load(tmp_path, raw).control
+    assert c.chat_commands is True and c.public_commands == frozenset({"status", "mirror"})
+    raw["control"] = {"public_commands": ["status", "unmirror"], "command_cooldown_seconds": 0,
+                      "change_cooldown_seconds": 10}
+    c = _load(tmp_path, raw).control
+    assert c.public_commands == frozenset({"status", "unmirror"})
+    assert (c.command_cooldown_seconds, c.change_cooldown_seconds) == (0, 10)
+    raw["control"] = {"public_commands": []}
+    assert _load(tmp_path, raw).control.public_commands == frozenset()
+    for bad in (["status", "bogus"], "status", [1]):
+        raw["control"] = {"public_commands": bad}
+        assert any("control.public_commands" in e for e in _errors(tmp_path, raw)), bad
+    for key in ("command_cooldown_seconds", "change_cooldown_seconds"):
+        for bad in (-1, "5", True, 1.5):
+            raw["control"] = {key: bad}
+            assert any(f"control.{key}" in e for e in _errors(tmp_path, raw)), (key, bad)
+
+
+def test_control_config_operators_optional_when_enabled(tmp_path: Path):
     raw = _raw()
     raw["control"] = {"chat_commands": True, "operator_user_ids": []}
-    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    c = _load(tmp_path, raw).control  # no operators: only public commands work
+    assert c.chat_commands is True and c.operator_user_ids == frozenset() and c.operator_role_ids == frozenset()
     raw["control"] = {"chat_commands": True, "operator_user_ids": ["42"], "command_channel_id": "7", "command_prefix": "!r"}
     c = _load(tmp_path, raw).control
     assert c.operator_user_ids == frozenset({42}) and c.command_channel_id == 7 and c.command_prefix == "!r"
@@ -321,7 +350,7 @@ def test_control_config_requires_operators_when_enabled(tmp_path: Path):
     c = _load(tmp_path, raw).control
     assert c.operator_role_ids == frozenset({77}) and c.operator_user_ids == frozenset()
     raw["control"] = {"chat_commands": True, "operator_user_ids": [], "operator_role_ids": []}
-    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    assert _load(tmp_path, raw).control.chat_commands is True
     raw["control"] = {"operator_role_ids": ["x"]}
     assert any("control.operator_role_ids" in e for e in _errors(tmp_path, raw))
     raw["control"] = {"command_prefix": "! relay"}
@@ -349,13 +378,13 @@ def test_control_is_operator_by_user_role_or_neither() -> None:
     assert not c.is_operator(2, frozenset({11}))
 
 
-def test_control_config_rejects_bad_command_channel_and_missing_operators(tmp_path: Path):
+def test_control_config_rejects_bad_command_channel(tmp_path: Path):
     raw = _raw()
     for bad in (7, "abc", "-7", "0", ["7"]):
         raw["control"] = {"command_channel_id": bad}
         assert any("control.command_channel_id" in e for e in _errors(tmp_path, raw)), bad
     raw["control"] = {"chat_commands": True}
-    assert any("control.operator_user_ids" in e for e in _errors(tmp_path, raw))
+    assert _load(tmp_path, raw).control.chat_commands is True
 
 
 def _with_pools(relay, mirror):

@@ -9,18 +9,31 @@ from typing import Callable, Mapping
 
 from golive_relay.supervisor.routing import Routing
 
-HELP = (
-    "ℹ️ **Lệnh relay**\n"
-    "• `status` - xem trạng thái hiện tại\n"
-    "• `on` / `off` - bật hoặc tắt relay\n"
-    "• `target <user_id>` - đổi người được relay\n"
-    "• `channel <channel_id>` - đổi kênh voice chính\n"
-    "• `mirror` - mirror kênh voice bạn đang ngồi\n"
-    "• `mirror <channel_id> [account_id]` - phát lại sang một kênh voice khác (có thể chỉ định tài khoản mirror)\n"
-    "• `unmirror` - gỡ mirror của kênh voice bạn đang ngồi\n"
-    "• `unmirror <channel_id|all>` - gỡ mirror\n"
-    "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"
+COMMAND_NAMES = ("status", "mirror", "unmirror", "on", "off", "target", "channel", "prejoin")
+DEFAULT_PUBLIC_COMMANDS = frozenset({"status", "mirror"})
+
+_HELP_LINES = (
+    ("status", "• `status` - xem trạng thái hiện tại"),
+    ("on", "• `on` / `off` - bật hoặc tắt relay"),
+    ("target", "• `target <user_id>` - đổi người được relay"),
+    ("channel", "• `channel <channel_id>` - đổi kênh voice chính"),
+    ("mirror", "• `mirror` - mirror kênh voice bạn đang ngồi"),
+    ("mirror", "• `mirror <channel_id> [account_id]` - phát lại sang một kênh voice khác (có thể chỉ định tài khoản mirror)"),
+    ("unmirror", "• `unmirror` - gỡ mirror của kênh voice bạn đang ngồi"),
+    ("unmirror", "• `unmirror <channel_id|all>` - gỡ mirror"),
+    ("prejoin", "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"),
 )
+
+
+def help_text(public: frozenset[str]) -> str:
+    lines = ["ℹ️ **Lệnh relay** (lệnh *công khai* ai cũng dùng được; lệnh khác cần quyền operator)"]
+    for name, line in _HELP_LINES:
+        open_ = name in public and (name != "on" or "off" in public)
+        lines.append(line + (" *(công khai)*" if open_ else ""))
+    return "\n".join(lines)
+
+
+HELP = help_text(DEFAULT_PUBLIC_COMMANDS)
 
 _USAGE = {
     "target": "`target <user_id>`",
@@ -36,7 +49,7 @@ _USAGE = {
 
 @dataclass(frozen=True, slots=True)
 class ChatCommand:
-    """A guild message from an operator, already filtered by the adapter; ``text`` is never logged."""
+    """A guild message, already filtered by guild/channel/relay account by the adapter; ``text`` is never logged."""
 
     author_id: int
     channel_id: int
@@ -44,6 +57,7 @@ class ChatCommand:
     text: str
     author_role_ids: frozenset[int] = frozenset()
     author_voice_channel_id: int | None = None  # author's current voice channel in the configured guild
+    is_operator: bool = False  # listed user or role holder; others may only use public commands
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +132,9 @@ class StatusDetails:
     last_watch_ms: float | None
     audio_ok: bool
     accounts: tuple[tuple[int, str, int | None, str, float | None], ...]  # (uid, role, channel_id, state, uptime_s)
+    public_commands: tuple[str, ...] = ()
+    command_cooldown_s: int = 0
+    change_cooldown_s: int = 0
 
 
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
@@ -145,12 +162,20 @@ def _parse_id(sub: str, raw: str) -> int | ParseError:
     return int(raw)
 
 
-def parse(text: str, prefix: str) -> Command | ParseError | None:
+def command_name(cmd: Command) -> str:
+    """The config name of a parsed command (as in ``control.public_commands``)."""
+    if isinstance(cmd, SetEnabled):
+        return "on" if cmd.on else "off"
+    return {Status: "status", SetPrejoin: "prejoin", SetTarget: "target", SetChannel: "channel",
+            AddMirror: "mirror", RemoveMirror: "unmirror"}[type(cmd)]
+
+
+def parse(text: str, prefix: str, public: frozenset[str] = DEFAULT_PUBLIC_COMMANDS) -> Command | ParseError | None:
     tokens = text.split()
     if not tokens or tokens[0].lower() != prefix.lower():
         return None
     if len(tokens) == 1:
-        return ParseError(HELP)
+        return ParseError(help_text(public))
     sub, args = tokens[1].lower(), tokens[2:]
     if sub in ("status", "on", "off"):
         if args:
@@ -181,7 +206,7 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
         if isinstance(n, ParseError):
             return n
         return {"target": SetTarget, "channel": SetChannel, "unmirror": RemoveMirror}[sub](n)
-    return ParseError(HELP)
+    return ParseError(help_text(public))
 
 
 def _reject(why: str, usage: str | None = None) -> str:
@@ -327,6 +352,10 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
     lines.append(
         f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, debounce {d.debounce_ms}ms, "
         f"video {d.video_mode}, {d.output_size}"
+    )
+    lines.append(
+        f"• Lệnh công khai: {', '.join(d.public_commands) or 'không có'}; "
+        f"cooldown {d.command_cooldown_s}s mỗi người, {d.change_cooldown_s}s giữa các thay đổi"
     )
     watch = "-" if d.last_watch_ms is None else f"{int(d.last_watch_ms)}ms"
     lines.append(f"• Hiệu năng: watch gần nhất {watch}, audio {'có tín hiệu' if d.audio_ok else 'im lặng'}")

@@ -180,7 +180,10 @@ class DiscordAdapter:
             self._on_message(args[0])
 
     def _on_message(self, msg: Any) -> None:
-        """Operator messages in the configured guild (and command channel) only; the rest is ignored silently."""
+        """Messages in the configured guild (and command channel) only; the rest is ignored silently.
+
+        Non-operators are passed on (flagged) only for prefixed messages: the service allows them public commands.
+        """
         c = self._control
         if not c.chat_commands or msg.guild is None or msg.guild.id != self.guild_id:
             return
@@ -195,14 +198,17 @@ class DiscordAdapter:
         if raw is None:
             raw = [r.id for r in getattr(member, "roles", ())]
         role_ids = frozenset(raw)
-        if not c.is_operator(author, role_ids):
-            return
         if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
             return
+        operator = c.is_operator(author, role_ids)
+        if not operator:
+            head = msg.content.split(maxsplit=1)
+            if not head or head[0].lower() != c.command_prefix.lower():
+                return
         voice = getattr(getattr(member, "voice", None), "channel", None)
         in_guild = voice is not None and getattr(getattr(voice, "guild", None), "id", None) == self.guild_id
         self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids,
-                               voice.id if in_guild else None))
+                               voice.id if in_guild else None, operator))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id

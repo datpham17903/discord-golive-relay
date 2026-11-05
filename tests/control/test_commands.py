@@ -10,8 +10,10 @@ from golive_relay.control.commands import (
     SetTarget,
     Status,
     StatusDetails,
+    command_name,
     describe_change,
     format_status,
+    help_text,
     parse,
     plan_change,
     resolve_here,
@@ -135,6 +137,10 @@ def test_no_reply_contains_user_mention():
         outs.append(plan_change(cmd, old, c))
     for t in ("!relay target <@1>", "!relay x", "!relay mirror 1 2 3"):
         outs.append(parse(t, P).text)
+    not_in_voice = resolve_here(AddMirror(None), old, None)
+    no_mirror = resolve_here(RemoveMirror(None, here=True), old, 300)
+    assert "không ở kênh voice" in not_in_voice and "chưa có mirror" in no_mirror
+    outs += [not_in_voice, no_mirror]
     assert all("<@" not in o for o in outs)
 
 
@@ -344,3 +350,33 @@ def test_bare_unmirror():
 def test_help_lists_bare_mirror_forms():
     assert "• `mirror` - " in HELP
     assert "• `unmirror` - " in HELP
+
+
+def test_help_marks_public_commands():
+    h = help_text(frozenset({"status", "mirror"}))
+    lines = {line.split("`")[1]: line for line in h.splitlines() if line.startswith("• ")}
+    assert "công khai" in lines["status"] and "công khai" in lines["mirror"] and "công khai" in lines["mirror <channel_id> [account_id]"]
+    for sub in ("on", "target <user_id>", "channel <channel_id>", "unmirror", "unmirror <channel_id|all>", "prejoin <on|off>"):
+        assert "công khai" not in lines[sub], sub
+    assert HELP == h
+    unmirror = [x for x in help_text(frozenset({"unmirror"})).splitlines() if x.startswith("• `unmirror")]
+    assert len(unmirror) == 2 and all("công khai" in x for x in unmirror)
+    assert parse("!relay", P, frozenset({"on"})) == ParseError(help_text(frozenset({"on"})))
+    assert parse("!relay wat", P) == ParseError(HELP)
+
+
+def test_command_name():
+    cases = {Status(): "status", SetEnabled(True): "on", SetEnabled(False): "off", SetTarget(1): "target",
+             SetChannel(1): "channel", AddMirror(None): "mirror", RemoveMirror(None, here=True): "unmirror",
+             RemoveMirror(None): "unmirror", SetPrejoin(True): "prejoin"}
+    for cmd, name in cases.items():
+        assert command_name(cmd) == name
+
+
+def test_status_shows_public_commands_and_cooldowns():
+    s = format_status(routing(), ctx(), _details(public_commands=("status", "mirror"), command_cooldown_s=5,
+                                                 change_cooldown_s=3))
+    line = next(x for x in s.splitlines() if "công khai" in x)
+    assert "status, mirror" in line and "5s" in line and "3s" in line
+    s = format_status(routing(), ctx(), _details())
+    assert "công khai: không có" in s

@@ -23,9 +23,10 @@ from discord.ext.native_voice.media import VideoConfig
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
-    ChatCommand, ParseError, RoutingContext, resolve_here, SetEnabled, SetPrejoin, Status, StatusDetails, describe_change,
-    format_status, parse, plan_change,
+    COMMAND_NAMES, ChatCommand, ParseError, RoutingContext, resolve_here, SetEnabled, SetPrejoin, Status, StatusDetails,
+    command_name, describe_change, format_status, parse, plan_change,
 )
+from golive_relay.control.cooldown import ChatCooldowns
 from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
 from golive_relay.control.state import PersistedState, StateCorrupt, StateStore, account_view, set_account
@@ -190,6 +191,7 @@ class Service:
         self._out_tail: dict[int, asyncio.Task] = {}
         self._out_tasks: set[asyncio.Task] = set()
         self._reply_tail: asyncio.Task | None = None
+        self._cooldowns = ChatCooldowns(cfg.control.command_cooldown_seconds, cfg.control.change_cooldown_seconds)
         self._resnap_pending = False  # routing changed while the gateway was not FRESH
         self._feedback_min = cfg.runtime.feedback_idr_min_interval_ms / 1000.0
         self._adapter: Any = None
@@ -414,9 +416,22 @@ class Service:
 
     def _on_chat(self, ev: ChatCommand) -> None:
         """parse -> plan -> persist -> RoutingChanged (which re-routes the pool) -> reply. Content is never logged."""
-        cmd = parse(ev.text, self.cfg.control.command_prefix)
+        c = self.cfg.control
+        cmd = parse(ev.text, c.command_prefix, c.public_commands)
         if cmd is None:
             return
+        if not ev.is_operator:
+            if isinstance(cmd, ParseError) or command_name(cmd) not in c.public_commands:
+                return  # no reply to non-operators for invalid or non-public commands: nothing to spam with
+            wait = self._cooldowns.author(ev.author_id)
+            if wait is not None:
+                self._chat_cooldown(ev, cmd, f"⏳ chậm lại chút, thử lại sau {wait}s" if wait else None)
+                return
+        if not isinstance(cmd, (ParseError, Status)):
+            wait = self._cooldowns.change_wait()
+            if wait:
+                self._chat_cooldown(ev, cmd, f"⏳ vừa có thay đổi, thử lại sau {wait}s")
+                return
         ctx = self._routing_context()
         old = self.sup.routing
         try:
@@ -446,9 +461,18 @@ class Service:
         except (OSError, StateCorrupt) as exc:
             self.log("chat_state_write_failed", error=repr(exc))
             outcome, text = "write_failed", "❌ **Không ghi được state.json**; không có gì thay đổi."
+        if outcome == "applied":
+            self._cooldowns.changed()
         self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
                  outcome=outcome)
         self._reply(ev, text)
+
+    def _chat_cooldown(self, ev: ChatCommand, cmd: Any, text: str | None) -> None:
+        """A rate-limited command changes nothing; ``text`` None = the author was already told this window."""
+        self.log("chat_command", command=type(cmd).__name__, author=ev.author_id, channel=ev.channel_id,
+                 outcome="cooldown")
+        if text is not None:
+            self._reply(ev, text)
 
     def _routing_write(self, old: Routing, new: Routing) -> Callable[[PersistedState], PersistedState]:
         """Runs under the state lock: a routing stored since the last poll must not be overwritten."""
@@ -1130,6 +1154,9 @@ class Service:
             last_watch_ms=self._last_watch_ms,
             audio_ok=self._audio_ok,
             accounts=tuple(accounts),
+            public_commands=tuple(n for n in COMMAND_NAMES if n in self.cfg.control.public_commands),
+            command_cooldown_s=self.cfg.control.command_cooldown_seconds,
+            change_cooldown_s=self.cfg.control.change_cooldown_seconds,
         )
 
     def _write_status(self) -> None:
