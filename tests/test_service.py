@@ -345,7 +345,7 @@ def test_output_account_fans_out_and_stops_with_gate_closed(tmp_path, slate, sou
     asyncio.run(main())
 
 
-def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None):
+def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None, role="relay"):
     from golive_relay.supervisor.outputs_model import OutputAccount
 
     env = Env(tmp_path, slate, source_gop)
@@ -353,7 +353,7 @@ def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None):
         env.store.update(state)
     cfg = replace(
         env.cfg,
-        discord=replace(env.cfg.discord, output_accounts=(OutputAccount(uid, "relay-token-2"),)),
+        discord=replace(env.cfg.discord, output_accounts=(OutputAccount(uid, "relay-token-2", role),)),
         runtime=replace(env.cfg.runtime, retry_delays_seconds=(0.01,)),
     )
     env.svc = Service(
@@ -663,12 +663,11 @@ def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source
         outs.append(a)
         return a
 
-    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory)
+    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory, role="mirror")
 
     async def main():
         task = await reach_relaying(env)
-        await wait_until(lambda: env.svc.pool.account_live(uid, env.svc._gen, env.svc._epoch))
-        assert ("channel", env.chan) in outs[0].calls
+        assert env.svc.pool.status(time.monotonic())[0]["state"] == "off"  # unassigned mirror account stays off
         env.adapters[0].voice_ids = frozenset({env.chan, mirror_chan})
         chat(env, f"!relay mirror {mirror_chan}")
         assert env.store.load().routing["mirrors"] == {str(mirror_chan): uid}

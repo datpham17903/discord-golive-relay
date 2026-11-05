@@ -100,34 +100,57 @@ class OutputPool:
         self._session: _Session | None = None
         self._queue: list[int] = []
         self._next_start = float("-inf")
+        self._relays = [a.user_id for a in accounts if a.role != "mirror"]  # config order = replacement order
+        self._relay_target = len(self._relays)
 
     # ------------------------------------------------------------ queries
 
-    def channel_of(self, uid: int) -> int:
+    def channel_of(self, uid: int) -> int | None:
+        """Relay accounts publish in the main channel; a mirror account in its assigned channel, or None if unassigned."""
+        rec = self._accts.get(uid)
+        if rec is None or not self._is_mirror_role(rec):
+            return self._routing.channel_id
         for ch, acct in self._routing.mirrors.items():
             if acct == uid:
                 return ch
-        return self._routing.channel_id
+        return None
 
-    def _is_mirror(self, uid: int) -> bool:
-        return uid in self._routing.mirrors.values()
+    @staticmethod
+    def _is_mirror_role(rec: _Acct) -> bool:
+        return rec.account.role == "mirror"
 
     def set_routing(self, routing: Routing, now: float) -> list[PoolAction]:
-        """Restart only the accounts whose mirror assignment moved them; a main-channel change waits for the next session."""
+        """Restart only the mirror accounts whose assignment moved them; a main-channel change waits for the next session."""
         out: list[PoolAction] = []
-        old_mirrored = set(self._routing.mirrors.values())
         before = {uid: self.channel_of(uid) for uid in self._accts}
         self._routing = routing
         for uid, rec in self._accts.items():
-            if before[uid] == self.channel_of(uid) or not (uid in old_mirrored or self._is_mirror(uid)):
+            if not self._is_mirror_role(rec) or before[uid] == self.channel_of(uid):
                 continue
             rec.blocked = False
             if self._active(rec):
                 self._stop(rec, "routing_changed", StopReason.ROUTING_CHANGED, out)
-            if self._restartable(rec):
+            if self._restartable(rec) and self._allowed(rec):
                 self._enqueue(rec)
         self._pump(now, out)
         return out
+
+    def set_relay_target(self, n: int, now: float) -> list[PoolAction]:
+        """Only the first ``n`` usable relay accounts may run; extra ones stop cleanly (no backoff, no rejection)."""
+        out: list[PoolAction] = []
+        self._relay_target = max(0, n)
+        self._reconcile_relays(out)
+        self._pump(now, out)
+        return out
+
+    def relay_summary(self) -> dict:
+        available = sum(1 for uid in self._relays if self._usable(self._accts[uid]))
+        return {
+            "wanted": self._relay_target,
+            "running": sum(1 for uid in self._relays if self._active(self._accts[uid])),
+            "available": available,
+            "short_by": max(0, self._relay_target - available),
+        }
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
         rec = self._accts.get(account)
@@ -196,6 +219,7 @@ class OutputPool:
                 self._fatal(rec, FatalReason.AUTH_REJECTED, "", out)
         elif isinstance(event, OutTick):
             pass
+        self._reconcile_relays(out)
         self._pump(now, out)
         return out
 
@@ -233,6 +257,32 @@ class OutputPool:
         s = self._session
         return s is not None and rec.state is OutputState.OFF and rec.skip_generation != s.generation
 
+    @staticmethod
+    def _usable(rec: _Acct) -> bool:
+        return rec.state not in (OutputState.FATAL, OutputState.QUARANTINE)
+
+    def _wanted_relays(self) -> list[int]:
+        return [uid for uid in self._relays if self._usable(self._accts[uid])][: self._relay_target]
+
+    def _allowed(self, rec: _Acct) -> bool:
+        """A mirror account runs only while assigned; a relay account only within the first n usable relays."""
+        if self._is_mirror_role(rec):
+            return self.channel_of(rec.account.user_id) is not None
+        return rec.account.user_id in self._wanted_relays()
+
+    def _reconcile_relays(self, out: list[PoolAction]) -> None:
+        wanted = set(self._wanted_relays())
+        for uid in self._relays:
+            rec = self._accts[uid]
+            if uid in wanted:
+                if self._restartable(rec):
+                    self._enqueue(rec)
+            elif self._active(rec):
+                self._stop(rec, "relay_scaled_down", StopReason.RELAY_SCALED_DOWN, out)
+            elif rec.state is OutputState.BACKOFF:
+                rec.state = OutputState.OFF
+                rec.backoff_until = None
+
     def _enqueue(self, rec: _Acct) -> None:
         if not rec.queued:
             rec.queued = True
@@ -255,7 +305,7 @@ class OutputPool:
                 rec.quarantine_inc = None
                 rec.state = OutputState.OFF
                 out.append(OutSetQuarantine(uid, None))
-            if rec.state is OutputState.OFF and rec.skip_generation != ev.generation:
+            if rec.state is OutputState.OFF and rec.skip_generation != ev.generation and self._allowed(rec):
                 self._enqueue(rec)
 
     def _on_hold(self, ev: SessionHold, out: list[PoolAction]) -> None:
@@ -312,7 +362,10 @@ class OutputPool:
         rec = self._accts.get(ev.account)
         if rec is None or rec.state not in (OutputState.READY, OutputState.LIVE):
             return  # JOINING/STOPPING are exempt; other states hold no voice
-        verdict = rec.detector.classify(RelayVoiceObserved(ev.session_id, ev.channel_id), self.channel_of(ev.account), now)
+        expected = self.channel_of(ev.account)
+        if expected is None:
+            return  # unassigned mirror: set_routing already stopped it
+        verdict = rec.detector.classify(RelayVoiceObserved(ev.session_id, ev.channel_id), expected, now)
         if verdict in (OwnershipVerdict.OK, OwnershipVerdict.IGNORED):
             return
         uid = rec.account.user_id
@@ -336,7 +389,7 @@ class OutputPool:
 
     def _on_participants(self, ev: MirrorParticipants, out: list[PoolAction]) -> None:
         rec = self._accts.get(ev.account)
-        if rec is None or not self._is_mirror(ev.account) or ev.channel_id != self.channel_of(ev.account):
+        if rec is None or not self._is_mirror_role(rec) or ev.channel_id != self.channel_of(ev.account):
             return
         blocked = bool(self._excluded & ev.participants)
         if blocked == rec.blocked:
@@ -354,7 +407,7 @@ class OutputPool:
             if rec.state is OutputState.BACKOFF and rec.backoff_until is not None and now >= rec.backoff_until:
                 rec.backoff_until = None
                 rec.state = OutputState.OFF
-                if s is not None:
+                if s is not None and self._allowed(rec):
                     self._enqueue(rec)
         if s is None:
             for uid in self._queue:
@@ -364,7 +417,7 @@ class OutputPool:
         while self._queue and now >= self._next_start:
             rec = self._accts[self._queue.pop(0)]
             rec.queued = False
-            if rec.state is not OutputState.OFF or rec.blocked:
+            if rec.state is not OutputState.OFF or rec.blocked or not self._allowed(rec):
                 continue
             rec.state = OutputState.JOINING
             rec.generation = s.generation

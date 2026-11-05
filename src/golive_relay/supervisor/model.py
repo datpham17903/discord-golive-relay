@@ -71,6 +71,7 @@ class StopReason(Enum):
     CONFIG_INVALID = "config_invalid"
     SHUTDOWN = "shutdown"
     ROUTING_CHANGED = "routing_changed"
+    RELAY_SCALED_DOWN = "relay_scaled_down"
 
 
 class Liveness(Enum):
