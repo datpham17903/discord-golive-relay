@@ -175,3 +175,24 @@ def test_failed_connect_after_voice_state_echo_clears_voice_client() -> None:
 
     asyncio.run(main())
     assert a._vc is None
+
+
+def test_author_voice_channel_filled_from_member_voice_state() -> None:
+    a, out = make()
+    m = message()
+    m.author.roles = []
+    m.author.voice = NS(channel=NS(id=77, guild=NS(id=GUILD)))
+    a.handle_dispatch("message", m)
+    other = message()
+    other.author.roles = []
+    other.author.voice = NS(channel=NS(id=78, guild=NS(id=99)))
+    a.handle_dispatch("message", other)
+    novoice = message()
+    novoice.author.roles = []
+    novoice.author.voice = None
+    a.handle_dispatch("message", novoice)
+    nochan = message()
+    nochan.author.roles = []
+    nochan.author.voice = NS(channel=None)
+    a.handle_dispatch("message", nochan)
+    assert [c.author_voice_channel_id for c in out] == [77, None, None, None]

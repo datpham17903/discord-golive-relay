@@ -23,8 +23,8 @@ HELP = (
 _USAGE = {
     "target": "`target <user_id>`",
     "channel": "`channel <channel_id>`",
-    "mirror": "`mirror <channel_id> [account_id]`",
-    "unmirror": "`unmirror <channel_id|all>`",
+    "mirror": "`mirror` (đang ở kênh voice) hoặc `mirror <channel_id> [account_id]`",
+    "unmirror": "`unmirror` (đang ở kênh voice) hoặc `unmirror <channel_id|all>`",
     "on": "`on`",
     "off": "`off`",
     "status": "`status`",
@@ -41,6 +41,7 @@ class ChatCommand:
     message_id: int
     text: str
     author_role_ids: frozenset[int] = frozenset()
+    author_voice_channel_id: int | None = None  # author's current voice channel in the configured guild
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,13 +66,14 @@ class SetChannel:
 
 @dataclass(frozen=True, slots=True)
 class AddMirror:
-    channel_id: int
+    channel_id: int | None  # None = the author's current voice channel
     account: int | None = None  # None = relay picks the account
 
 
 @dataclass(frozen=True, slots=True)
 class RemoveMirror:
-    channel_id: int | None  # None = all
+    channel_id: int | None  # None = all, unless ``here``
+    here: bool = False  # bare `unmirror`: the author's current voice channel
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,7 +159,9 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
             return _usage_error(sub, "**Cần đúng một tham số** `on` hoặc `off`")
         return SetPrejoin(args[0].lower() == "on")
     if sub == "mirror":
-        if len(args) not in (1, 2):
+        if not args:
+            return AddMirror(None)
+        if len(args) > 2:
             return _usage_error(sub, "**Cần kênh và tùy chọn một tài khoản**")
         ids = [_parse_id(sub, a) for a in args]
         for n in ids:
@@ -165,6 +169,8 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
                 return n
         return AddMirror(*ids)
     if sub in ("target", "channel", "unmirror"):
+        if sub == "unmirror" and not args:
+            return RemoveMirror(None, here=True)
         if len(args) != 1:
             return _usage_error(sub, "**Cần đúng một tham số**")
         if sub == "unmirror" and args[0].lower() == "all":
@@ -178,6 +184,21 @@ def parse(text: str, prefix: str) -> Command | ParseError | None:
 
 def _reject(why: str, usage: str | None = None) -> str:
     return f"⚠️ {why}" + (f" Dùng: {usage}" if usage else "")
+
+
+def resolve_here(cmd: Command, routing: Routing, voice_channel_id: int | None) -> Command | str:
+    """Bare `mirror`/`unmirror` -> the concrete channel command, or a rejection reply."""
+    bare_add = isinstance(cmd, AddMirror) and cmd.channel_id is None
+    bare_remove = isinstance(cmd, RemoveMirror) and cmd.here
+    if not (bare_add or bare_remove):
+        return cmd
+    if voice_channel_id is None:
+        return _reject("**Bạn đang không ở kênh voice nào.**", _USAGE["mirror" if bare_add else "unmirror"])
+    if bare_add:
+        return replace(cmd, channel_id=voice_channel_id)
+    if voice_channel_id not in routing.mirrors:
+        return _reject(f"**Kênh** {_ch(voice_channel_id)} chưa có mirror.", "`status` để xem danh sách mirror")
+    return RemoveMirror(voice_channel_id)
 
 
 def plan_change(cmd: Command, routing: Routing, ctx: RoutingContext) -> Routing | str:

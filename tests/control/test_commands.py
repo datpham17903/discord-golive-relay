@@ -14,6 +14,7 @@ from golive_relay.control.commands import (
     format_status,
     parse,
     plan_change,
+    resolve_here,
 )
 from golive_relay.supervisor.routing import Routing
 
@@ -132,7 +133,7 @@ def test_no_reply_contains_user_mention():
         outs.append(describe_change(cmd, old, new, c))
     for cmd in (SetTarget(INGEST), AddMirror(100), SetChannel(200), RemoveMirror(7)):
         outs.append(plan_change(cmd, old, c))
-    for t in ("!relay target <@1>", "!relay x", "!relay mirror"):
+    for t in ("!relay target <@1>", "!relay x", "!relay mirror 1 2 3"):
         outs.append(parse(t, P).text)
     assert all("<@" not in o for o in outs)
 
@@ -299,3 +300,42 @@ def test_status_shows_shortage_warning():
     s = format_status(routing(), ctx(), _details(scale_down_in_s=42.4, last_watch_ms=None, audio_ok=False))
     assert "giảm sau 43s"  # rounded up in s.splitlines()[4]
     assert "⚠️" not in s.splitlines()[4]
+
+
+def test_parse_bare_mirror_forms():
+    assert parse("!relay mirror", P) == AddMirror(None)
+    assert parse("!relay unmirror", P) == RemoveMirror(None, here=True)
+    assert parse("!relay unmirror all", P) == RemoveMirror(None)
+    assert parse("!relay unmirror all", P) != parse("!relay unmirror", P)
+    assert parse("!relay mirror 5", P) == AddMirror(5)
+    assert parse("!relay unmirror 5", P) == RemoveMirror(5)
+
+
+def test_bare_mirror_requires_voice_channel():
+    for cmd, word in ((AddMirror(None), "mirror"), (RemoveMirror(None, here=True), "unmirror")):
+        r = resolve_here(cmd, routing(), None)
+        assert isinstance(r, str) and r.startswith("⚠️") and "không ở kênh voice" in r and f"`{word}`" in r
+
+
+def test_bare_mirror_in_main_channel_rejected_by_planner():
+    cmd = resolve_here(AddMirror(None), routing(), 100)
+    assert cmd == AddMirror(100)
+    assert "kênh chính" in plan_change(cmd, routing(), ctx())
+
+
+def test_bare_mirror_in_other_channel():
+    cmd = resolve_here(AddMirror(None), routing(), 200)
+    assert plan_change(cmd, routing(), ctx()).mirrors == {200: O3}
+    fixed = ctx(mirror_fixed={O1: 200})
+    assert plan_change(cmd, routing(), fixed).mirrors == {200: O1}
+    assert resolve_here(AddMirror(None, 22), routing(), 200) == AddMirror(200, 22)
+
+
+def test_bare_unmirror():
+    r = routing({200: O1})
+    cmd = resolve_here(RemoveMirror(None, here=True), r, 200)
+    assert cmd == RemoveMirror(200)
+    assert plan_change(cmd, r, ctx()).mirrors == {}
+    miss = resolve_here(RemoveMirror(None, here=True), r, 300)
+    assert miss.startswith("⚠️") and "<#300>" in miss and "chưa có mirror" in miss
+    assert resolve_here(RemoveMirror(None), r, None) == RemoveMirror(None)

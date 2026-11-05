@@ -327,6 +327,8 @@ With `control.chat_commands: true` the ingest account reads messages in the conf
 | `!relay target <user_id>` | Relays another person. The current session stops and starts again when the new target shares in the main channel. A relay account (ingest or output) is refused |
 | `!relay channel <channel_id>` | Moves the main voice channel. The channel must be a voice channel of the guild and not a mirror |
 | `!relay mirror <channel_id> [account_id]` | Publishes the same stream in another voice channel with a mirror account. With `account_id`, that mirror account is used; it must be free, not FATAL or quarantined, and not fixed to another channel. Without it, the mirror account fixed to this channel is used, else the last free mirror account without a fixed channel. Relay accounts are refused |
+| `!relay mirror` | Same as `mirror <channel_id>` for the voice channel you are sitting in. Refused when you are not in a voice channel of the guild or you are in the main channel |
+| `!relay unmirror` | Removes the mirror of the voice channel you are sitting in; refused when you are not in voice or that channel has no mirror |
 | `!relay unmirror <channel_id>` / `!relay unmirror all` | Removes one mirror or all of them; the mirror account stops publishing |
 | `!relay prejoin on` / `!relay prejoin off` | Turns pre-join (`runtime.prejoin_voice`) on or off. `on` joins the main channel as soon as the target is there; `off` leaves voice when the target is not streaming. Stored as `prejoin_voice` in `state.json` and kept across restarts; while nothing is stored the config value is used. `!relay status` shows it |
 

@@ -515,10 +515,10 @@ def test_status_exposes_audio_counters(tmp_path, slate, source_gop):
 OPERATOR, CMD_CHAN = 50, 60
 
 
-def chat(env, text: str, msg_id: int = 900) -> None:
+def chat(env, text: str, msg_id: int = 900, voice: int | None = None) -> None:
     from golive_relay.control.commands import ChatCommand
 
-    env.adapters[-1].events(ChatCommand(OPERATOR, CMD_CHAN, msg_id, text))
+    env.adapters[-1].events(ChatCommand(OPERATOR, CMD_CHAN, msg_id, text, author_voice_channel_id=voice))
 
 
 def test_chat_target_command_persists_and_restarts(tmp_path, slate, source_gop):
@@ -678,6 +678,36 @@ def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source
         assert st["routing"]["mirrors"] == {str(mirror_chan): uid}
         assert st["accounts"][0]["channel_id"] == mirror_chan
         assert env.svc.sup.state is RelayState.RELAYING  # the main session is not interrupted
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_bare_mirror_uses_operator_voice_channel(tmp_path, slate, source_gop):
+    uid, mirror_chan = 424242, 999
+    outs: list = []
+
+    class ChannelOut(FakeOutAdapter):
+        async def publish(self, g, n, fps, source, channel_id):
+            self.calls.append(("channel", channel_id))
+            return await super().publish(g, n, fps, source, channel_id)
+
+    def out_factory(acct, events, log):
+        a = ChannelOut(acct, events, [])
+        outs.append(a)
+        return a
+
+    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory, role="mirror")
+
+    async def main():
+        task = await reach_relaying(env)
+        env.adapters[0].voice_ids = frozenset({env.chan, mirror_chan})
+        chat(env, "!relay mirror", voice=mirror_chan)
+        assert env.store.load().routing["mirrors"] == {str(mirror_chan): uid}
+        await wait_until(lambda: ("channel", mirror_chan) in outs[0].calls)
+        await wait_until(lambda: env.adapters[0].replies)
+        assert env.adapters[0].replies[0][2].startswith("✅")
         env.svc.request_shutdown()
         assert await task == 0
 

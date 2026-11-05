@@ -23,7 +23,7 @@ from discord.ext.native_voice.media import VideoConfig
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
-    ChatCommand, ParseError, RoutingContext, SetEnabled, SetPrejoin, Status, StatusDetails, describe_change,
+    ChatCommand, ParseError, RoutingContext, resolve_here, SetEnabled, SetPrejoin, Status, StatusDetails, describe_change,
     format_status, parse, plan_change,
 )
 from golive_relay.control.lock import InstanceLocks
@@ -433,13 +433,14 @@ class Service:
                 self._handle(PrejoinChanged(cmd.on))
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
             else:
-                new = plan_change(cmd, old, ctx)
+                resolved = resolve_here(cmd, old, ev.author_voice_channel_id)
+                new = resolved if isinstance(resolved, str) else plan_change(resolved, old, ctx)
                 if isinstance(new, str):
                     outcome, text = "rejected", new
                 else:
                     self.store.update(self._routing_write(old, new))
                     self._handle(RoutingChanged(new))
-                    outcome, text = "applied", describe_change(cmd, old, new, ctx)
+                    outcome, text = "applied", describe_change(resolved, old, new, ctx)
         except _RoutingMoved:
             outcome, text = "stale", "⚠️ state.json vừa thay đổi, thử lại lệnh."
         except (OSError, StateCorrupt) as exc:

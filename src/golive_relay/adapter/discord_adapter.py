@@ -199,7 +199,10 @@ class DiscordAdapter:
             return
         if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
             return
-        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids))
+        voice = getattr(getattr(member, "voice", None), "channel", None)
+        in_guild = voice is not None and getattr(getattr(voice, "guild", None), "id", None) == self.guild_id
+        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids,
+                               voice.id if in_guild else None))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id
