@@ -131,6 +131,14 @@ class MirrorParticipants:
 
 
 @dataclass(frozen=True, slots=True)
+class OutViewers:
+    """Users watching the account's own current Go Live, bot accounts excluded (sent when the list changes)."""
+
+    account: int
+    viewers: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
 class OutAuthRejected:
     account: int
 
@@ -142,7 +150,7 @@ class OutTick:
 
 PoolEvent = (
     SessionLive | SessionHold | SessionEnded | OutJoined | OutReady | OutFailed | OutHealth
-    | OutVoiceObserved | MirrorParticipants | OutAuthRejected | OutTick
+    | OutVoiceObserved | MirrorParticipants | OutViewers | OutAuthRejected | OutTick
 )
 
 

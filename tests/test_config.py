@@ -447,19 +447,27 @@ def test_two_mirrors_same_fixed_channel_rejected(tmp_path):
 
 def test_new_runtime_keys_defaults(tmp_path):
     rt = load_config(EXAMPLE).runtime
-    assert (rt.relay_autoscale, rt.relay_scale_down_seconds, rt.stream_viewer_cap) == (True, 120.0, 50)
+    assert (rt.relay_autoscale, rt.relay_idle_stop_seconds, rt.stream_viewer_cap) == (True, 30.0, 50)
     raw = _raw()
-    for k in ("relay_autoscale", "relay_scale_down_seconds", "stream_viewer_cap"):
+    for k in ("relay_autoscale", "relay_idle_stop_seconds", "stream_viewer_cap"):
         raw["runtime"].pop(k, None)
     rt = _load(tmp_path, raw).runtime
-    assert (rt.relay_autoscale, rt.relay_scale_down_seconds, rt.stream_viewer_cap) == (True, 120.0, 50)
-    raw["runtime"].update(relay_autoscale=False, relay_scale_down_seconds=5, stream_viewer_cap=1)
+    assert (rt.relay_autoscale, rt.relay_idle_stop_seconds, rt.stream_viewer_cap) == (True, 30.0, 50)
+    raw["runtime"].update(relay_autoscale=False, relay_idle_stop_seconds=5, stream_viewer_cap=1)
     rt = _load(tmp_path, raw).runtime
-    assert (rt.relay_autoscale, rt.relay_scale_down_seconds, rt.stream_viewer_cap) == (False, 5.0, 1)
-    for key, bad in (("relay_autoscale", "yes"), ("relay_scale_down_seconds", 0), ("stream_viewer_cap", 0)):
+    assert (rt.relay_autoscale, rt.relay_idle_stop_seconds, rt.stream_viewer_cap) == (False, 5.0, 1)
+    for key, bad in (("relay_autoscale", "yes"), ("relay_idle_stop_seconds", 0), ("stream_viewer_cap", 0)):
         raw = _raw()
         raw["runtime"][key] = bad
         assert any(f"runtime.{key}" in e for e in _errors(tmp_path, raw)), key
+
+
+def test_relay_scale_down_seconds_is_a_deprecated_no_op(tmp_path):
+    raw = _raw()
+    raw["runtime"]["relay_scale_down_seconds"] = 120
+    with pytest.warns(FutureWarning, match="relay_scale_down_seconds"):
+        rt = _load(tmp_path, raw).runtime
+    assert rt.relay_idle_stop_seconds == 30.0 and not hasattr(rt, "relay_scale_down_seconds")
 
 
 def test_example_defaults_debounce_100_prejoin_true():

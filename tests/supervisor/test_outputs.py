@@ -21,6 +21,7 @@ from golive_relay.supervisor.outputs_model import (
     OutTick,
     OutputAccount,
     MirrorParticipants,
+    OutViewers,
     OutVoiceObserved,
     SessionEnded,
     SessionHold,
@@ -35,7 +36,7 @@ MCH = 600
 MCH2 = 601
 
 
-def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_ids=()):
+def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_ids=(), idle=30.0):
     return OutputPool(
         [OutputAccount(i, f"c{i}", "mirror" if i in mirror_ids else "relay") for i in ids],
         persisted or {},
@@ -43,6 +44,7 @@ def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_
         rejection_limit=limit,
         routing=Routing(SRC, CH, mirrors or {}),
         excluded_viewer_ids=frozenset(excluded),
+        relay_idle_stop_s=idle,
     )
 
 
@@ -382,7 +384,7 @@ def test_only_first_n_relays_start():
     assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     assert p.handle(OutTick(), 2.0) == []
     assert p.handle(OutTick(), 10.0) == []
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 3, "short_by": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 3, "short_by": 0, "kept": 0}
 
 
 def test_raising_n_starts_next_relay_immediately():
@@ -396,13 +398,16 @@ def test_raising_n_starts_next_relay_immediately():
 def test_lowering_n_stops_last_relay_without_penalty():
     p = make((A, B), {B: AccountPersisted(None, None, 1)})
     t = bring_live(p, (A, B))
-    acts = p.set_relay_target(1, t + 1.0)
+    p.handle(OutViewers(A, frozenset({900})), t)
+    p.handle(OutViewers(B, frozenset()), t)
+    assert p.set_relay_target(1, t + 1.0) == []  # B has had no viewer for 1 s only
+    acts = p.handle(OutTick(), t + 30.0)
     assert acts == [OutCloseGate(B, "relay_scaled_down"), OutTeardown(B, 1, StopReason.RELAY_SCALED_DOWN)]
-    row = p.status(t + 1.0)[1]
+    row = p.status(t + 30.0)[1]
     assert row["state"] == "off" and row["backoff_in"] is None and row["consecutive_rejections"] == 1
     assert p.account_live(A, 1, 1)
     assert p.handle(OutTick(), t + 100.0) == []
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 2, "short_by": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 2, "short_by": 0, "kept": 0}
     # raising again restarts B in the same session
     assert p.set_relay_target(2, t + 101.0) == [OutStart(B, 1, 2, CH)]
 
@@ -416,9 +421,9 @@ def test_fatal_relay_replaced_by_next():
         OutCloseGate(A, "auth_rejected"), OutTeardown(A, 1, StopReason.AUTH_REJECTED),
         OutSetFatal(A, FatalReason.AUTH_REJECTED, ""), OutStart(C, 1, 1, CH),
     ]
-    assert p.relay_summary() == {"wanted": 2, "running": 2, "available": 2, "short_by": 0}
+    assert p.relay_summary() == {"wanted": 2, "running": 2, "available": 2, "short_by": 0, "kept": 0}
     p.handle(OutAuthRejected(B), t + 10.0)
-    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1}
+    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0}
 
 
 def test_quarantined_relay_replaced_by_next():
@@ -435,9 +440,9 @@ def test_relay_failed_for_session_replaced_by_next():
     assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
     p.handle(OutFailed(A, 1, 1, StopReason.CONFIG_INVALID, False), 0.5)
     assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, 1, CH)]  # after the start stagger
-    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 1, "short_by": 0}
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 1, "short_by": 0, "kept": 0}
     p.set_relay_target(2, 1.0)
-    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1}
+    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1, "kept": 0}
     # next session A gets a fresh chance
     p.handle(SessionEnded(1, StopReason.SHUTDOWN, False), 2.0)
     assert p.handle(SessionLive(2, 2, 7), 10.0) == [OutStart(A, 2, 2, CH)]
@@ -493,3 +498,79 @@ def test_excluded_viewer_blocks_relays_via_session():
     assert p.set_relay_target(2, t + 2.0) == []
     assert p.set_relay_target(1, t + 3.0) == []
     assert p.handle(OutTick(), t + 50.0) == []
+
+
+def test_surplus_relay_with_viewers_stays_and_zero_viewer_one_stops_instead():
+    p = make((A, B))
+    t = bring_live(p, (A, B))
+    p.handle(OutViewers(A, frozenset()), t)
+    p.handle(OutViewers(B, frozenset({900})), t)
+    assert p.set_relay_target(1, t + 1.0) == []
+    assert p.status(t + 1.0)[0]["stop_in"] == 29.0 and p.status(t + 1.0)[1]["stop_in"] is None
+    assert p.handle(OutTick(), t + 29.0) == []
+    # A has had no viewer for 30 s: it stops although it comes first in config order
+    assert p.handle(OutTick(), t + 30.0) == [
+        OutCloseGate(A, "relay_scaled_down"), OutTeardown(A, 1, StopReason.RELAY_SCALED_DOWN)]
+    assert p.handle(OutTick(), t + 1000.0) == []
+    assert p.account_live(B, 1, 1)
+
+
+def test_surplus_relay_kept_while_watched_and_stopped_after_idle():
+    p = make((A, B))
+    t = bring_live(p, (A, B))
+    p.handle(OutViewers(A, frozenset({900})), t)
+    p.handle(OutViewers(B, frozenset({901})), t)
+    assert p.set_relay_target(1, t + 1.0) == []
+    assert p.relay_summary()["kept"] == 1
+    assert p.handle(OutTick(), t + 500.0) == []
+    p.handle(OutViewers(B, frozenset()), t + 500.0)
+    assert p.relay_summary()["kept"] == 0
+    p.handle(OutViewers(B, frozenset({901})), t + 520.0)  # someone came back: the idle timer restarts
+    p.handle(OutViewers(B, frozenset()), t + 525.0)
+    assert p.handle(OutTick(), t + 554.0) == []
+    assert p.status(t + 554.0)[1]["viewers"] == 0
+    assert p.handle(OutTick(), t + 555.0) == [
+        OutCloseGate(B, "relay_scaled_down"), OutTeardown(B, 1, StopReason.RELAY_SCALED_DOWN)]
+    assert p.status(t + 555.0)[1]["viewers"] is None
+
+
+def test_target_watching_a_relay_is_not_a_viewer():
+    p = make((A, B))
+    t = bring_live(p, (A, B))
+    p.handle(OutViewers(A, frozenset({900})), t)
+    p.handle(OutViewers(B, frozenset({SRC})), t)
+    assert p.status(t)[1]["viewers"] == 0
+    p.set_relay_target(1, t)
+    assert kinds(p.handle(OutTick(), t + 30.0)) == [OutCloseGate, OutTeardown]
+
+
+def test_unknown_viewers_count_as_watched_for_four_idle_periods():
+    p = make((A, B))
+    t = bring_live(p, (A, B))  # B went live at t and never reports viewers
+    p.handle(OutViewers(A, frozenset({900})), t)
+    assert p.status(t)[1]["viewers"] is None
+    assert p.set_relay_target(1, t + 1.0) == []
+    assert p.handle(OutTick(), t + 119.0) == []
+    assert p.handle(OutTick(), t + 120.0) == [
+        OutCloseGate(B, "relay_scaled_down"), OutTeardown(B, 1, StopReason.RELAY_SCALED_DOWN)]
+
+
+def test_starting_relay_is_not_cut_and_queued_one_is_dropped():
+    p = make((A, B))
+    p.set_relay_target(2, 0.0)
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]  # B waits for the stagger
+    assert p.set_relay_target(0, 0.5) == []
+    assert p.handle(OutTick(), 3.0) == []  # B never starts
+    assert p.status(3.0)[0]["state"] == "joining"
+
+
+def test_kept_relay_counts_toward_a_higher_target():
+    p = make((A, B, C))
+    p.set_relay_target(2, 0.0)
+    t = bring_live(p, (A, B))
+    p.handle(OutViewers(A, frozenset({900})), t)
+    p.handle(OutViewers(B, frozenset({901})), t)
+    assert p.set_relay_target(1, t + 1.0) == []
+    assert p.set_relay_target(2, t + 2.0) == []  # B already runs
+    assert p.relay_summary()["kept"] == 0
+    assert p.set_relay_target(3, t + 3.0) == [OutStart(C, 1, 1, CH)]

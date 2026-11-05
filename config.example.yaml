@@ -56,7 +56,7 @@ runtime:
   recording_enabled: false
   prejoin_voice: true         # the ingest joins the main channel while the target is there, before it streams
   relay_autoscale: true       # start relay_accounts only when the main channel needs them; false = all relays always publish
-  relay_scale_down_seconds: 120   # stop the last relay only after this long below its threshold
+  relay_idle_stop_seconds: 30    # an extra relay stops only after its Go Live had no viewer this long
   stream_viewer_cap: 50       # viewers one Go Live can hold
 
 liveness:

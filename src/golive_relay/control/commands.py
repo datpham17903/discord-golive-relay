@@ -131,7 +131,7 @@ class StatusDetails:
     relay_running: int
     relay_available: int
     relay_short_by: int
-    scale_down_in_s: float | None
+    relay_kept: int  # extra relays still running because their Go Live has viewers
     prejoin: bool
     autoscale: bool
     debounce_ms: int
@@ -139,7 +139,8 @@ class StatusDetails:
     output_size: str
     last_watch_ms: float | None
     audio_ok: bool
-    accounts: tuple[tuple[int, str, int | None, str, float | None], ...]  # (uid, role, channel_id, state, uptime_s)
+    # (uid, role, channel_id, state, uptime_s, viewers or None when unknown, seconds until an idle extra relay stops)
+    accounts: tuple[tuple[int, str, int | None, str, float | None, int | None, float | None], ...]
     public_commands: tuple[str, ...] = ()
     command_cooldown_s: int = 0
     change_cooldown_s: int = 0
@@ -310,7 +311,7 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
         return "✅ **Đã tắt pre-join**: relay chỉ vào voice khi target bắt đầu stream."
     if isinstance(cmd, SetAutoscale):
         if cmd.on:
-            return "✅ **Đã bật autoscale**: số relay chạy theo số người xem; relay thừa dừng sau thời gian chờ giảm."
+            return "✅ **Đã bật autoscale**: số relay chạy theo số người xem; relay thừa chỉ dừng khi không còn ai xem."
         return "✅ **Đã tắt autoscale**: mọi tài khoản relay đều phát."
     if isinstance(cmd, SetTarget):
         return (
@@ -340,8 +341,8 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
     relay = f"• Relay (cần/đang chạy/có sẵn): {d.relay_wanted}/{d.relay_running}/{d.relay_available}"
     if d.relay_short_by > 0:
         relay += f" ⚠️ **thiếu {d.relay_short_by} tài khoản**"
-    if d.scale_down_in_s is not None:
-        relay += f", giảm sau {math.ceil(d.scale_down_in_s)}s"
+    if d.relay_kept > 0:
+        relay += f", giữ thêm {d.relay_kept} relay còn người xem"
     lines = [
         "📡 **Trạng thái relay**",
         f"• Phiên: **{d.session_state}**, chạy {_dur(d.session_uptime_s)}",
@@ -349,17 +350,22 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
         f"• Kênh chính: {_ch(routing.channel_id)}, {d.viewers} người",
         relay,
     ]
-    rows = {uid: (state, up) for uid, _, _, state, up in d.accounts}
-    for uid, role, _, state, up in d.accounts:
+    rows = {uid: (state, up) for uid, _, _, state, up, _, _ in d.accounts}
+    for uid, role, _, state, up, viewers, stop_in in d.accounts:
         if role == "relay":
-            lines.append(f"  - relay {_user(ctx, uid)}: {state}, {_dur(up)}")
+            line = f"  - relay {_user(ctx, uid)}: {state}, {_dur(up)}"
+            if state == "live":
+                line += f", {'?' if viewers is None else viewers} người xem"
+            if stop_in is not None:
+                line += f", tắt sau {math.ceil(stop_in)}s nếu không ai xem"
+            lines.append(line)
     if routing.mirrors:
         for ch, acct in routing.mirrors.items():
             state, up = rows.get(acct, ("không rõ", None))
             lines.append(f"• Mirror {_ch(ch)} ← {_user(ctx, acct)}: {state}, {_dur(up)}")
     else:
         lines.append("• Mirror: chưa có mirror")
-    free = [_user(ctx, uid) for uid, role, ch, _, _ in d.accounts if role == "mirror" and ch is None]
+    free = [_user(ctx, uid) for uid, role, ch, *_ in d.accounts if role == "mirror" and ch is None]
     lines.append(f"• Tài khoản mirror rảnh: {', '.join(free) if free else 'không có'}")
     lines.append(
         f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, autoscale {'bật' if d.autoscale else 'tắt'}, debounce {d.debounce_ms}ms, "

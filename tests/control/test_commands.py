@@ -291,7 +291,7 @@ def _details(**over):
         relay_running=1,
         relay_available=2,
         relay_short_by=0,
-        scale_down_in_s=None,
+        relay_kept=0,
         prejoin=True,
         autoscale=True,
         debounce_ms=100,
@@ -300,10 +300,10 @@ def _details(**over):
         last_watch_ms=412.0,
         audio_ok=True,
         accounts=(
-            (R1, "relay", 100, "live", 65.0),
-            (32, "relay", 100, "off", None),
-            (O1, "mirror", 200, "ready", 12.0),
-            (O2, "mirror", None, "off", None),
+            (R1, "relay", 100, "live", 65.0, 3, None),
+            (32, "relay", 100, "off", None, None, None),
+            (O1, "mirror", 200, "ready", 12.0, None, None),
+            (O2, "mirror", None, "off", None, None, None),
         ),
     )
     kw.update(over)
@@ -328,13 +328,25 @@ def test_status_details_layout():
 
 
 def test_status_shows_shortage_warning():
-    d = _details(relay_wanted=3, relay_running=2, relay_available=2, relay_short_by=1, scale_down_in_s=None)
+    d = _details(relay_wanted=3, relay_running=2, relay_available=2, relay_short_by=1)
     s = format_status(routing(), ctx(), d)
     relay_line = s.splitlines()[4]
     assert "⚠️" in relay_line and "thiếu 1" in relay_line
-    s = format_status(routing(), ctx(), _details(scale_down_in_s=42.4, last_watch_ms=None, audio_ok=False))
-    assert "giảm sau 43s"  # rounded up in s.splitlines()[4]
+    s = format_status(routing(), ctx(), _details(relay_kept=1, last_watch_ms=None, audio_ok=False))
+    assert "giữ thêm 1 relay còn người xem" in s.splitlines()[4]
     assert "⚠️" not in s.splitlines()[4]
+
+
+def test_status_relay_lines_show_viewers_and_idle_stop():
+    d = _details(relay_wanted=0, relay_running=2, accounts=(
+        (R1, "relay", 100, "live", 65.0, 0, 12.2),
+        (32, "relay", 100, "live", 5.0, None, None),
+    ))
+    lines = format_status(routing(), ctx(), d).splitlines()
+    r1 = next(x for x in lines if "relay 31" in x)
+    r2 = next(x for x in lines if "relay 32" in x)
+    assert "0 người xem" in r1 and "tắt sau 13s nếu không ai xem" in r1
+    assert "? người xem" in r2 and "tắt sau" not in r2
 
 
 def test_parse_bare_mirror_forms():

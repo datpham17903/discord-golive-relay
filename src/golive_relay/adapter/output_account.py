@@ -16,7 +16,7 @@ from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
 from golive_relay.supervisor.outputs_model import (
-    MirrorParticipants, OutAuthRejected, OutHealth, OutJoined, OutReady, OutVoiceObserved, PoolEvent,
+    MirrorParticipants, OutAuthRejected, OutHealth, OutJoined, OutReady, OutViewers, OutVoiceObserved, PoolEvent,
 )
 
 CONNECT_TIMEOUT_S = 15
@@ -42,11 +42,14 @@ class OutputAccountAdapter:
         codec_mode: str = "auto_decode",
         excluded_viewer_ids: frozenset[int] = frozenset(),
         audio_bitrate_kbps: int = 64,
+        bot_user_ids: frozenset[int] = frozenset(),
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
         self.channel_id = channel_id
         self._excluded = excluded_viewer_ids
+        self._bots = bot_user_ids | {user_id}  # never counted as viewers of this account's Go Live
+        self._viewers: frozenset[int] | None = None  # last reported; None while not live
         self._events = events
         self.log = log
         decodable = codecs.probe_decoders() if decodable is None else decodable
@@ -66,6 +69,8 @@ class OutputAccountAdapter:
         """Log in and wait for READY. ``LoginFailure`` -> OutAuthRejected (nothing is left running)."""
         self._client = self._client_factory()
         self._client.on_voice_state_update = self._on_member_voice
+        self._client.on_stream_create = self._on_stream_create
+        self._client.on_stream_update = self._on_stream_update
         self._gateway_task = asyncio.create_task(self._client.start(token))
         ready = asyncio.create_task(self._client.wait_until_ready())
         try:
@@ -103,6 +108,21 @@ class OutputAccountAdapter:
     async def _on_member_voice(self, member: Any, before: Any, after: Any) -> None:
         if self.channel_id in (getattr(before.channel, "id", None), getattr(after.channel, "id", None)):
             self._emit_participants()
+
+    async def _on_stream_create(self, stream: Any) -> None:
+        self._own_stream(stream)
+
+    async def _on_stream_update(self, old: Any, new: Any) -> None:
+        self._own_stream(new)
+
+    def _own_stream(self, stream: Any) -> None:
+        """Report who watches this account's own Go Live in its channel, once per change."""
+        if self._vc is None or stream.owner_id != self.user_id or stream.channel_id != self.channel_id:
+            return
+        viewers = frozenset(stream.viewer_ids) - self._bots
+        if viewers != self._viewers:
+            self._viewers = viewers
+            self._events(OutViewers(self.user_id, viewers))
 
     def _emit_participants(self) -> None:
         guild = self._client.get_guild(self.guild_id)
@@ -150,6 +170,7 @@ class OutputAccountAdapter:
         out, self._out = self._out, None
         vc, self._vc = self._vc, None
         health, self._health_task = self._health_task, None
+        self._viewers = None
         if health is not None:
             health.cancel()
         try:

@@ -42,7 +42,7 @@ from golive_relay.supervisor.outputs_model import (
 from golive_relay.supervisor.retry import RetryPolicy
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
 from golive_relay.supervisor.routing import Routing
-from golive_relay.supervisor.scaling import RelayScaler, relays_needed
+from golive_relay.supervisor.scaling import relays_needed
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
     FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
@@ -172,8 +172,8 @@ class Service:
             rejection_limit=r.repeated_rejection_limit,
             routing=self.sup.routing,
             excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
+            relay_idle_stop_s=r.relay_idle_stop_seconds,
         )
-        self._scaler = RelayScaler(r.relay_scale_down_seconds)
         # chat override persisted in state.json; config is only the default
         self._autoscale = r.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
         if self._autoscale:
@@ -321,7 +321,7 @@ class Service:
             now = time.monotonic()
             self._handle(Tick())
             self._pool_event(OutTick())
-            self._scale_relays(now)  # a scale-down is due even when no event arrives
+            self._scale_relays(now)  # OutTick above stops extra relays whose Go Live stayed without viewers
             if now >= next_poll:
                 self._poll_state()
                 next_poll = now + STATE_POLL_S
@@ -1134,12 +1134,11 @@ class Service:
         return len((self.sup.participants or frozenset()) - bots)
 
     def _set_autoscale(self, on: bool) -> None:
-        """Off: every relay account may run. On: the scaler starts from the relays running now, so extra ones
-        stop only after the normal scale-down delay."""
+        """Off: every relay account may run. On: the target follows the viewers; extra running relays stop
+        only once their Go Live has no viewer (see OutputPool.set_relay_target)."""
         now = time.monotonic()
         self._autoscale = on
         if on:
-            self._scaler.hold(self.pool.relay_summary()["running"])
             self._scale_relays(now)
         else:
             for a in self.pool.set_relay_target(len(self.cfg.discord.relay_accounts), now):
@@ -1149,8 +1148,7 @@ class Service:
         r = self.cfg.runtime
         if not self._autoscale:
             return  # the pool keeps its target: every relay account
-        needed = relays_needed(self._viewers(), r.stream_viewer_cap, self.cfg.discord.ingest_publishes)
-        want = self._scaler.update(needed, now)
+        want = relays_needed(self._viewers(), r.stream_viewer_cap, self.cfg.discord.ingest_publishes)
         if want != self.pool.relay_summary()["wanted"]:
             for a in self.pool.set_relay_target(want, now):
                 self._pool_action(a)
@@ -1163,7 +1161,8 @@ class Service:
         for row in self.pool.status(now):
             uid, state = row["account"], row["state"]
             since = self._out_since.get(uid) if state == OutputState.LIVE.value else None
-            accounts.append((uid, roles[uid], self.pool.channel_of(uid), state, None if since is None else now - since))
+            accounts.append((uid, roles[uid], self.pool.channel_of(uid), state, None if since is None else now - since,
+                             row["viewers"], row["stop_in"]))
         return StatusDetails(
             session_state=self.sup.state.value,
             session_uptime_s=None if self._session_since is None else now - self._session_since,
@@ -1172,7 +1171,7 @@ class Service:
             relay_running=relay["running"],
             relay_available=relay["available"],
             relay_short_by=relay["short_by"],
-            scale_down_in_s=self._scaler.scale_down_in(now) if self._autoscale else None,
+            relay_kept=relay["kept"],
             prejoin=self.sup.prejoin_voice,
             autoscale=self._autoscale,
             debounce_ms=self.cfg.runtime.start_debounce_ms,
@@ -1266,7 +1265,8 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
                 network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs,
                 excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
-                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps),
+                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps,
+                bot_user_ids=frozenset({d.expected_relay_user_id, *(a.user_id for a in accounts)})),
             output_tokens=out_tokens,
         )
         return await svc.run(token)

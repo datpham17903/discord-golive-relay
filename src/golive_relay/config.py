@@ -106,7 +106,7 @@ class RuntimeConfig:
     recording_enabled: bool
     prejoin_voice: bool = True
     relay_autoscale: bool = True
-    relay_scale_down_seconds: float = 120.0
+    relay_idle_stop_seconds: float = 30.0
     stream_viewer_cap: int = 50
 
 
@@ -507,9 +507,15 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         recording_enabled=r.only_false("recording_enabled"),
         prejoin_voice=r.opt_bool("prejoin_voice", default=True),
         relay_autoscale=r.opt_bool("relay_autoscale", default=True),
-        relay_scale_down_seconds=(r.num("relay_scale_down_seconds") or 120.0) if "relay_scale_down_seconds" in r.data else 120.0,
+        relay_idle_stop_seconds=(r.num("relay_idle_stop_seconds") or 30.0) if "relay_idle_stop_seconds" in r.data else 30.0,
         stream_viewer_cap=r.int_("stream_viewer_cap") if "stream_viewer_cap" in r.data else 50,
     )
+    if "relay_scale_down_seconds" in r.data:
+        r._get("relay_scale_down_seconds")
+        warnings.warn(
+            "runtime.relay_scale_down_seconds is deprecated and ignored; extra relays stop after "
+            "runtime.relay_idle_stop_seconds without viewers", FutureWarning, stacklevel=2,
+        )
     if runtime.keyframe_interval_seconds > 2.0:  # num() already rejects values <= 0
         r._err("keyframe_interval_seconds", "must be > 0 and <= 2.0")
     r.finish()

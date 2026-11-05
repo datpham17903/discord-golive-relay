@@ -1473,25 +1473,30 @@ def test_participants_drive_relay_count(tmp_path, slate, source_gop):
     asyncio.run(main())
 
 
-def test_scale_down_happens_on_tick_after_delay(tmp_path, slate, source_gop):
+def test_extra_relay_stays_while_watched_then_stops_and_leaves(tmp_path, slate, source_gop):
     from golive_relay.supervisor.model import ParticipantsChanged
-    from golive_relay.supervisor.outputs_model import OutputAccount
+    from golive_relay.supervisor.outputs_model import OutputAccount, OutViewers
 
     r1 = 424242
     outs: list = []
     env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1")], outs,
-                    stream_viewer_cap=1, relay_scale_down_seconds=0.4)
+                    stream_viewer_cap=1, relay_idle_stop_seconds=0.4)
 
     async def main():
         task = await reach_relaying(env)
         env.adapters[0].events(ParticipantsChanged(frozenset({env.target, *VIEWERS[:2]})))
         await wait_until(lambda: env.svc.pool.account_live(r1, env.svc._gen, env.svc._epoch))
+        out = next(o for o in outs if o.acct.user_id == r1)
+        out.events(OutViewers(r1, frozenset({VIEWERS[0], env.target})))
         env.adapters[0].events(ParticipantsChanged(frozenset({env.target})))  # last event: only ticks follow
-        assert env.svc.pool.relay_summary()["wanted"] == 1  # not lowered at once
-        assert env.svc.status_dict()["details"]["scale_down_in_s"] is not None
-        await asyncio.sleep(0.2)
-        assert env.svc.pool.relay_summary()["wanted"] == 1
-        await wait_until(lambda: env.svc.pool.relay_summary()["wanted"] == 0)
+        assert env.svc.pool.relay_summary()["wanted"] == 0  # lowered at once
+        st = env.svc.status_dict()
+        assert st["details"]["relay_kept"] == 1
+        assert next(r for r in st["accounts"] if r["account"] == r1)["viewers"] == 1  # the target is not counted
+        await asyncio.sleep(0.8)  # well past the idle time: someone still watches
+        assert env.svc.pool.account_live(r1, env.svc._gen, env.svc._epoch) and "out_end" not in env.order
+        out.events(OutViewers(r1, frozenset()))
+        assert env.svc.status_dict()["details"]["relay_kept"] == 0
         await wait_until(lambda: "out_end" in env.order)
         assert env.svc.pool.relay_summary()["running"] == 0
         assert env.svc.sup.state is RelayState.RELAYING  # the main session keeps running
@@ -1507,7 +1512,7 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
     r1, r2 = 424242, 424243
     outs: list = []
     env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1"), OutputAccount(r2, "t2")], outs,
-                    stream_viewer_cap=1, relay_scale_down_seconds=0.4)
+                    stream_viewer_cap=1, relay_idle_stop_seconds=1.0)  # > start stagger / 4
 
     async def main():
         task = await reach_relaying(env)
@@ -1523,9 +1528,9 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
         chat(env, "!relay status", 3)
         chat(env, "!relay autoscale on", 4)
         assert env.store.load().relay_autoscale is True
-        assert env.svc.pool.relay_summary()["wanted"] == 2  # no instant mass stop: the scale-down delay applies
-        assert env.svc.status_dict()["details"]["scale_down_in_s"] is not None
-        await wait_until(lambda: env.svc.pool.relay_summary()["wanted"] == 0)
+        assert env.svc.pool.relay_summary()["wanted"] == 0
+        # no instant mass stop: without viewer data both stay for four idle periods after going live
+        assert env.svc.pool.relay_summary()["running"] == 2
         await wait_until(lambda: env.svc.pool.relay_summary()["running"] == 0)
         assert env.svc.sup.state is RelayState.RELAYING
         await wait_until(lambda: len(a.replies) == 3)
@@ -1537,13 +1542,16 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
     asyncio.run(main())
 
 
-def test_repeated_autoscale_on_keeps_the_scale_down_countdown(tmp_path, slate, source_gop):
+def test_repeated_autoscale_on_keeps_the_idle_stop_countdown(tmp_path, slate, source_gop):
     from golive_relay.supervisor.outputs_model import OutputAccount
 
     r1, r2 = 424242, 424243
     outs: list = []
     env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1"), OutputAccount(r2, "t2")], outs,
-                    stream_viewer_cap=1, relay_scale_down_seconds=1.5)
+                    stream_viewer_cap=1, relay_idle_stop_seconds=1.5)
+
+    def stop_in():
+        return min(r[6] for r in env.svc.status_dict()["details"]["accounts"] if r[6] is not None)
 
     async def main():
         task = await reach_relaying(env)
@@ -1551,12 +1559,10 @@ def test_repeated_autoscale_on_keeps_the_scale_down_countdown(tmp_path, slate, s
         chat(env, "!relay autoscale off", 1)
         await wait_until(lambda: _published(outs, r1) and _published(outs, r2))
         chat(env, "!relay autoscale on", 2)
-        first = env.svc.status_dict()["details"]["scale_down_in_s"]
-        assert first is not None
+        first = stop_in()
         await asyncio.sleep(0.3)
         chat(env, "!relay autoscale on", 3)
-        second = env.svc.status_dict()["details"]["scale_down_in_s"]
-        assert second is not None and second < first - 0.2
+        assert stop_in() < first - 0.2
         env.svc.request_shutdown()
         assert await task == 0
 
@@ -1637,7 +1643,7 @@ def test_status_details_from_service(tmp_path, slate, source_gop):
         assert d["session_state"] == "relaying" and d["session_uptime_s"] is not None
         assert d["viewers"] == 2
         assert (d["relay_wanted"], d["relay_running"], d["relay_available"], d["relay_short_by"]) == (1, 1, 2, 0)
-        assert d["scale_down_in_s"] is None
+        assert d["relay_kept"] == 0
         assert d["prejoin"] is env.svc.sup.prejoin_voice and d["debounce_ms"] == 0
         w, h, fps = env.cfg.profile_key()
         assert d["output_size"] == f"{w}x{h}@{fps}" and d["video_mode"] == env.cfg.codecs.video_mode
@@ -1651,6 +1657,7 @@ def test_status_details_from_service(tmp_path, slate, source_gop):
         assert env.svc.status_dict()["details"]["last_watch_ms"] == d["last_watch_ms"]
         rows = {row[0]: row for row in d["accounts"]}
         assert rows[r1][1:4] == ("relay", env.chan, "live") and rows[r1][4] is not None
+        assert rows[r1][5:] == (None, None)  # no viewer data yet, not an extra relay
         assert rows[r2][1:4] == ("relay", env.chan, "off") and rows[r2][4] is None
         assert rows[m1][1:4] == ("mirror", mirror_chan, "live")
         chat(env, "!relay status")

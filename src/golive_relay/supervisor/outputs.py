@@ -30,6 +30,7 @@ from golive_relay.supervisor.outputs_model import (
     OutTick,
     OutputAccount,
     OutputState,
+    OutViewers,
     OutVoiceObserved,
     PoolAction,
     PoolEvent,
@@ -68,6 +69,9 @@ class _Acct:
     streamed_inc: int | None = None
     queued: bool = False
     blocked: bool = False  # an excluded viewer is in this mirror channel
+    live_at: float | None = None  # Go Live created (READY) in the current run
+    viewers: frozenset[int] | None = None  # watchers of the current Go Live; None until the client reports them
+    zero_since: float | None = None  # viewers became empty
     detector: OwnershipDetector = field(default_factory=OwnershipDetector)
 
 
@@ -82,8 +86,10 @@ class OutputPool:
         rejection_limit: int = 3,
         routing: Routing,
         excluded_viewer_ids: frozenset[int] = frozenset(),
+        relay_idle_stop_s: float = 30.0,
     ) -> None:
         self._stagger = stagger_s
+        self._idle_stop = relay_idle_stop_s
         self._limit = rejection_limit
         self._routing = routing
         self._excluded = excluded_viewer_ids
@@ -130,26 +136,31 @@ class OutputPool:
             rec.blocked = False
             if self._active(rec):
                 self._stop(rec, "routing_changed", StopReason.ROUTING_CHANGED, out)
-            if self._restartable(rec) and self._allowed(rec):
+            if self._restartable(rec) and self._allowed(rec, now):
                 self._enqueue(rec)
         self._pump(now, out)
         return out
 
     def set_relay_target(self, n: int, now: float) -> list[PoolAction]:
-        """Only the first ``n`` usable relay accounts may run; extra ones stop cleanly (no backoff, no rejection)."""
+        """``n`` usable relay accounts should run. More start at once; an extra running relay stops cleanly
+        (no backoff, no rejection) only once its Go Live has had no viewer for ``relay_idle_stop_s``."""
         out: list[PoolAction] = []
         self._relay_target = max(0, n)
-        self._reconcile_relays(out)
+        self._reconcile_relays(now, out)
         self._pump(now, out)
         return out
 
     def relay_summary(self) -> dict:
         available = sum(1 for uid in self._relays if self._relay_candidate(self._accts[uid]))
+        running = sum(1 for uid in self._relays if self._active(self._accts[uid]))
+        waiting = sum(1 for uid, _ in self._surplus_stops() if self._active(self._accts[uid]))
         return {
             "wanted": self._relay_target,
-            "running": sum(1 for uid in self._relays if self._active(self._accts[uid])),
+            "running": running,
             "available": available,
             "short_by": max(0, self._relay_target - available),
+            # extra relays that stay because they have (or may still have) viewers
+            "kept": max(0, running - self._relay_target) - waiting,
         }
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
@@ -166,6 +177,7 @@ class OutputPool:
         )
 
     def status(self, now: float) -> list[dict]:
+        stops = dict(self._surplus_stops())
         return [
             {
                 "account": r.account.user_id,
@@ -175,6 +187,8 @@ class OutputPool:
                 "fatal": r.fatal.value if r.fatal else None,
                 "quarantine_incarnation": r.quarantine_inc,
                 "consecutive_rejections": r.rejections,
+                "viewers": None if r.viewers is None else len(r.viewers),
+                "stop_in": None if r.account.user_id not in stops else max(0.0, stops[r.account.user_id] - now),
             }
             for r in self._accts.values()
         ]
@@ -184,7 +198,7 @@ class OutputPool:
     def handle(self, event: PoolEvent, now: float) -> list[PoolAction]:
         out: list[PoolAction] = []
         if isinstance(event, SessionLive):
-            self._on_live(event, out)
+            self._on_live(event, now, out)
         elif isinstance(event, SessionHold):
             self._on_hold(event, out)
         elif isinstance(event, SessionEnded):
@@ -211,6 +225,8 @@ class OutputPool:
             self._on_voice(event, now, out)
         elif isinstance(event, MirrorParticipants):
             self._on_participants(event, out)
+        elif isinstance(event, OutViewers):
+            self._on_viewers(event, now)
         elif isinstance(event, OutAuthRejected):
             rec = self._accts.get(event.account)
             if rec is not None:
@@ -219,7 +235,7 @@ class OutputPool:
                 self._fatal(rec, FatalReason.AUTH_REJECTED, "", out)
         elif isinstance(event, OutTick):
             pass
-        self._reconcile_relays(out)
+        self._reconcile_relays(now, out)
         self._pump(now, out)
         return out
 
@@ -242,6 +258,7 @@ class OutputPool:
         rec.detector.disarm()
         rec.generation = None
         rec.state = OutputState.OFF
+        rec.live_at = rec.viewers = rec.zero_since = None
 
     def _backoff(self, rec: _Acct, reason: StopReason, now: float, out: list[PoolAction]) -> None:
         self._stop(rec, reason.value, reason, out)
@@ -270,20 +287,48 @@ class OutputPool:
             and not (s is not None and rec.skip_generation == s.generation)
         )
 
-    def _wanted_relays(self) -> list[int]:
-        """Running (or queued) relays keep their slot over idle ones; config order breaks ties."""
-        cands = [uid for uid in self._relays if self._relay_candidate(self._accts[uid])]
-        cands.sort(key=lambda uid: not (self._active(self._accts[uid]) or self._accts[uid].queued))
-        return cands[: self._relay_target]
+    def _running_relays(self) -> list[int]:
+        return [uid for uid in self._relays if self._relay_candidate(self._accts[uid])
+                and (self._active(self._accts[uid]) or self._accts[uid].queued)]
 
-    def _allowed(self, rec: _Acct) -> bool:
-        """A mirror account runs only while assigned; a relay account only within the first n usable relays."""
+    def _stop_at(self, rec: _Acct) -> float | None:
+        """When an extra relay may stop; None while it has viewers, or may have them (still connecting, or no
+        viewer data yet within four idle periods of going live)."""
+        if not self._active(rec):
+            return float("-inf")  # only queued: nothing to cut
+        if rec.viewers is None:
+            return None if rec.live_at is None else rec.live_at + 4 * self._idle_stop
+        if rec.viewers or rec.zero_since is None:
+            return None
+        return rec.zero_since + self._idle_stop
+
+    def _surplus_stops(self) -> list[tuple[int, float]]:
+        """Extra relays chosen to stop, earliest first, with the time each may stop: only relays without viewers,
+        in any position (the last one first on a tie)."""
+        running = self._running_relays()
+        excess = len(running) - self._relay_target
+        if excess <= 0:
+            return []
+        picks = [(at, -i, uid) for i, uid in enumerate(running) if (at := self._stop_at(self._accts[uid])) is not None]
+        return [(uid, at) for at, _, uid in sorted(picks)[:excess]]
+
+    def _wanted_relays(self, now: float) -> list[int]:
+        """Running (or queued) relays keep their slot unless they are extra and due to stop; idle ones fill up
+        to the target in config order."""
+        running = self._running_relays()
+        due = {uid for uid, at in self._surplus_stops() if at <= now}
+        keep = [uid for uid in running if uid not in due]
+        idle = [uid for uid in self._relays if self._relay_candidate(self._accts[uid]) and uid not in running]
+        return keep + idle[: max(0, self._relay_target - len(keep))]
+
+    def _allowed(self, rec: _Acct, now: float) -> bool:
+        """A mirror account runs only while assigned; a relay account only within the wanted relays."""
         if self._is_mirror_role(rec):
             return self.channel_of(rec.account.user_id) is not None
-        return rec.account.user_id in self._wanted_relays()
+        return rec.account.user_id in self._wanted_relays(now)
 
-    def _reconcile_relays(self, out: list[PoolAction]) -> None:
-        wanted = set(self._wanted_relays())
+    def _reconcile_relays(self, now: float, out: list[PoolAction]) -> None:
+        wanted = set(self._wanted_relays(now))
         for uid in self._relays:
             rec = self._accts[uid]
             if uid in wanted:
@@ -297,7 +342,7 @@ class OutputPool:
             rec.queued = True
             self._queue.append(rec.account.user_id)
 
-    def _on_live(self, ev: SessionLive, out: list[PoolAction]) -> None:
+    def _on_live(self, ev: SessionLive, now: float, out: list[PoolAction]) -> None:
         prev = self._session
         self._session = _Session(ev.generation, ev.epoch, ev.incarnation)
         for rec in self._accts.values():
@@ -314,7 +359,7 @@ class OutputPool:
                 rec.quarantine_inc = None
                 rec.state = OutputState.OFF
                 out.append(OutSetQuarantine(uid, None))
-            if rec.state is OutputState.OFF and rec.skip_generation != ev.generation and self._allowed(rec):
+            if rec.state is OutputState.OFF and rec.skip_generation != ev.generation and self._allowed(rec, now):
                 self._enqueue(rec)
 
     def _on_hold(self, ev: SessionHold, out: list[PoolAction]) -> None:
@@ -360,6 +405,7 @@ class OutputPool:
             return
         rec.retry.reset()
         rec.state = OutputState.READY
+        rec.live_at = now
         rec.streamed_inc = rec.incarnation
         if s is not None and s.generation == rec.generation:
             rec.state = OutputState.LIVE
@@ -410,13 +456,24 @@ class OutputPool:
         elif self._restartable(rec):
             self._enqueue(rec)
 
+    def _on_viewers(self, ev: OutViewers, now: float) -> None:
+        rec = self._accts.get(ev.account)
+        if rec is None or not self._active(rec):
+            return
+        viewers = ev.viewers - {self._routing.target_user_id}
+        if viewers:
+            rec.zero_since = None
+        elif rec.viewers is None or rec.viewers:
+            rec.zero_since = now
+        rec.viewers = viewers
+
     def _pump(self, now: float, out: list[PoolAction]) -> None:
         s = self._session
         for rec in self._accts.values():
             if rec.state is OutputState.BACKOFF and rec.backoff_until is not None and now >= rec.backoff_until:
                 rec.backoff_until = None
                 rec.state = OutputState.OFF
-                if s is not None and self._allowed(rec):
+                if s is not None and self._allowed(rec, now):
                     self._enqueue(rec)
         if s is None:
             for uid in self._queue:
@@ -426,7 +483,7 @@ class OutputPool:
         while self._queue and now >= self._next_start:
             rec = self._accts[self._queue.pop(0)]
             rec.queued = False
-            if rec.state is not OutputState.OFF or rec.blocked or not self._allowed(rec):
+            if rec.state is not OutputState.OFF or rec.blocked or not self._allowed(rec, now):
                 continue
             rec.state = OutputState.JOINING
             rec.generation = s.generation
