@@ -1183,6 +1183,9 @@ class Service:
             public_commands=tuple(n for n in COMMAND_NAMES if n in self.cfg.control.public_commands),
             command_cooldown_s=self.cfg.control.command_cooldown_seconds,
             change_cooldown_s=self.cfg.control.change_cooldown_seconds,
+            viewer_cap=self.cfg.runtime.stream_viewer_cap,
+            ingest_publishes=self.cfg.discord.ingest_publishes,
+            fatal_reason=None if self.sup.fatal is None else self.sup.fatal.value,
         )
 
     def _write_status(self) -> None:

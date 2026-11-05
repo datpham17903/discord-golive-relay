@@ -144,6 +144,9 @@ class StatusDetails:
     public_commands: tuple[str, ...] = ()
     command_cooldown_s: int = 0
     change_cooldown_s: int = 0
+    viewer_cap: int = 50  # viewers one Go Live carries
+    ingest_publishes: bool = False
+    fatal_reason: str | None = None
 
 
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
@@ -330,53 +333,159 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
 
 
 def _dur(s: float | None) -> str:
-    if s is None:
-        return "-"
-    t = int(s)
-    h, m, sec = t // 3600, t // 60 % 60, t % 60
-    return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s" if m else f"{sec}s"
+    t = int(s or 0)
+    h, m = t // 3600, t // 60 % 60
+    if h:
+        return f"{h} giờ {m} phút" if m else f"{h} giờ"
+    return f"{m} phút" if m else f"{t} giây"
+
+
+_SESSION_LABEL = {
+    "relaying": "🟢 Đang phát",
+    "connecting": "🟡 Đang kết nối",
+    "joining": "🟡 Đang kết nối",
+    "hold": "🟠 Tạm giữ",
+    "backoff": "🟠 Đang thử lại",
+    "stopping": "🟠 Đang dừng",
+    "idle": "🔵 Chờ Target phát",
+    "disabled": "⚫ Đã tắt",
+    "fatal": "🔴 Lỗi",
+    "quarantine": "🔴 Lỗi",
+}
+_ACCOUNT_DOT = {"live": "🟢", "joining": "🟡", "ready": "🟡", "stopping": "🟡", "backoff": "🟠", "fatal": "🔴",
+                "quarantine": "🔴", "off": "⚫"}
+_ACCOUNT_TEXT = {"joining": "đang kết nối", "ready": "đang kết nối", "stopping": "đang dừng", "backoff": "đang thử lại",
+                 "fatal": "lỗi", "quarantine": "lỗi"}
+_BAR_CELLS = 10
+_MAX_LEN = 2000
+
+
+def _short(ctx: RoutingContext, uid: int) -> str:
+    """Sanitized display name (capped), or the short id when unknown."""
+    raw = _user(ctx, uid)
+    name = raw[: -len(f" ({uid})")] if raw != str(uid) else ""
+    if name:
+        return name[:32]
+    sid = str(uid)
+    return sid if len(sid) <= 8 else f"{sid[:4]}…{sid[-4:]}"
+
+
+def _capacity_bar(used: int, total: int) -> str:
+    filled = 0 if total <= 0 else min(_BAR_CELLS, max(0, used) * _BAR_CELLS // total)
+    return "▰" * filled + "▱" * (_BAR_CELLS - filled)
+
+
+def _footer(d: StatusDetails, with_public: bool) -> str:
+    parts = [
+        f"prejoin {'bật' if d.prejoin else 'tắt'}",
+        f"debounce {d.debounce_ms} ms",
+        f"autoscale {'bật' if d.autoscale else 'tắt'}",
+        f"{d.output_size.replace('x', '×', 1)} {d.video_mode}",
+    ]
+    if with_public:
+        parts.append(f"lệnh công khai: {', '.join(d.public_commands) or 'không có'}")
+        parts.append(f"cooldown {d.command_cooldown_s}s/{d.change_cooldown_s}s")
+    return "-# ⚙️ " + " · ".join(parts)
 
 
 def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routing_error: str | None = None) -> str:
-    relay = f"• Relay (cần/đang chạy/có sẵn): {d.relay_wanted}/{d.relay_running}/{d.relay_available}"
-    if d.relay_short_by > 0:
-        relay += f" ⚠️ **thiếu {d.relay_short_by} tài khoản**"
-    if d.relay_kept > 0:
-        relay += f", giữ thêm {d.relay_kept} relay còn người xem"
-    lines = [
-        "📡 **Trạng thái relay**",
-        f"• Phiên: **{d.session_state}**, chạy {_dur(d.session_uptime_s)}",
-        f"• Target: {_user(ctx, routing.target_user_id)}",
-        f"• Kênh chính: {_ch(routing.channel_id)}, {d.viewers} người",
-        relay,
-    ]
-    rows = {uid: (state, up) for uid, _, _, state, up, _, _ in d.accounts}
-    for uid, role, _, state, up, viewers, stop_in in d.accounts:
-        if role == "relay":
-            line = f"  - relay {_user(ctx, uid)}: {state}, {_dur(up)}"
-            if state == "live":
-                line += f", {'?' if viewers is None else viewers} người xem"
-            if stop_in is not None:
-                line += f", tắt sau {math.ceil(stop_in)}s nếu không ai xem"
-            lines.append(line)
-    if routing.mirrors:
-        for ch, acct in routing.mirrors.items():
-            state, up = rows.get(acct, ("không rõ", None))
-            lines.append(f"• Mirror {_ch(ch)} ← {_user(ctx, acct)}: {state}, {_dur(up)}")
-    else:
-        lines.append("• Mirror: chưa có mirror")
-    free = [_user(ctx, uid) for uid, role, ch, *_ in d.accounts if role == "mirror" and ch is None]
-    lines.append(f"• Tài khoản mirror rảnh: {', '.join(free) if free else 'không có'}")
-    lines.append(
-        f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, autoscale {'bật' if d.autoscale else 'tắt'}, debounce {d.debounce_ms}ms, "
-        f"video {d.video_mode}, {d.output_size}"
-    )
-    lines.append(
-        f"• Lệnh công khai: {', '.join(d.public_commands) or 'không có'}; "
-        f"cooldown {d.command_cooldown_s}s mỗi người, {d.change_cooldown_s}s giữa các thay đổi"
-    )
-    watch = "-" if d.last_watch_ms is None else f"{int(d.last_watch_ms)}ms"
-    lines.append(f"• Hiệu năng: watch gần nhất {watch}, audio {'có tín hiệu' if d.audio_ok else 'im lặng'}")
+    label = _SESSION_LABEL.get(d.session_state, f"⚪ {d.session_state}")
+    if d.session_state in ("fatal", "quarantine") and d.fatal_reason:
+        label += f" ({d.fatal_reason})"
+    head = [f"# 📡 Relay · {label}"]
+    sub = []
+    if d.session_uptime_s is not None:
+        sub.append(f"chạy {_dur(d.session_uptime_s)}")
+    if d.session_state == "relaying":
+        if d.last_watch_ms is not None:
+            sub.append(f"watch {int(d.last_watch_ms)} ms")
+        sub.append("🔊 audio OK" if d.audio_ok else "🔇 không có audio")
+    if sub:
+        head.append("-# " + " · ".join(sub))
     if routing_error is not None:
-        lines.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
-    return "\n".join(lines)
+        head.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
+
+    tid = routing.target_user_id
+    sid = str(tid)
+    if _user(ctx, tid) == sid:
+        who = f"`{sid}`"  # name unknown: full id
+    else:
+        who = f"**{_short(ctx, tid)}**" + (f" `{sid[:4]}…{sid[-4:]}`" if len(sid) > 8 else f" `{sid}`")
+    source = [
+        "### 🎯 Nguồn",
+        f"> {who}",
+        f"> Kênh chính {_ch(routing.channel_id)} · 👥 **{d.viewers}** người",
+    ]
+
+    relays = [a for a in d.accounts if a[1] == "relay"]
+    relay_title = ""
+    relay_head: list[str] = []
+    relay_lines: list[str] = []
+    if relays:
+        relay_title = f"### 📶 Relay · {d.relay_running}/{len(relays)} chạy" + ("" if d.autoscale else " · autoscale tắt")
+        total = (d.viewer_cap - 1) + (d.viewer_cap if d.ingest_publishes else 0) + d.viewer_cap * d.relay_running
+        relay_head.append(f"> {_capacity_bar(d.viewers, total)} sức chứa {d.viewers}/{total}")
+        if d.relay_short_by > 0:
+            relay_head.append(f"> ⚠️ thiếu {d.relay_short_by} relay")
+        # extra relays kept for their viewers: assume the least-watched stop-less live ones
+        watched = sorted((a for a in relays if a[3] == "live" and a[6] is None and a[5]), key=lambda a: a[5])
+        kept = {a[0] for a in watched[: d.relay_kept]}
+        for uid, _, _, state, _, viewers, stop_in in relays:
+            line = f"> {_ACCOUNT_DOT.get(state, '⚪')} **{_short(ctx, uid)}**"
+            if state == "live":
+                line += f" · 👁 {'?' if viewers is None else viewers}"
+            elif state == "off":
+                line += " · rảnh"
+            else:
+                line += f" · {_ACCOUNT_TEXT.get(state, state)}"
+            if uid in kept:
+                line += " · *giữ vì còn người xem*"
+            if stop_in is not None:
+                line += f" · *tắt sau {math.ceil(stop_in)}s nếu không ai xem*"
+            relay_lines.append(line)
+
+    rows = {a[0]: a for a in d.accounts}
+    mirror_lines: list[str] = []
+    has_mirror = any(a[1] == "mirror" for a in d.accounts)
+    for ch, acct in routing.mirrors.items():
+        row = rows.get(acct)
+        state, viewers = (row[3], row[5]) if row else ("off", None)
+        line = f"> {_ACCOUNT_DOT.get(state, '⚪')} {_ch(ch)} ← **{_short(ctx, acct)}**"
+        if state == "live":
+            line += f" · 👁 {'?' if viewers is None else viewers}"
+        elif state != "off":
+            line += f" · {_ACCOUNT_TEXT.get(state, state)}"
+        mirror_lines.append(line)
+    for uid, role, ch, *_ in d.accounts:
+        if role == "mirror" and ch is None and uid not in routing.mirrors.values():
+            line = f"> ⚫ **{_short(ctx, uid)}** · rảnh"
+            if uid in ctx.mirror_fixed:
+                line += f" · cố định {_ch(ctx.mirror_fixed[uid])}"
+            mirror_lines.append(line)
+
+    def build(nr: int, nm: int, with_public: bool) -> str:
+        blocks = ["\n".join(head), "\n".join(source)]
+        if relays:
+            lines = relay_lines[:nr]
+            if nr < len(relay_lines):
+                lines.append(f"> +{len(relay_lines) - nr} relay khác")
+            blocks.append("\n".join([relay_title, *relay_head, *lines]))
+        if has_mirror or mirror_lines:
+            lines = mirror_lines[:nm]
+            if nm < len(mirror_lines):
+                lines.append(f"> +{len(mirror_lines) - nm} mirror khác")
+            blocks.append("\n".join(["### 🪞 Mirror", *lines]))
+        blocks.append(_footer(d, with_public))
+        return "\n\n".join(blocks)
+
+    nr, nm = len(relay_lines), len(mirror_lines)
+    out = build(nr, nm, True)
+    if len(out) >= _MAX_LEN:
+        out = build(nr, nm, False)
+    while len(out) >= _MAX_LEN and (nr or nm):
+        if nr >= nm:
+            nr -= 1
+        else:
+            nm -= 1
+        out = build(nr, nm, False)
+    return out[: _MAX_LEN - 1]

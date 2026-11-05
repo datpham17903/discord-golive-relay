@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from golive_relay.control.commands import (
     DEFAULT_PUBLIC_COMMANDS,
     HELP,
@@ -122,9 +124,9 @@ def test_no_free_account_error():
 def test_status_format():
     c = ctx(user_name=lambda u: {555: "Alice", O1: "Out1"}.get(u))
     s = format_status(routing({200: O1}), c, _details())
-    assert s.startswith("📡") and s.count("\n") >= 3
-    assert "Alice (555)" in s and "<#100>" in s and "<#200>" in s and "Out1 (21)" in s and "ready" in s
-    assert "chưa có mirror" in format_status(routing(), c, _details())
+    assert s.startswith("# 📡 Relay · 🟢 Đang phát") and s.count("\n") >= 8
+    assert "**Alice**" in s and "<#100>" in s and "<#200>" in s and "**Out1**" in s
+    assert "🪞 Mirror" in s
 
 
 def test_no_reply_contains_user_mention():
@@ -153,7 +155,7 @@ def test_display_names_are_sanitized():
     outs = [format_status(old, c, _details(output_size="1920x1080")), describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)]
     for o in outs:
         assert "<@" not in o and "@" not in o and "`x`" not in o
-    assert "123 everyone x (555)" in outs[0]
+    assert "**123 everyone x**" in outs[0]
     assert "đổi target** thành 999." in outs[1]  # nothing left of the name: ID only
 
 
@@ -203,8 +205,8 @@ def test_status_shows_autoscale():
 
 
 def test_status_shows_prejoin():
-    assert "pre-join bật" in format_status(routing(), ctx(), _details(prejoin=True))
-    assert "pre-join tắt" in format_status(routing(), ctx(), _details(prejoin=False))
+    assert "prejoin bật" in format_status(routing(), ctx(), _details(prejoin=True))
+    assert "prejoin tắt" in format_status(routing(), ctx(), _details(prejoin=False))
 
 
 def test_display_names_neutralise_markdown_and_format_chars():
@@ -221,7 +223,7 @@ def test_display_names_neutralise_markdown_and_format_chars():
     for bad in ("[", "]", "(https", "\u202e", "@", "<@"):
         assert bad not in s
     assert "://" not in s and "<@" not in s
-    assert "abc (21)" in s and "everyone (22)" in s and "1 (23)" in s
+    assert "**abc**" in s and "**everyone**" in s and "**1**" in s
     out = describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)
     assert "đổi target** thành 999." in out  # nothing left of the name: ID only
 
@@ -284,7 +286,7 @@ def test_mirror_rejects_unknown_account():
 
 def _details(**over):
     kw = dict(
-        session_state="LIVE",
+        session_state="relaying",
         session_uptime_s=3725.0,
         viewers=120,
         relay_wanted=1,
@@ -314,39 +316,127 @@ def test_status_details_layout():
     c = ctx(user_name=lambda u: {555: "<@1> Alice", R1: "Relay1", O1: "Mir1"}.get(u))
     s = format_status(routing({200: O1}), c, _details())
     lines = s.splitlines()
-    assert lines[0].startswith("📡")
-    assert "LIVE" in lines[1] and "1h02m05s" in lines[1]
-    assert "Alice (555)" in lines[2]
-    assert "<#100>" in lines[3] and "120" in lines[3]
-    assert "1/1/2" in lines[4] and "⚠️" not in lines[4]
-    assert "Relay1 (31)" in s and "live" in s and "1m05s" in s and "32" in s
-    assert "<#200>" in s and "Mir1 (21)" in s and "ready" in s
-    assert "bật" in s and "100ms" in s and "passthrough" in s and "1920x1080@60" in s
-    assert "412ms" in s and "audio" in s.lower()
-    assert "mirror rảnh: 22" in s  # unassigned mirror account O2
+    assert lines[0] == "# 📡 Relay · 🟢 Đang phát"
+    assert lines[1] == "-# chạy 1 giờ 2 phút · watch 412 ms · 🔊 audio OK"
+    assert "> **1 Alice** `555`" in s
+    assert "> Kênh chính <#100> · 👥 **120** người" in s
+    assert "### 📶 Relay · 1/2 chạy" in s
+    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 120/99" in s  # 49 + 50 * 1 running relay
+    assert "> 🟢 **Relay1** · 👁 3" in s
+    assert "> ⚫ **32** · rảnh" in s
+    assert "> 🟡 <#200> ← **Mir1** · đang kết nối" in s
+    assert "> ⚫ **22** · rảnh" in s
+    assert lines[-1] == ("-# ⚙️ prejoin bật · debounce 100 ms · autoscale bật · 1920×1080@60 passthrough"
+                         " · lệnh công khai: không có · cooldown 0s/0s")
     assert "<@" not in s
+
+
+def test_session_state_labels():
+    cases = {"relaying": "🟢 Đang phát", "connecting": "🟡 Đang kết nối", "joining": "🟡 Đang kết nối", "hold": "🟠 Tạm giữ",
+             "backoff": "🟠 Đang thử lại", "idle": "🔵 Chờ Target phát", "disabled": "⚫ Đã tắt", "fatal": "🔴 Lỗi",
+             "quarantine": "🔴 Lỗi"}
+    for state, label in cases.items():
+        assert format_status(routing(), ctx(), _details(session_state=state)).splitlines()[0] == f"# 📡 Relay · {label}"
+    s = format_status(routing(), ctx(), _details(session_state="fatal", fatal_reason="AUTH_REJECTED"))
+    assert "🔴 Lỗi (AUTH_REJECTED)" in s.splitlines()[0]
+
+
+def test_subtext_only_when_relaying_and_unknown_watch_omitted():
+    s = format_status(routing(), ctx(), _details(last_watch_ms=None, audio_ok=False))
+    assert s.splitlines()[1] == "-# chạy 1 giờ 2 phút · 🔇 không có audio"
+    s = format_status(routing(), ctx(), _details(session_state="idle", session_uptime_s=None))
+    assert "-#" not in s.split("### 🎯")[0]
+    assert format_status(routing(), ctx(), _details(session_uptime_s=45)).splitlines()[1].startswith("-# chạy 45 giây")
+    assert format_status(routing(), ctx(), _details(session_uptime_s=720)).splitlines()[1].startswith("-# chạy 12 phút")
+
+
+def test_source_block_ids():
+    big = 5734000000009185
+    r = replace(routing(), target_user_id=big)
+    s = format_status(r, ctx(user_name=lambda u: {big: "NewbieLady"}.get(u)), _details())
+    assert "> **NewbieLady** `5734…9185`" in s
+    assert "> `5734000000009185`" in format_status(r, ctx(), _details())
+
+
+def test_capacity_bar_math_and_clamp():
+    s = format_status(routing(), ctx(), _details(viewers=199, relay_running=2, viewer_cap=50, ingest_publishes=True))
+    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 199/199" in s  # 49 + 50 + 2 * 50
+    s = format_status(routing(), ctx(), _details(viewers=100, relay_running=1, viewer_cap=50, ingest_publishes=True))
+    assert "▰▰▰▰▰▰▱▱▱▱ sức chứa 100/149" in s
+    s = format_status(routing(), ctx(), _details(viewers=5000))
+    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 5000/99" in s
+    s = format_status(routing(), ctx(), _details(viewers=0))
+    assert "▱▱▱▱▱▱▱▱▱▱ sức chứa 0/99" in s
 
 
 def test_status_shows_shortage_warning():
     d = _details(relay_wanted=3, relay_running=2, relay_available=2, relay_short_by=1)
-    s = format_status(routing(), ctx(), d)
-    relay_line = s.splitlines()[4]
-    assert "⚠️" in relay_line and "thiếu 1" in relay_line
-    s = format_status(routing(), ctx(), _details(relay_kept=1, last_watch_ms=None, audio_ok=False))
-    assert "giữ thêm 1 relay còn người xem" in s.splitlines()[4]
-    assert "⚠️" not in s.splitlines()[4]
+    assert "> ⚠️ thiếu 1 relay" in format_status(routing(), ctx(), d)
+    assert "thiếu" not in format_status(routing(), ctx(), _details())
+    assert "Relay · 1/2 chạy · autoscale tắt" in format_status(routing(), ctx(), _details(autoscale=False))
 
 
-def test_status_relay_lines_show_viewers_and_idle_stop():
-    d = _details(relay_wanted=0, relay_running=2, accounts=(
+def test_status_relay_lines_show_viewers_kept_and_idle_stop():
+    d = _details(relay_wanted=0, relay_running=3, relay_kept=1, accounts=(
         (R1, "relay", 100, "live", 65.0, 0, 12.2),
         (32, "relay", 100, "live", 5.0, None, None),
+        (33, "relay", 100, "live", 5.0, 7, None),
     ))
     lines = format_status(routing(), ctx(), d).splitlines()
-    r1 = next(x for x in lines if "relay 31" in x)
-    r2 = next(x for x in lines if "relay 32" in x)
-    assert "0 người xem" in r1 and "tắt sau 13s nếu không ai xem" in r1
-    assert "? người xem" in r2 and "tắt sau" not in r2
+    r1 = next(x for x in lines if "**31**" in x)
+    r2 = next(x for x in lines if "**32**" in x)
+    r3 = next(x for x in lines if "**33**" in x)
+    assert "👁 0" in r1 and "*tắt sau 13s nếu không ai xem*" in r1 and "giữ" not in r1
+    assert "👁 ?" in r2 and "tắt sau" not in r2 and "giữ" not in r2
+    assert "👁 7" in r3 and "*giữ vì còn người xem*" in r3
+
+
+def test_status_account_state_dots():
+    d = _details(accounts=(
+        (R1, "relay", 100, "joining", None, None, None),
+        (32, "relay", 100, "backoff", None, None, None),
+        (33, "relay", 100, "fatal", None, None, None),
+        (34, "relay", 100, "quarantine", None, None, None),
+    ))
+    lines = format_status(routing(), ctx(), d).splitlines()
+    for dot, uid in (("🟡", 31), ("🟠", 32), ("🔴", 33), ("🔴", 34)):
+        assert any(x.startswith(f"> {dot} **{uid}**") for x in lines), uid
+
+
+def test_status_omits_empty_blocks():
+    s = format_status(routing(), ctx(), _details(accounts=()))
+    assert "📶" not in s and "🪞" not in s and "🎯" in s
+    s = format_status(routing(), ctx(), _details(accounts=((R1, "relay", 100, "live", 1.0, 1, None),)))
+    assert "📶" in s and "🪞" not in s
+
+
+def test_status_mirror_block_lines_and_fixed():
+    c = ctx(mirror_fixed={O2: 300}, user_name=lambda u: {O1: "Mir1"}.get(u))
+    d = _details(accounts=(
+        (O1, "mirror", 200, "live", 3.0, 12, None),
+        (O2, "mirror", None, "off", None, None, None),
+    ))
+    s = format_status(routing({200: O1}), c, d)
+    assert "> 🟢 <#200> ← **Mir1** · 👁 12" in s
+    assert "> ⚫ **22** · rảnh · cố định <#300>" in s
+
+
+def test_status_routing_error_under_header():
+    s = format_status(routing(), ctx(), _details(), routing_error="x")
+    assert s.splitlines()[2].startswith("⚠️") and "state.json" in s.splitlines()[2]
+
+
+def test_status_stays_under_discord_limit():
+    long = "N" * 80
+    ids = list(range(1000, 1025))
+    accounts = tuple((u, "relay", 100, "live", 5.0, 3, 9.0) for u in ids) + tuple(
+        (u + 100, "mirror", None, "off", None, None, None) for u in ids)
+    c = ctx(user_name=lambda u: long, mirror_fixed={u + 100: 300 for u in ids})
+    d = _details(accounts=accounts, public_commands=("status", "mirror", "unmirror", "on", "off"),
+                 relay_running=25, command_cooldown_s=5, change_cooldown_s=3)
+    s = format_status(routing(), c, d)
+    assert len(s) < 2000 and "<@" not in s
+    assert "relay khác" in s or "mirror khác" in s
 
 
 def test_parse_bare_mirror_forms():
@@ -419,7 +509,6 @@ def test_command_name():
 def test_status_shows_public_commands_and_cooldowns():
     s = format_status(routing(), ctx(), _details(public_commands=("status", "mirror"), command_cooldown_s=5,
                                                  change_cooldown_s=3))
-    line = next(x for x in s.splitlines() if "công khai" in x)
-    assert "status, mirror" in line and "5s" in line and "3s" in line
-    s = format_status(routing(), ctx(), _details())
-    assert "công khai: không có" in s
+    line = s.splitlines()[-1]
+    assert "lệnh công khai: status, mirror" in line and "cooldown 5s/3s" in line
+    assert "công khai: không có" in format_status(routing(), ctx(), _details())

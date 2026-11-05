@@ -593,7 +593,7 @@ def test_chat_rejection_and_status_reply_without_state_change(tmp_path, slate, s
         await wait_until(lambda: len(a.replies) == 3)
         assert [r[1] for r in a.replies] == [1, 2, 3]
         assert a.replies[0][2].startswith("⚠️") and a.replies[1][2].startswith("❌")
-        assert a.replies[2][2].startswith("📡")
+        assert a.replies[2][2].startswith("# 📡")
         assert all("<@" not in r[2] for r in a.replies)
         assert env.store.load().revision == rev
         env.svc.request_shutdown()
@@ -755,7 +755,7 @@ def test_non_operator_may_use_public_commands_only(tmp_path, slate, source_gop):
         chat(env, "!relay status", 1, author=guest, op=False)
         chat(env, "!relay mirror", 2, voice=mirror_chan, author=guest, op=False)
         await wait_until(lambda: len(a.replies) == 2)
-        assert a.replies[0][2].startswith("📡") and a.replies[1][2].startswith("✅")
+        assert a.replies[0][2].startswith("# 📡") and a.replies[1][2].startswith("✅")
         assert env.svc.sup.routing.mirrors == {mirror_chan: uid}
         chat(env, "!relay unmirror", 3, voice=mirror_chan, author=guest, op=False)  # unmirror is public by default
         await wait_until(lambda: len(a.replies) == 3)
@@ -800,7 +800,7 @@ def test_per_author_cooldown_one_notice_then_silence_operators_exempt(tmp_path, 
         await wait_until(lambda: len(a.replies) == 7)
         assert [r[1] for r in a.replies] == [1, 2, 4, 5, 6, 7, 8]
         assert a.replies[1][2] == "⏳ chậm lại chút, thử lại sau 4s"
-        assert all(r[2].startswith("📡") for i, r in enumerate(a.replies) if i != 1)
+        assert all(r[2].startswith("# 📡") for i, r in enumerate(a.replies) if i != 1)
         env.svc.request_shutdown()
         await task
 
@@ -834,7 +834,7 @@ def test_global_change_cooldown_blocks_everyone_but_not_status(tmp_path, slate, 
         texts = [r[2] for r in a.replies]
         assert texts[0].startswith("✅") and texts[5].startswith("✅")
         assert texts[1] == texts[2] == "⏳ vừa có thay đổi, thử lại sau 2s"
-        assert texts[3].startswith("📡") and texts[4].startswith("📡")
+        assert texts[3].startswith("# 📡") and texts[4].startswith("# 📡")
         env.svc.request_shutdown()
         await task
 
@@ -1287,7 +1287,7 @@ def test_chat_prejoin_toggle_persists_joins_and_leaves(tmp_path, slate, source_g
         assert env.store.load().prejoin_voice is False
         await wait_until(lambda: "leave" in env.order)
         await wait_until(lambda: len(a.replies) == 3)
-        assert a.replies[0][2].startswith("✅") and "pre-join bật" in a.replies[1][2]
+        assert a.replies[0][2].startswith("✅") and "prejoin bật" in a.replies[1][2]
         assert a.replies[2][2].startswith("✅")
         env.svc.request_shutdown()
         await task
@@ -1665,7 +1665,7 @@ def test_status_details_from_service(tmp_path, slate, source_gop):
         chat(env, "!relay status")
         await wait_until(lambda: env.adapters[0].replies)
         text = env.adapters[0].replies[0][2]
-        assert text.startswith("\U0001f4e1") and "2 người" in text and "1/1/2" in text and "<#999>" in text
+        assert text.startswith("# \U0001f4e1") and "**2** người" in text and "Relay · 1/2 chạy" in text and "<#999>" in text
         env.svc.request_shutdown()
         assert await task == 0
 
