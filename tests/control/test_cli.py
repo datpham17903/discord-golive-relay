@@ -367,3 +367,33 @@ def test_fetch_user_id_uses_library_http_login_only(monkeypatch):
     monkeypatch.setattr(HTTPClient, "static_login", static_login)
     monkeypatch.setattr(discord.Client, "connect", no_gateway)
     assert asyncio.run(cli.fetch_user_id("tok")) == 4242
+
+
+def _doctor_setup(tmp_path, monkeypatch, lookup):
+    from golive_relay.media import hwaccel
+
+    _token_dir(tmp_path, monkeypatch)
+    monkeypatch.setattr(hwaccel, "platform_encoders", lambda: [])
+    monkeypatch.setattr(hwaccel, "hwdevices_available", lambda: [])
+    monkeypatch.setattr(cli, "fetch_user_id", lookup)
+    return _short_form_config(tmp_path)
+
+
+def test_doctor_reports_resolved_account_ids(tmp_path, monkeypatch, capsys):
+    async def lookup(token):
+        return IDS[token]
+
+    cfg = _doctor_setup(tmp_path, monkeypatch, lookup)
+    cli.main(["doctor", "--config", str(cfg)])
+    out = capsys.readouterr().out
+    assert "[ok] account ids resolved" in out and "tok-" not in out
+
+
+def test_doctor_reports_failed_account_id_lookup(tmp_path, monkeypatch, capsys):
+    async def lookup(token):
+        raise RuntimeError("bad token")
+
+    cfg = _doctor_setup(tmp_path, monkeypatch, lookup)
+    assert cli.main(["doctor", "--config", str(cfg)]) == cli.EXIT_FAIL
+    out = capsys.readouterr().out
+    assert "[FAIL] account ids: " in out and "tok-" not in out

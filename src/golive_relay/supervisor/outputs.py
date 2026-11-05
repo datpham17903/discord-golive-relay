@@ -159,7 +159,7 @@ class OutputPool:
                       and not self._accts[uid].viewers)
         kept = max(0, running - self._relay_target - len(waiting) - unknown)
         # the watched ones that would stop first, the last in config order (the tie order of _surplus_stops)
-        watched = [uid for uid in self._relays if self._active(self._accts[uid]) and uid not in waiting
+        watched = [uid for uid in self._running_relays() if self._active(self._accts[uid]) and uid not in waiting
                    and self._accts[uid].viewers]
         return {
             "wanted": self._relay_target,

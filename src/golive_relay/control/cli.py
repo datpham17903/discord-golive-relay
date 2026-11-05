@@ -292,7 +292,8 @@ async def fetch_user_id(token: str) -> int:
     client = discord.Client()
     try:
         await client.login(token)
-        assert client.user is not None
+        if client.user is None:
+            raise RuntimeError("login returned no user for this credential")
         return client.user.id
     finally:
         await client.close()
