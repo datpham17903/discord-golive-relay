@@ -339,3 +339,8 @@ def test_bare_unmirror():
     miss = resolve_here(RemoveMirror(None, here=True), r, 300)
     assert miss.startswith("⚠️") and "<#300>" in miss and "chưa có mirror" in miss
     assert resolve_here(RemoveMirror(None), r, None) == RemoveMirror(None)
+
+
+def test_help_lists_bare_mirror_forms():
+    assert "• `mirror` - " in HELP
+    assert "• `unmirror` - " in HELP

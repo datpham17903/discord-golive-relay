@@ -15,7 +15,9 @@ HELP = (
     "• `on` / `off` - bật hoặc tắt relay\n"
     "• `target <user_id>` - đổi người được relay\n"
     "• `channel <channel_id>` - đổi kênh voice chính\n"
+    "• `mirror` - mirror kênh voice bạn đang ngồi\n"
     "• `mirror <channel_id> [account_id]` - phát lại sang một kênh voice khác (có thể chỉ định tài khoản mirror)\n"
+    "• `unmirror` - gỡ mirror của kênh voice bạn đang ngồi\n"
     "• `unmirror <channel_id|all>` - gỡ mirror\n"
     "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"
 )
