@@ -32,6 +32,11 @@ class RelayScaler:
             self._below_since = None
         return self._current
 
+    def hold(self, current: int) -> None:
+        """Restart from ``current``: a lower need waits the full delay before it applies."""
+        self._current = current
+        self._below_since = None
+
     def scale_down_in(self, now: float) -> float | None:
         """Seconds left before a pending scale-down applies; None when none is pending."""
         if self._below_since is None:

@@ -23,7 +23,7 @@ from discord.ext.native_voice.media import VideoConfig
 from golive_relay.adapter.output_account import AccountMismatch
 from golive_relay.config import RelayConfig
 from golive_relay.control.commands import (
-    COMMAND_NAMES, ChatCommand, ParseError, RoutingContext, resolve_here, SetEnabled, SetPrejoin, Status, StatusDetails,
+    COMMAND_NAMES, ChatCommand, ParseError, RoutingContext, resolve_here, SetAutoscale, SetEnabled, SetPrejoin, Status, StatusDetails,
     command_name, describe_change, format_status, parse, plan_change,
 )
 from golive_relay.control.cooldown import ChatCooldowns
@@ -174,7 +174,9 @@ class Service:
             excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
         )
         self._scaler = RelayScaler(r.relay_scale_down_seconds)
-        if r.relay_autoscale:
+        # chat override persisted in state.json; config is only the default
+        self._autoscale = r.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
+        if self._autoscale:
             self.pool.set_relay_target(0, time.monotonic())  # no session yet: nothing to start or stop
         self._session_since: float | None = None  # gate first opened in the current session
         self._out_since: dict[int, float] = {}  # account -> first OutSetLive of its current run
@@ -399,6 +401,9 @@ class Service:
         prejoin = self.cfg.runtime.prejoin_voice if st.prejoin_voice is None else st.prejoin_voice
         if prejoin != self.sup.prejoin_voice:
             self._handle(PrejoinChanged(prejoin))
+        autoscale = self.cfg.runtime.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
+        if autoscale != self._autoscale:
+            self._set_autoscale(autoscale)
         routing = Routing.from_persisted(st.routing, config_routing(self.cfg))
         err = routing_error(routing, self.cfg)
         if err is None:
@@ -420,14 +425,17 @@ class Service:
         cmd = parse(ev.text, c.command_prefix, c.public_commands)
         if cmd is None:
             return
+        changing = not isinstance(cmd, (ParseError, Status))
         if not ev.is_operator:
             if isinstance(cmd, ParseError) or command_name(cmd) not in c.public_commands:
                 return  # no reply to non-operators for invalid or non-public commands: nothing to spam with
-            wait = self._cooldowns.author(ev.author_id)
-            if wait is not None:
-                self._chat_cooldown(ev, cmd, f"⏳ chậm lại chút, thử lại sau {wait}s" if wait else None)
-                return
-        if not isinstance(cmd, (ParseError, Status)):
+            # a change the global cooldown rejects must not start the author window, or its stated wait would lie
+            if not (changing and self._cooldowns.change_wait()):
+                wait = self._cooldowns.author(ev.author_id)
+                if wait is not None:
+                    self._chat_cooldown(ev, cmd, f"⏳ chậm lại chút, thử lại sau {wait}s" if wait else None)
+                    return
+        if changing:
             wait = self._cooldowns.change_wait()
             if wait:
                 self._chat_cooldown(ev, cmd, f"⏳ vừa có thay đổi, thử lại sau {wait}s")
@@ -446,6 +454,10 @@ class Service:
             elif isinstance(cmd, SetPrejoin):
                 self.store.update(lambda s: replace(s, prejoin_voice=cmd.on))
                 self._handle(PrejoinChanged(cmd.on))
+                outcome, text = "applied", describe_change(cmd, old, old, ctx)
+            elif isinstance(cmd, SetAutoscale):
+                self.store.update(lambda s: replace(s, relay_autoscale=cmd.on))
+                self._set_autoscale(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
             else:
                 resolved = resolve_here(cmd, old, ev.author_voice_channel_id)
@@ -1119,10 +1131,22 @@ class Service:
                 *(a.user_id for a in self.cfg.output_accounts())}
         return len((self.sup.participants or frozenset()) - bots)
 
+    def _set_autoscale(self, on: bool) -> None:
+        """Off: every relay account may run. On: the scaler starts from the relays running now, so extra ones
+        stop only after the normal scale-down delay."""
+        now = time.monotonic()
+        self._autoscale = on
+        if on:
+            self._scaler.hold(self.pool.relay_summary()["running"])
+            self._scale_relays(now)
+        else:
+            for a in self.pool.set_relay_target(len(self.cfg.discord.relay_accounts), now):
+                self._pool_action(a)
+
     def _scale_relays(self, now: float) -> None:
         r = self.cfg.runtime
-        if not r.relay_autoscale:
-            return  # the pool keeps its initial target: every relay account
+        if not self._autoscale:
+            return  # the pool keeps its target: every relay account
         needed = relays_needed(self._viewers(), r.stream_viewer_cap, self.cfg.discord.ingest_publishes)
         want = self._scaler.update(needed, now)
         if want != self.pool.relay_summary()["wanted"]:
@@ -1146,8 +1170,9 @@ class Service:
             relay_running=relay["running"],
             relay_available=relay["available"],
             relay_short_by=relay["short_by"],
-            scale_down_in_s=self._scaler.scale_down_in(now) if self.cfg.runtime.relay_autoscale else None,
+            scale_down_in_s=self._scaler.scale_down_in(now) if self._autoscale else None,
             prejoin=self.sup.prejoin_voice,
+            autoscale=self._autoscale,
             debounce_ms=self.cfg.runtime.start_debounce_ms,
             video_mode=self.cfg.codecs.video_mode,
             output_size=f"{w}x{h}@{fps}",

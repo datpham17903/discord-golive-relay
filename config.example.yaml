@@ -77,6 +77,6 @@ control:
   operator_user_ids: []       # decimal user ID strings allowed to use every command
   operator_role_ids: []       # decimal role ID strings; members holding any of these roles may use every command too
   command_channel_id: null    # optional decimal channel ID; when set, commands are accepted only there
-  public_commands: ["status", "mirror"]   # anyone in the guild may use these; names: status, mirror, unmirror, on, off, target, channel, prejoin
+  public_commands: ["status", "mirror", "unmirror"]   # anyone in the guild may use these; names: status, mirror, unmirror, on, off, target, channel, prejoin, autoscale
   command_cooldown_seconds: 5 # per author: further commands are ignored this long (one notice); operators are exempt
   change_cooldown_seconds: 3  # global: no new change (every command but status) this long after the last one, for everyone

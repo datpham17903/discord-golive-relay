@@ -1,9 +1,11 @@
 from golive_relay.control.commands import (
+    DEFAULT_PUBLIC_COMMANDS,
     HELP,
     AddMirror,
     ParseError,
     RemoveMirror,
     RoutingContext,
+    SetAutoscale,
     SetChannel,
     SetEnabled,
     SetPrejoin,
@@ -174,6 +176,32 @@ def test_prejoin_plan_and_reply():
     assert "tắt" in describe_change(SetPrejoin(False), old, old, c)
 
 
+def test_parse_autoscale():
+    assert parse("!relay autoscale on", P) == SetAutoscale(True)
+    assert parse("!relay AUTOSCALE Off", P) == SetAutoscale(False)
+    for bad in ("!relay autoscale", "!relay autoscale yes", "!relay autoscale on off"):
+        e = parse(bad, P)
+        assert isinstance(e, ParseError) and "Cú pháp" in e.text and "`autoscale <on|off>`" in e.text
+    line = next(x for x in HELP.splitlines() if x.startswith("• `autoscale"))
+    assert "`autoscale <on|off>`" in line and "công khai" not in line and "operator" in line
+    assert command_name(SetAutoscale(True)) == command_name(SetAutoscale(False)) == "autoscale"
+
+
+def test_autoscale_plan_and_reply():
+    c, old = ctx(), routing({200: O1})
+    for on in (True, False):
+        assert plan_change(SetAutoscale(on), old, c) is old
+        text = describe_change(SetAutoscale(on), old, old, c)
+        assert text.startswith("✅") and "autoscale" in text and "<@" not in text
+    assert "bật" in describe_change(SetAutoscale(True), old, old, c)
+    assert "tắt" in describe_change(SetAutoscale(False), old, old, c)
+
+
+def test_status_shows_autoscale():
+    assert "autoscale bật" in format_status(routing(), ctx(), _details(autoscale=True))
+    assert "autoscale tắt" in format_status(routing(), ctx(), _details(autoscale=False))
+
+
 def test_status_shows_prejoin():
     assert "pre-join bật" in format_status(routing(), ctx(), _details(prejoin=True))
     assert "pre-join tắt" in format_status(routing(), ctx(), _details(prejoin=False))
@@ -265,6 +293,7 @@ def _details(**over):
         relay_short_by=0,
         scale_down_in_s=None,
         prejoin=True,
+        autoscale=True,
         debounce_ms=100,
         video_mode="passthrough",
         output_size="1920x1080@60",
@@ -356,9 +385,11 @@ def test_help_marks_public_commands():
     h = help_text(frozenset({"status", "mirror"}))
     lines = {line.split("`")[1]: line for line in h.splitlines() if line.startswith("• ")}
     assert "công khai" in lines["status"] and "công khai" in lines["mirror"] and "công khai" in lines["mirror <channel_id> [account_id]"]
-    for sub in ("on", "target <user_id>", "channel <channel_id>", "unmirror", "unmirror <channel_id|all>", "prejoin <on|off>"):
+    for sub in ("on", "target <user_id>", "channel <channel_id>", "unmirror", "unmirror <channel_id|all>", "prejoin <on|off>",
+                "autoscale <on|off>"):
         assert "công khai" not in lines[sub], sub
-    assert HELP == h
+    assert HELP == help_text(frozenset({"status", "mirror", "unmirror"}))
+    assert DEFAULT_PUBLIC_COMMANDS == frozenset({"status", "mirror", "unmirror"})
     unmirror = [x for x in help_text(frozenset({"unmirror"})).splitlines() if x.startswith("• `unmirror")]
     assert len(unmirror) == 2 and all("công khai" in x for x in unmirror)
     assert parse("!relay", P, frozenset({"on"})) == ParseError(help_text(frozenset({"on"})))
@@ -368,7 +399,7 @@ def test_help_marks_public_commands():
 def test_command_name():
     cases = {Status(): "status", SetEnabled(True): "on", SetEnabled(False): "off", SetTarget(1): "target",
              SetChannel(1): "channel", AddMirror(None): "mirror", RemoveMirror(None, here=True): "unmirror",
-             RemoveMirror(None): "unmirror", SetPrejoin(True): "prejoin"}
+             RemoveMirror(None): "unmirror", SetPrejoin(True): "prejoin", SetAutoscale(False): "autoscale"}
     for cmd, name in cases.items():
         assert command_name(cmd) == name
 

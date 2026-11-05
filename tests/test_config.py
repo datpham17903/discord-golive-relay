@@ -308,12 +308,12 @@ def test_control_config_defaults_when_absent_and_example():
     cfg = load_config(EXAMPLE)
     assert cfg.control.chat_commands is True and cfg.control.command_prefix == "!relay"
     assert cfg.control.operator_user_ids == frozenset() and cfg.control.command_channel_id is None
-    assert cfg.control.public_commands == frozenset({"status", "mirror"})
+    assert cfg.control.public_commands == frozenset({"status", "mirror", "unmirror"})
     assert (cfg.control.command_cooldown_seconds, cfg.control.change_cooldown_seconds) == (5, 3)
     from golive_relay.config import ControlConfig
 
     d = ControlConfig()
-    assert d.chat_commands is True and d.public_commands == frozenset({"status", "mirror"})
+    assert d.chat_commands is True and d.public_commands == frozenset({"status", "mirror", "unmirror"})
     assert (d.command_cooldown_seconds, d.change_cooldown_seconds) == (5, 3)
 
 
@@ -321,7 +321,9 @@ def test_control_public_commands_and_cooldowns(tmp_path: Path):
     raw = _raw()
     raw["control"] = {}
     c = _load(tmp_path, raw).control
-    assert c.chat_commands is True and c.public_commands == frozenset({"status", "mirror"})
+    assert c.chat_commands is True and c.public_commands == frozenset({"status", "mirror", "unmirror"})
+    raw["control"] = {"public_commands": ["autoscale"]}
+    assert _load(tmp_path, raw).control.public_commands == frozenset({"autoscale"})  # a valid name, opt-in only
     raw["control"] = {"public_commands": ["status", "unmirror"], "command_cooldown_seconds": 0,
                       "change_cooldown_seconds": 10}
     c = _load(tmp_path, raw).control

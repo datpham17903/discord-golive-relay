@@ -9,8 +9,8 @@ from typing import Callable, Mapping
 
 from golive_relay.supervisor.routing import Routing
 
-COMMAND_NAMES = ("status", "mirror", "unmirror", "on", "off", "target", "channel", "prejoin")
-DEFAULT_PUBLIC_COMMANDS = frozenset({"status", "mirror"})
+COMMAND_NAMES = ("status", "mirror", "unmirror", "on", "off", "target", "channel", "prejoin", "autoscale")
+DEFAULT_PUBLIC_COMMANDS = frozenset({"status", "mirror", "unmirror"})
 
 _HELP_LINES = (
     ("status", "• `status` - xem trạng thái hiện tại"),
@@ -22,6 +22,7 @@ _HELP_LINES = (
     ("unmirror", "• `unmirror` - gỡ mirror của kênh voice bạn đang ngồi"),
     ("unmirror", "• `unmirror <channel_id|all>` - gỡ mirror"),
     ("prejoin", "• `prejoin <on|off>` - bật hoặc tắt việc vào sẵn kênh voice trước khi target stream"),
+    ("autoscale", "• `autoscale <on|off>` - bật hoặc tắt tự động tăng/giảm số relay theo người xem (chỉ operator)"),
 )
 
 
@@ -44,6 +45,7 @@ _USAGE = {
     "off": "`off`",
     "status": "`status`",
     "prejoin": "`prejoin <on|off>`",
+    "autoscale": "`autoscale <on|off>`",
 }
 
 
@@ -97,7 +99,12 @@ class SetPrejoin:
     on: bool
 
 
-Command = Status | SetEnabled | SetPrejoin | SetTarget | SetChannel | AddMirror | RemoveMirror
+@dataclass(frozen=True, slots=True)
+class SetAutoscale:
+    on: bool
+
+
+Command = Status | SetEnabled | SetPrejoin | SetAutoscale | SetTarget | SetChannel | AddMirror | RemoveMirror
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +133,7 @@ class StatusDetails:
     relay_short_by: int
     scale_down_in_s: float | None
     prejoin: bool
+    autoscale: bool
     debounce_ms: int
     video_mode: str
     output_size: str
@@ -166,7 +174,7 @@ def command_name(cmd: Command) -> str:
     """The config name of a parsed command (as in ``control.public_commands``)."""
     if isinstance(cmd, SetEnabled):
         return "on" if cmd.on else "off"
-    return {Status: "status", SetPrejoin: "prejoin", SetTarget: "target", SetChannel: "channel",
+    return {Status: "status", SetPrejoin: "prejoin", SetAutoscale: "autoscale", SetTarget: "target", SetChannel: "channel",
             AddMirror: "mirror", RemoveMirror: "unmirror"}[type(cmd)]
 
 
@@ -181,10 +189,10 @@ def parse(text: str, prefix: str, public: frozenset[str] = DEFAULT_PUBLIC_COMMAN
         if args:
             return _usage_error(sub, "**Thừa tham số**")
         return Status() if sub == "status" else SetEnabled(sub == "on")
-    if sub == "prejoin":
+    if sub in ("prejoin", "autoscale"):
         if len(args) != 1 or args[0].lower() not in ("on", "off"):
             return _usage_error(sub, "**Cần đúng một tham số** `on` hoặc `off`")
-        return SetPrejoin(args[0].lower() == "on")
+        return (SetPrejoin if sub == "prejoin" else SetAutoscale)(args[0].lower() == "on")
     if sub == "mirror":
         if not args:
             return AddMirror(None)
@@ -229,7 +237,7 @@ def resolve_here(cmd: Command, routing: Routing, voice_channel_id: int | None) -
 
 
 def plan_change(cmd: Command, routing: Routing, ctx: RoutingContext) -> Routing | str:
-    """New routing, or a rejection reply. Status/SetEnabled/SetPrejoin leave routing unchanged."""
+    """New routing, or a rejection reply. Status/SetEnabled/SetPrejoin/SetAutoscale leave routing unchanged."""
     if isinstance(cmd, SetTarget):
         if cmd.user_id in ctx.relay_user_ids:
             return _reject(
@@ -300,6 +308,10 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
         if cmd.on:
             return "✅ **Đã bật pre-join**: relay vào sẵn kênh voice chính khi target có mặt."
         return "✅ **Đã tắt pre-join**: relay chỉ vào voice khi target bắt đầu stream."
+    if isinstance(cmd, SetAutoscale):
+        if cmd.on:
+            return "✅ **Đã bật autoscale**: số relay chạy theo số người xem; relay thừa dừng sau thời gian chờ giảm."
+        return "✅ **Đã tắt autoscale**: mọi tài khoản relay đều phát."
     if isinstance(cmd, SetTarget):
         return (
             f"✅ **Đã đổi target** thành {_user(ctx, new.target_user_id)}. "
@@ -350,7 +362,7 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
     free = [_user(ctx, uid) for uid, role, ch, _, _ in d.accounts if role == "mirror" and ch is None]
     lines.append(f"• Tài khoản mirror rảnh: {', '.join(free) if free else 'không có'}")
     lines.append(
-        f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, debounce {d.debounce_ms}ms, "
+        f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, autoscale {'bật' if d.autoscale else 'tắt'}, debounce {d.debounce_ms}ms, "
         f"video {d.video_mode}, {d.output_size}"
     )
     lines.append(

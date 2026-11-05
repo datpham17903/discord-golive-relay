@@ -258,6 +258,23 @@ def test_routing_rejects_bad_shape(tmp_path: Path, routing: dict) -> None:
         StateStore(tmp_path).load()
 
 
+def test_autoscale_override_is_optional_v3_key(tmp_path: Path) -> None:
+    doc = {
+        "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
+        "quarantine": None, "consecutive_rejections": 0, "accounts": {}, "routing": None, "prejoin_voice": None,
+    }
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    store = StateStore(tmp_path)
+    assert store.load().relay_autoscale is None  # nothing persisted: config decides
+    store.update(lambda s: replace(s, relay_autoscale=False))
+    st = StateStore(tmp_path).load()
+    assert st.relay_autoscale is False and st.schema_version == 3 and st.prejoin_voice is None
+    doc["relay_autoscale"] = 1
+    (tmp_path / "state.json").write_text(json.dumps(doc))
+    with pytest.raises(StateCorrupt):
+        store.load()
+
+
 def test_prejoin_override_is_optional_v3_key(tmp_path: Path) -> None:
     doc = {
         "schema_version": 3, "revision": 1, "desired_enabled": False, "fatal_latch": None,
