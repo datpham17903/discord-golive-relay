@@ -438,7 +438,8 @@ class Service:
         if changing:
             wait = self._cooldowns.change_wait()
             if wait:
-                self._chat_cooldown(ev, cmd, f"⏳ vừa có thay đổi, thử lại sau {wait}s")
+                notice = ev.is_operator or self._cooldowns.change_notice(ev.author_id)
+                self._chat_cooldown(ev, cmd, f"⏳ vừa có thay đổi, thử lại sau {wait}s" if notice else None)
                 return
         ctx = self._routing_context()
         old = self.sup.routing
@@ -456,8 +457,9 @@ class Service:
                 self._handle(PrejoinChanged(cmd.on))
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
             elif isinstance(cmd, SetAutoscale):
-                self.store.update(lambda s: replace(s, relay_autoscale=cmd.on))
-                self._set_autoscale(cmd.on)
+                if cmd.on != self._autoscale:
+                    self.store.update(lambda s: replace(s, relay_autoscale=cmd.on))
+                    self._set_autoscale(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
             else:
                 resolved = resolve_here(cmd, old, ev.author_voice_channel_id)

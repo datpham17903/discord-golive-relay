@@ -16,6 +16,7 @@ class ChatCooldowns:
         self._clock = clock
         self._authors: dict[int, tuple[float, bool]] = {}  # author -> (window start, notice sent)
         self._last_change: float | None = None
+        self._change_notified: set[int] = set()
 
     def author(self, author_id: int) -> int | None:
         """None: allowed, a new window starts. Else the seconds left to tell the author once; 0 = stay silent."""
@@ -39,5 +40,13 @@ class ChatCooldowns:
         left = self._last_change + self._change_s - self._clock()
         return math.ceil(left) if left > 0 else 0
 
+    def change_notice(self, author_id: int) -> bool:
+        """True once per author per change window: the one reply a non-operator gets while the window runs."""
+        if author_id in self._change_notified:
+            return False
+        self._change_notified.add(author_id)
+        return True
+
     def changed(self) -> None:
         self._last_change = self._clock()
+        self._change_notified.clear()

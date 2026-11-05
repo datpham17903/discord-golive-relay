@@ -844,6 +844,36 @@ def test_global_change_cooldown_blocks_everyone_but_not_status(tmp_path, slate, 
     assert all("text" not in kw for kw in cooled)
 
 
+def test_global_change_cooldown_notifies_a_guest_once_per_window(tmp_path, slate, source_gop):
+    from golive_relay.control.cooldown import ChatCooldowns
+
+    uid, mirror_chan = 424242, 999
+    env = _multi_env(tmp_path, slate, source_gop, uid, lambda acct, events, log: FakeOutAdapter(acct, events, []),
+                     role="mirror")
+    clk = _Clock()
+    env.svc._cooldowns = ChatCooldowns(5, 3, clk)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        a.voice_ids = frozenset({env.chan, mirror_chan})
+        chat(env, "!relay prejoin off", 1)
+        clk.t += 1
+        for i in (2, 3, 4):
+            chat(env, f"!relay mirror {mirror_chan}", i, author=51, op=False)
+        clk.t += 2
+        chat(env, f"!relay mirror {mirror_chan}", 5, author=51, op=False)
+        await wait_until(lambda: len(a.replies) == 3)
+        await asyncio.sleep(0.1)
+        texts = [r[2] for r in a.replies]
+        assert len(texts) == 3 and texts[1] == "⏳ vừa có thay đổi, thử lại sau 2s"
+        assert texts[2].startswith("✅") and env.svc.sup.routing.mirrors == {mirror_chan: uid}
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
 def test_global_change_cooldown_does_not_start_the_author_window(tmp_path, slate, source_gop):
     from golive_relay.control.cooldown import ChatCooldowns
 
@@ -1501,6 +1531,32 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
         await wait_until(lambda: len(a.replies) == 3)
         assert a.replies[0][2].startswith("✅") and "autoscale tắt" in a.replies[1][2]
         assert a.replies[2][2].startswith("✅")
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_repeated_autoscale_on_keeps_the_scale_down_countdown(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.outputs_model import OutputAccount
+
+    r1, r2 = 424242, 424243
+    outs: list = []
+    env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1"), OutputAccount(r2, "t2")], outs,
+                    stream_viewer_cap=1, relay_scale_down_seconds=1.5)
+
+    async def main():
+        task = await reach_relaying(env)
+        await asyncio.sleep(0.1)
+        chat(env, "!relay autoscale off", 1)
+        await wait_until(lambda: _published(outs, r1) and _published(outs, r2))
+        chat(env, "!relay autoscale on", 2)
+        first = env.svc.status_dict()["details"]["scale_down_in_s"]
+        assert first is not None
+        await asyncio.sleep(0.3)
+        chat(env, "!relay autoscale on", 3)
+        second = env.svc.status_dict()["details"]["scale_down_in_s"]
+        assert second is not None and second < first - 0.2
         env.svc.request_shutdown()
         assert await task == 0
 
