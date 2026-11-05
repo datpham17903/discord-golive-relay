@@ -180,7 +180,10 @@ class DiscordAdapter:
             self._on_message(args[0])
 
     def _on_message(self, msg: Any) -> None:
-        """Operator messages in the configured guild (and command channel) only; the rest is ignored silently."""
+        """Messages in the configured guild (and command channel) only; the rest is ignored silently.
+
+        Only prefixed messages are passed on; the service decides who may use what (chat-added operators live there).
+        """
         c = self._control
         if not c.chat_commands or msg.guild is None or msg.guild.id != self.guild_id:
             return
@@ -195,11 +198,15 @@ class DiscordAdapter:
         if raw is None:
             raw = [r.id for r in getattr(member, "roles", ())]
         role_ids = frozenset(raw)
-        if not c.is_operator(author, role_ids):
-            return
         if c.command_channel_id is not None and msg.channel.id != c.command_channel_id:
             return
-        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids))
+        head = msg.content.split(maxsplit=1)
+        if not head or head[0].lower() != c.command_prefix.lower():
+            return
+        voice = getattr(getattr(member, "voice", None), "channel", None)
+        in_guild = voice is not None and getattr(getattr(voice, "guild", None), "id", None) == self.guild_id
+        self._emit(ChatCommand(author, msg.channel.id, msg.id, msg.content, role_ids,
+                               voice.id if in_guild else None))
 
     def _is_target_stream(self, stream: Any) -> bool:
         return stream.owner_id == self.target_id and stream.guild_id == self.guild_id
@@ -360,6 +367,17 @@ class DiscordAdapter:
             return member.display_name
         user = self._client.get_user(uid) if self._client else None
         return (user.global_name or user.name) if user is not None else None
+
+    def is_bot(self, uid: int) -> bool:
+        """True when the cached member or user is a bot account; unknown ids are not."""
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        user = (guild.get_member(uid) if guild else None) or (self._client.get_user(uid) if self._client else None)
+        return bool(getattr(user, "bot", False))
+
+    def role_name(self, rid: int) -> str | None:
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        role = guild.get_role(rid) if guild else None
+        return role.name if role is not None else None
 
     # ------------------------------------------------------------------ voice
 

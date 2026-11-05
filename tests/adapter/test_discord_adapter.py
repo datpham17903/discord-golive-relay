@@ -36,11 +36,24 @@ def test_operator_message_becomes_chat_command() -> None:
     a, out = make()
     a.handle_dispatch("message", message())
     assert out == [ChatCommand(OPERATOR, CMD_CHAN, 900, "!relay status")]
+    a.handle_dispatch("message", message(text="hello"))  # owners too: only prefixed messages reach the service
+    assert len(out) == 1
 
 
-def test_chat_from_non_operator_ignored_no_reply() -> None:
+def test_non_operator_command_is_passed_on() -> None:
     a, out = make()
-    a.handle_dispatch("message", message(author=51))  # not an operator
+    a.handle_dispatch("message", message(author=51))
+    assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status")]
+    a.handle_dispatch("message", message(author=51, text="hello"))  # not a command: never reaches the service
+    a.handle_dispatch("message", message(author=51, text=""))
+    a.handle_dispatch("message", message(author=51, text="!relayx status"))
+    assert len(out) == 1
+    a.handle_dispatch("message", message(author=51, text="!RELAY unmirror all"))  # the service decides
+    assert out[-1].text == "!RELAY unmirror all"
+
+
+def test_chat_from_elsewhere_ignored_no_reply() -> None:
+    a, out = make()
     a.handle_dispatch("message", message(guild=99))  # other guild
     a.handle_dispatch("message", message(guild=None))  # DM
     a.handle_dispatch("message", message(channel=61))  # not the command channel
@@ -86,6 +99,16 @@ def test_cache_lookups_for_routing_context() -> None:
     assert a.display_name(10) is None
 
 
+def test_cache_lookups_for_operator_list() -> None:
+    a, _ = make()
+    guild = NS(get_member=lambda uid: NS(bot=True) if uid == 8 else None,
+               get_role=lambda rid: NS(name="Mods") if rid == 500 else None)
+    users = {9: NS(bot=True), 11: NS(bot=False)}
+    a._client = NS(get_guild=lambda gid: guild if gid == GUILD else None, get_user=users.get)
+    assert a.is_bot(8) and a.is_bot(9) and not a.is_bot(11) and not a.is_bot(10)
+    assert a.role_name(500) == "Mods" and a.role_name(501) is None
+
+
 def test_join_reports_voice_state_echo_before_voice_connects() -> None:
     a, _ = make()
     vc = NS(session_id="sess-1")
@@ -114,7 +137,7 @@ def test_join_reports_voice_state_echo_before_voice_connects() -> None:
 ROLE = 700
 
 
-def test_role_holder_is_operator_and_role_ids_are_passed() -> None:
+def test_role_ids_are_passed() -> None:
     a, out = make(roles=frozenset({ROLE}))
     m = message(author=51)
     m.author.roles = [NS(id=ROLE), NS(id=701)]
@@ -122,12 +145,8 @@ def test_role_holder_is_operator_and_role_ids_are_passed() -> None:
     assert out == [ChatCommand(51, CMD_CHAN, 900, "!relay status", frozenset({ROLE, 701}))]
 
 
-def test_role_operator_denials() -> None:
+def test_role_holder_elsewhere_is_ignored() -> None:
     a, out = make(roles=frozenset({ROLE}))
-    other = message(author=51)
-    other.author.roles = [NS(id=701)]
-    a.handle_dispatch("message", other)  # wrong role
-    a.handle_dispatch("message", message(author=51))  # not a member, unknown
     wrong_guild = message(author=51, guild=99)
     wrong_guild.author.roles = [NS(id=ROLE)]
     a.handle_dispatch("message", wrong_guild)
@@ -175,3 +194,33 @@ def test_failed_connect_after_voice_state_echo_clears_voice_client() -> None:
 
     asyncio.run(main())
     assert a._vc is None
+
+
+def test_author_voice_channel_filled_from_member_voice_state() -> None:
+    a, out = make()
+    m = message()
+    m.author.roles = []
+    m.author.voice = NS(channel=NS(id=77, guild=NS(id=GUILD)))
+    a.handle_dispatch("message", m)
+    other = message()
+    other.author.roles = []
+    other.author.voice = NS(channel=NS(id=78, guild=NS(id=99)))
+    a.handle_dispatch("message", other)
+    novoice = message()
+    novoice.author.roles = []
+    novoice.author.voice = None
+    a.handle_dispatch("message", novoice)
+    nochan = message()
+    nochan.author.roles = []
+    nochan.author.voice = NS(channel=None)
+    a.handle_dispatch("message", nochan)
+    assert [c.author_voice_channel_id for c in out] == [77, None, None, None]
+
+
+def test_explicit_relay_id_mismatch_is_config_invalid() -> None:
+    from golive_relay.supervisor.model import ConfigInvalid
+
+    a, out = make()
+    a._client = NS(user=NS(id=99))
+    a._on_ready()
+    assert any(isinstance(e, ConfigInvalid) for e in out)

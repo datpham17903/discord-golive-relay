@@ -10,8 +10,16 @@ import socket
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Awaitable, Callable, Mapping
 
-from golive_relay.config import ConfigInvalid, check_operable, load_config
+from golive_relay.config import (
+    ConfigInvalid,
+    RelayConfig,
+    apply_account_ids,
+    check_operable,
+    load_config,
+    unresolved_credentials,
+)
 from golive_relay.control.lock import InstanceLocked
 from golive_relay.control.state import (
     PersistedState,
@@ -189,6 +197,10 @@ def _validate(cfg_path: Path) -> int:
     if cfg is None:
         return code
     print("config valid")
+    unresolved = unresolved_credentials(cfg)
+    if unresolved:
+        print(f"note: user ids of {', '.join(unresolved)} are resolved at run time from their tokens; "
+              "id-dependent checks skipped")
     for p in _operable_errors(cfg, cfg_path):
         print(f"not operable: {p}")
     return EXIT_OK
@@ -227,6 +239,13 @@ def _doctor(cfg_path: Path) -> int:
         report(f"encoder {cfg.codecs.video_encoder} -> {choice.name}", choice.ok, choice.reason)
     except Exception as exc:
         report("encoder probe", False, str(exc))
+    if unresolved_credentials(cfg):
+        try:
+            cfg = _resolve_ids(cfg)
+            report("account ids resolved", True)
+        except ConfigInvalid as exc:
+            for e in exc.errors:
+                report("account ids", False, e)
     sd = cfg.storage.state_directory
     try:
         sd.mkdir(parents=True, exist_ok=True)
@@ -265,9 +284,71 @@ def _read_token(credential: str = "relay-token") -> str | None:
         return None
 
 
+async def fetch_user_id(token: str) -> int:
+    """Who the token belongs to: the pinned library's HTTP login (GET /users/@me, same client fingerprint as the
+    gateway login), without opening a gateway connection."""
+    import discord
+
+    client = discord.Client()
+    try:
+        await client.login(token)
+        if client.user is None:
+            raise RuntimeError("login returned no user for this credential")
+        return client.user.id
+    finally:
+        await client.close()
+
+
+async def resolve_account_ids(
+    cfg: RelayConfig, tokens: Mapping[str, str], lookup: Callable[[str], Awaitable[int]]
+) -> RelayConfig:
+    """Look up every missing user ID concurrently (one try each) and return the fully resolved config."""
+    names = unresolved_credentials(cfg)
+    results = await asyncio.gather(*(lookup(tokens[n]) for n in names), return_exceptions=True)
+    errors, ids = [], {}
+    for name, res in zip(names, results):
+        if isinstance(res, BaseException):
+            detail = str(res).replace(tokens[name], "<token>")
+            errors.append(f"credential {name}: cannot resolve user id ({type(res).__name__}: {detail})")
+        else:
+            ids[name] = int(res)
+    if errors:
+        raise ConfigInvalid(errors)
+    for name in names:
+        _err(f"account {name} -> {ids[name]}")
+    return apply_account_ids(cfg, ids)
+
+
+def _resolve_ids(cfg: RelayConfig) -> RelayConfig:
+    """``cfg`` with every user ID filled in; ``ConfigInvalid`` names each credential that failed."""
+    names = unresolved_credentials(cfg)
+    if not names:
+        return cfg
+    tokens, errors = {}, []
+    for name in names:
+        try:
+            token = _read_token(name) if name == cfg.discord.ingest_credential else load_token(name)
+        except (OSError, ValueError) as exc:
+            errors.append(f"credential {name}: {exc}")
+            continue
+        if token is None:
+            errors.append(f"credential {name}: no token (set RELAY_TOKEN_DIR or systemd LoadCredential)")
+        else:
+            tokens[name] = token
+    if errors:
+        raise ConfigInvalid(errors)
+    return asyncio.run(resolve_account_ids(cfg, tokens, fetch_user_id))
+
+
 def _run(cfg_path: Path) -> int:
     cfg, _ = _load(cfg_path)
     if cfg is None:
+        return EXIT_CONFIG
+    try:
+        cfg = _resolve_ids(cfg)
+    except ConfigInvalid as exc:
+        for e in exc.errors:
+            _err(e)
         return EXIT_CONFIG
     problems = _operable_errors(cfg, cfg_path)
     if problems:

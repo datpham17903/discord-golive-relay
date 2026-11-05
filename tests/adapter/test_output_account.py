@@ -9,7 +9,9 @@ import discord
 import pytest
 
 from golive_relay.adapter.output_account import AccountMismatch, OutputAccountAdapter
-from golive_relay.supervisor.outputs_model import OutAuthRejected, MirrorParticipants, OutHealth, OutJoined, OutReady, OutVoiceObserved
+from golive_relay.supervisor.outputs_model import (
+    OutAuthRejected, MirrorParticipants, OutHealth, OutJoined, OutReady, OutViewers, OutVoiceObserved,
+)
 
 USER, GUILD, CHAN = 7, 1, 2
 
@@ -279,5 +281,35 @@ def test_publish_plays_with_configured_audio_bitrate() -> None:
         await a.publish(5, 1, 30, "SRC", CHAN)
         assert ("play_kw", {"bitrate": 96}) in calls
         await a.end()
+
+    asyncio.run(go())
+
+
+def test_own_go_live_viewers_emitted_without_bots() -> None:
+    async def go():
+        events: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, events.append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient([]), bot_user_ids=frozenset({40, 41}),
+        )
+        await a.start("tok")
+        own = lambda ids, ch=CHAN, owner=USER: NS(owner_id=owner, channel_id=ch, viewer_ids=ids)  # noqa: E731
+        await a._client.on_stream_create(own([5]))  # not in voice yet: no data for a Go Live of this run
+        await a.publish(5, 1, 30, "SRC", CHAN)
+        events.clear()
+        await a._client.on_stream_create(own([USER, 40]))
+        await a._client.on_stream_update(own([]), own([5, 41, 6]))
+        await a._client.on_stream_update(own([5, 41, 6]), own([6, 5]))  # same viewers: no event
+        await a._client.on_stream_update(own([]), own([9], owner=8))  # another user's Go Live
+        await a._client.on_stream_update(own([]), own([9], ch=77))  # another channel
+        assert events == [OutViewers(USER, frozenset()), OutViewers(USER, frozenset({5, 6}))]
+        await a.end()
+        events.clear()
+        await a._client.on_stream_update(own([]), own([5]))  # ended: the account is not live
+        assert events == []
+        await a.publish(5, 2, 30, "SRC", CHAN)
+        events.clear()
+        await a._client.on_stream_update(own([]), own([5, 6]))  # a new run reports again
+        assert events == [OutViewers(USER, frozenset({5, 6}))]
 
     asyncio.run(go())

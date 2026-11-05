@@ -17,7 +17,8 @@ from golive_relay.supervisor.outputs_model import AccountPersisted
 
 SCHEMA_VERSION = 3
 # v1 has no ``accounts`` (read as {}); v1/v2 have no ``routing`` (read as None);
-# ``prejoin_voice`` is an optional v3 key (missing reads as None)
+# ``prejoin_voice`` and ``relay_autoscale`` are optional v3 keys (missing reads as None);
+# ``chat_operator_ids`` is an optional v3 key (missing reads as [])
 _READ_VERSIONS = (1, 2, 3)
 _ACCOUNT_KEYS = {"fatal_latch", "quarantine_incarnation", "consecutive_rejections"}
 _ROUTING_KEYS = {"target_user_id", "channel_id", "mirrors"}
@@ -48,6 +49,8 @@ class PersistedState:
     # {"target_user_id": int, "channel_id": int, "mirrors": {str(channel_id): int(user_id)}}; None = use config
     routing: dict | None = None
     prejoin_voice: bool | None = None  # chat override of runtime.prejoin_voice; None = use config
+    relay_autoscale: bool | None = None  # chat override of runtime.relay_autoscale; None = use config
+    chat_operator_ids: list = field(default_factory=list)  # user ids added by `op add`; config owners not included
 
 
 def _empty_account() -> dict:
@@ -108,6 +111,8 @@ def _parse(raw: bytes) -> PersistedState:
             accounts=data["accounts"] if data["schema_version"] >= 2 else {},
             routing=data["routing"] if data["schema_version"] == 3 else None,
             prejoin_voice=data.get("prejoin_voice") if data["schema_version"] == 3 else None,
+            relay_autoscale=data.get("relay_autoscale") if data["schema_version"] == 3 else None,
+            chat_operator_ids=data.get("chat_operator_ids", []) if data["schema_version"] == 3 else [],
         )
         if (
             type(st.revision) is not int
@@ -116,6 +121,7 @@ def _parse(raw: bytes) -> PersistedState:
             or not (st.fatal_latch is None or isinstance(st.fatal_latch, dict))
             or not (st.quarantine is None or isinstance(st.quarantine, dict))
             or not (st.prejoin_voice is None or type(st.prejoin_voice) is bool)
+            or not (st.relay_autoscale is None or type(st.relay_autoscale) is bool)
         ):
             raise ValueError("bad field type")
         if st.quarantine is not None and (
@@ -140,6 +146,9 @@ def _parse(raw: bytes) -> PersistedState:
                 raise ValueError(f"bad account record {key!r}")
         if st.routing is not None:
             _check_routing(st.routing)
+        ops = st.chat_operator_ids
+        if not isinstance(ops, list) or not all(_positive_int(u) for u in ops) or len(set(ops)) != len(ops):
+            raise ValueError("bad chat_operator_ids")
         return st
     except (ValueError, KeyError, UnicodeDecodeError) as e:
         raise StateCorrupt(f"state.json is corrupt: {e}") from e
