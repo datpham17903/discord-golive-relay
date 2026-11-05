@@ -127,7 +127,7 @@ relayctl validate --config config.yaml
 | `discord.ingest_publishes` | Ingest account also publishes its own Go Live | `true` | set `false` to publish only from output accounts |
 | `discord.relay_accounts` | Extra publish-only accounts for the main channel (list of `{user_id, credential}`); started as viewers grow (`runtime.relay_autoscale`). Relay and mirror accounts together: max 9, never shared | `[]` | the main channel outgrows one Go Live |
 | `discord.mirror_accounts` | Publish-only accounts for other voice channels (list of `{user_id, credential}` plus optional `channel_id`); one account per channel, one channel per account. A `channel_id` fixes the account to that channel (not the main channel, not shared by two mirrors) and starts it there while `state.json` has no routing | `[]` | you mirror the stream into other channels |
-| `discord.output_accounts` | Deprecated alias of `relay_accounts` (logs a warning); cannot be combined with the new lists | absent | migrate to `relay_accounts` |
+| `discord.output_accounts` | Deprecated alias of `relay_accounts` (Python prints a `FutureWarning` to stderr when the config loads; nothing goes to the JSON log); cannot be combined with the new lists | absent | migrate to `relay_accounts` |
 | `authorization.agreement_ref` | Note pointing to the consent record | placeholder | always |
 | `authorization.excluded_viewer_ids` | Viewer IDs the target asked to exclude | `[]` | the target asks |
 | `codecs.parent_codecs`, `watch_codecs` | Video codecs the relay offers to decode. `h264_only` makes Discord send the target's stream as H.264 for every viewer of it (it picks a codec all participants decode), so passthrough always applies; `auto_decode` offers every codec PyAV decodes | `h264_only` | rarely |
@@ -192,7 +192,7 @@ Two pools, never mixed:
 
 - **Relay accounts** (`relay_accounts`) add Go Lives in the main channel so more people can watch. They are started in config order. A relay account is never used as a mirror.
 - **Mirror accounts** (`mirror_accounts`) publish in other voice channels: one account per channel, one channel per account. A mirror with `channel_id` is used only for that channel, and starts there on its own while `state.json` has no `routing`. Mirrors without `channel_id` are free for `!relay mirror`. A mirror account is never used as a relay.
-- An old config with only `output_accounts` still runs: those accounts are relay accounts (a deprecation warning is printed). Mirrors then need `mirror_accounts`.
+- An old config with only `output_accounts` still runs: those accounts are relay accounts (Python prints a `FutureWarning` to stderr when the config loads; it is not in the JSON log). Mirrors then need `mirror_accounts`. If `state.json` already has mirrors in its `routing`, move those accounts to `mirror_accounts` (or run `!relay unmirror` before upgrading); otherwise the service stops at start with `state.json routing is invalid`.
 
 ### Relay autoscale
 
@@ -202,7 +202,7 @@ With `runtime.relay_autoscale: true` (the default) only as many relay accounts p
 - One Go Live holds `cap = runtime.stream_viewer_cap` viewers (50). The target's stream holds `cap - 1` (the ingest uses one slot), and the ingest's own Go Live holds `cap` more when `ingest_publishes` is true.
 - Relays needed = ceil(max(0, N - capacity) / cap). With `ingest_publishes: true` and cap 50: 99 people need 0 relays, 100 need 1, 150 need 2 (49 + 50 + 2 x 50 = 199 slots), 200 need 3.
 - More people start relays at once. Fewer people stop the last relay only after the need stayed lower for `runtime.relay_scale_down_seconds` (120 s, 2 minutes) without a break, so a count that flaps around a threshold never stops a relay early.
-- A FATAL or quarantined relay is replaced by the next free relay account. When there are not enough usable relay accounts, `!relay status` shows a ⚠️ shortage.
+- A FATAL or quarantined relay, a relay in backoff, and a relay that failed for good in the current session are replaced by the next free relay account; a relay that is running keeps its slot over an idle one. When there are not enough usable relay accounts, `!relay status` shows a ⚠️ shortage.
 - `relay_autoscale: false` keeps every relay account publishing during a session.
 
 ### Approved profile manifest
@@ -322,7 +322,7 @@ With `control.chat_commands: true` the ingest account reads messages in the conf
 | Command | What it does |
 | --- | --- |
 | `!relay` | Shows the command list |
-| `!relay status` | Session state and uptime; target; main channel with its member count N; relays needed/running/available, a ⚠️ shortage warning and the time left before a scale-down; each relay account and each mirror with its state and uptime; pre-join, debounce, video mode and output size; the last watch time and whether the target audio has signal. The same values are in `status.json` under `details` |
+| `!relay status` | Session state and uptime; target; main channel with its member count N; relays needed/running/available, a ⚠️ shortage warning and the time left before a scale-down; each relay account and each mirror with its state and uptime; the free mirror accounts; pre-join, debounce, video mode and output size; the last watch time and whether the target audio has signal. The same values are in `status.json` under `details` |
 | `!relay on` / `!relay off` | Same as `relayctl enable` / `disable` |
 | `!relay target <user_id>` | Relays another person. The current session stops and starts again when the new target shares in the main channel. A relay account (ingest or output) is refused |
 | `!relay channel <channel_id>` | Moves the main voice channel. The channel must be a voice channel of the guild and not a mirror |
@@ -485,6 +485,7 @@ After fixing the cause: `relayctl reset-fatal --state-dir DIR` (add `--account I
 | `not operable: profile ... not approved` | Add the profile to `verified-profiles.json` (section 5) |
 | `relay_accounts[i]: ...` / `mirror_accounts[i]: ...` | Need `user_id` and `credential` (mirrors may add `channel_id`); IDs and credential names must be unique; a mirror `channel_id` must not be the main channel or another mirror's |
 | `output_accounts: deprecated; cannot be combined ...` | Move the entries to `relay_accounts` and remove `output_accounts` |
+| `state.json routing is invalid` (`mirror ... is not a configured mirror account`) after switching to `output_accounts` or `relay_accounts` | Every `output_accounts` entry is a relay account. Move the accounts used by the stored mirrors to `mirror_accounts`, or remove the `routing` entry from `state.json` (run `!relay unmirror` before upgrading) |
 | `no credential: ...` | Set `RELAY_TOKEN_DIR` (or systemd `LoadCredential`); file name must equal the credential name |
 
 ## 11. What is verified live

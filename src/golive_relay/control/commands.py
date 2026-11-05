@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import unicodedata
 from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping
@@ -267,30 +268,6 @@ def describe_change(cmd: Command, old: Routing, new: Routing, ctx: RoutingContex
     return "✅ **Xong**"
 
 
-def format_status(
-    routing: Routing, ctx: RoutingContext, session: str, account_states: Mapping[int, str], prejoin: bool = False,
-    routing_error: str | None = None, details: StatusDetails | None = None,
-) -> str:
-    if details is not None:
-        return _format_details(routing, ctx, details, routing_error)
-    lines = [
-        "📡 **Trạng thái relay**",
-        f"• Phiên: **{session}**",
-        f"• Pre-join: {'bật' if prejoin else 'tắt'}",
-        f"• Target: {_user(ctx, routing.target_user_id)}",
-        f"• Kênh chính: {_ch(routing.channel_id)}",
-    ]
-    if routing.mirrors:
-        lines.append("• Mirror:")
-        for ch, acct in routing.mirrors.items():
-            lines.append(f"  - {_ch(ch)} ← {_user(ctx, acct)}: {account_states.get(acct, 'không rõ')}")
-    else:
-        lines.append("• Mirror: chưa có mirror")
-    if routing_error is not None:
-        lines.append("⚠️ **state.json có routing không hợp lệ** (đang bị bỏ qua); relay sẽ dừng ở lần khởi động sau.")
-    return "\n".join(lines)
-
-
 def _dur(s: float | None) -> str:
     if s is None:
         return "-"
@@ -299,12 +276,12 @@ def _dur(s: float | None) -> str:
     return f"{h}h{m:02d}m{sec:02d}s" if h else f"{m}m{sec:02d}s" if m else f"{sec}s"
 
 
-def _format_details(routing: Routing, ctx: RoutingContext, d: StatusDetails, routing_error: str | None) -> str:
+def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routing_error: str | None = None) -> str:
     relay = f"• Relay (cần/đang chạy/có sẵn): {d.relay_wanted}/{d.relay_running}/{d.relay_available}"
     if d.relay_short_by > 0:
         relay += f" ⚠️ **thiếu {d.relay_short_by} tài khoản**"
     if d.scale_down_in_s is not None:
-        relay += f", giảm sau {int(d.scale_down_in_s)}s"
+        relay += f", giảm sau {math.ceil(d.scale_down_in_s)}s"
     lines = [
         "📡 **Trạng thái relay**",
         f"• Phiên: **{d.session_state}**, chạy {_dur(d.session_uptime_s)}",
@@ -322,6 +299,8 @@ def _format_details(routing: Routing, ctx: RoutingContext, d: StatusDetails, rou
             lines.append(f"• Mirror {_ch(ch)} ← {_user(ctx, acct)}: {state}, {_dur(up)}")
     else:
         lines.append("• Mirror: chưa có mirror")
+    free = [_user(ctx, uid) for uid, role, ch, _, _ in d.accounts if role == "mirror" and ch is None]
+    lines.append(f"• Tài khoản mirror rảnh: {', '.join(free) if free else 'không có'}")
     lines.append(
         f"• Cấu hình: pre-join {'bật' if d.prejoin else 'tắt'}, debounce {d.debounce_ms}ms, "
         f"video {d.video_mode}, {d.output_size}"

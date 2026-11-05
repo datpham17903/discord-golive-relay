@@ -429,6 +429,40 @@ def test_quarantined_relay_replaced_by_next():
     assert OutSetQuarantine(A, 7) in acts and acts[-1] == OutStart(B, 1, 1, CH)
 
 
+def test_relay_failed_for_session_replaced_by_next():
+    p = make((A, B))
+    p.set_relay_target(1, 0.0)
+    assert p.handle(SessionLive(1, 1, 7), 0.0) == [OutStart(A, 1, 1, CH)]
+    p.handle(OutFailed(A, 1, 1, StopReason.CONFIG_INVALID, False), 0.5)
+    assert p.handle(OutTick(), 2.0) == [OutStart(B, 1, 1, CH)]  # after the start stagger
+    assert p.relay_summary() == {"wanted": 1, "running": 1, "available": 1, "short_by": 0}
+    p.set_relay_target(2, 1.0)
+    assert p.relay_summary() == {"wanted": 2, "running": 1, "available": 1, "short_by": 1}
+    # next session A gets a fresh chance
+    p.handle(SessionEnded(1, StopReason.SHUTDOWN, False), 2.0)
+    assert p.handle(SessionLive(2, 2, 7), 10.0) == [OutStart(A, 2, 2, CH)]
+
+
+def test_backoff_relay_replaced_and_live_relay_kept():
+    p = make((A, B))
+    p.set_relay_target(1, 0.0)
+    t = bring_live(p, (A,))
+    acts = p.handle(OutHealth(A, 1, 1, False), t + 5.0)
+    assert acts[-1] == OutStart(B, 1, 1, CH)
+    assert p.relay_summary()["short_by"] == 0
+    p.handle(OutJoined(B, 1, 1, f"vs{B}"), t + 5.5)
+    p.handle(OutReady(B, 1, 1, "H264"), t + 5.5)
+    # A's backoff expires: B stays, A is not restarted
+    assert p.handle(OutTick(), t + 10.0) == []
+    assert p.account_live(B, 1, 1)
+    # scale 2 -> 1 while A is in backoff keeps the live B
+    assert p.set_relay_target(2, t + 11.0) == [OutStart(A, 1, 2, CH)]
+    p.handle(OutHealth(A, 1, 2, False), t + 11.5)
+    assert p.status(t + 11.5)[0]["state"] == "backoff"
+    assert p.set_relay_target(1, t + 12.0) == []
+    assert p.account_live(B, 1, 1)
+
+
 def test_unassigned_mirror_never_starts():
     p = make((A, B), mirror_ids=(B,), excluded=(555,))
     assert p.channel_of(B) is None

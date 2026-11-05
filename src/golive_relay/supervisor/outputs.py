@@ -144,7 +144,7 @@ class OutputPool:
         return out
 
     def relay_summary(self) -> dict:
-        available = sum(1 for uid in self._relays if self._usable(self._accts[uid]))
+        available = sum(1 for uid in self._relays if self._relay_candidate(self._accts[uid]))
         return {
             "wanted": self._relay_target,
             "running": sum(1 for uid in self._relays if self._active(self._accts[uid])),
@@ -261,8 +261,20 @@ class OutputPool:
     def _usable(rec: _Acct) -> bool:
         return rec.state not in (OutputState.FATAL, OutputState.QUARANTINE)
 
+    def _relay_candidate(self, rec: _Acct) -> bool:
+        """A relay in BACKOFF or failed for this session cannot hold a slot, so the next relay takes over."""
+        s = self._session
+        return (
+            self._usable(rec)
+            and rec.state is not OutputState.BACKOFF
+            and not (s is not None and rec.skip_generation == s.generation)
+        )
+
     def _wanted_relays(self) -> list[int]:
-        return [uid for uid in self._relays if self._usable(self._accts[uid])][: self._relay_target]
+        """Running (or queued) relays keep their slot over idle ones; config order breaks ties."""
+        cands = [uid for uid in self._relays if self._relay_candidate(self._accts[uid])]
+        cands.sort(key=lambda uid: not (self._active(self._accts[uid]) or self._accts[uid].queued))
+        return cands[: self._relay_target]
 
     def _allowed(self, rec: _Acct) -> bool:
         """A mirror account runs only while assigned; a relay account only within the first n usable relays."""
@@ -279,9 +291,6 @@ class OutputPool:
                     self._enqueue(rec)
             elif self._active(rec):
                 self._stop(rec, "relay_scaled_down", StopReason.RELAY_SCALED_DOWN, out)
-            elif rec.state is OutputState.BACKOFF:
-                rec.state = OutputState.OFF
-                rec.backoff_until = None
 
     def _enqueue(self, rec: _Acct) -> None:
         if not rec.queued:

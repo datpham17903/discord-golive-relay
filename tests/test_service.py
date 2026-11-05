@@ -1313,6 +1313,13 @@ def test_status_details_from_service(tmp_path, slate, source_gop):
         w, h, fps = env.cfg.profile_key()
         assert d["output_size"] == f"{w}x{h}@{fps}" and d["video_mode"] == env.cfg.codecs.video_mode
         assert d["last_watch_ms"] is not None
+        # a later session that never sent a watch keeps the last measurement
+        saved = env.svc._timing
+        env.svc._timing = {"generation": -1, "start": 0.0, "seen": None, "gate_ready": None, "prejoined": False,
+                           "marks": {}, "extra": {}}
+        env.svc._log_timing(-1, "test")
+        env.svc._timing = saved
+        assert env.svc.status_dict()["details"]["last_watch_ms"] == d["last_watch_ms"]
         rows = {row[0]: row for row in d["accounts"]}
         assert rows[r1][1:4] == ("relay", env.chan, "live") and rows[r1][4] is not None
         assert rows[r2][1:4] == ("relay", env.chan, "off") and rows[r2][4] is None

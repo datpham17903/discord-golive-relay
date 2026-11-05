@@ -116,16 +116,16 @@ def test_no_free_account_error():
 
 def test_status_format():
     c = ctx(user_name=lambda u: {555: "Alice", O1: "Out1"}.get(u))
-    s = format_status(routing({200: O1}), c, "ACTIVE", {O1: "READY"})
+    s = format_status(routing({200: O1}), c, _details())
     assert s.startswith("📡") and s.count("\n") >= 3
-    assert "Alice (555)" in s and "<#100>" in s and "<#200>" in s and "Out1 (21)" in s and "READY" in s
-    assert "chưa có mirror" in format_status(routing(), c, "IDLE", {})
+    assert "Alice (555)" in s and "<#100>" in s and "<#200>" in s and "Out1 (21)" in s and "ready" in s
+    assert "chưa có mirror" in format_status(routing(), c, _details())
 
 
 def test_no_reply_contains_user_mention():
     c = ctx(user_name=lambda u: "Bob")
     old = routing({200: O1})
-    outs = [HELP, format_status(old, c, "X", {O1: "OK"})]
+    outs = [HELP, format_status(old, c, _details())]
     for cmd in (SetTarget(999), SetChannel(300), AddMirror(400), RemoveMirror(200), RemoveMirror(None), SetEnabled(True)):
         new = plan_change(cmd, old, c)
         assert isinstance(new, Routing)
@@ -141,7 +141,7 @@ def test_display_names_are_sanitized():
     hostile = {555: "<@123> @everyone `x`", O1: "<@&9>", 999: "@<>`"}
     c = ctx(user_name=hostile.get)
     old = routing({200: O1})
-    outs = [format_status(old, c, "X", {O1: "OK"}), describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)]
+    outs = [format_status(old, c, _details(output_size="1920x1080")), describe_change(SetTarget(999), old, plan_change(SetTarget(999), old, c), c)]
     for o in outs:
         assert "<@" not in o and "@" not in o and "`x`" not in o
     assert "123 everyone x (555)" in outs[0]
@@ -168,8 +168,8 @@ def test_prejoin_plan_and_reply():
 
 
 def test_status_shows_prejoin():
-    assert "Pre-join: bật" in format_status(routing(), ctx(), "IDLE", {}, prejoin=True)
-    assert "Pre-join: tắt" in format_status(routing(), ctx(), "IDLE", {}, prejoin=False)
+    assert "pre-join bật" in format_status(routing(), ctx(), _details(prejoin=True))
+    assert "pre-join tắt" in format_status(routing(), ctx(), _details(prejoin=False))
 
 
 def test_display_names_neutralise_markdown_and_format_chars():
@@ -182,7 +182,7 @@ def test_display_names_neutralise_markdown_and_format_chars():
     }
     c = ctx(user_name=hostile.get)
     old = routing({200: O1, 300: O2, 400: O3})
-    s = format_status(old, c, "X", {})
+    s = format_status(old, c, _details(output_size="1920x1080"))  # no "@60": the test bans every "@"
     for bad in ("[", "]", "(https", "\u202e", "@", "<@"):
         assert bad not in s
     assert "://" not in s and "<@" not in s
@@ -202,9 +202,9 @@ def test_parse_id_edges_and_prefix():
 
 
 def test_status_shows_invalid_state_routing():
-    s = format_status(routing(), ctx(), "IDLE", {}, routing_error="target is a relay account")
+    s = format_status(routing(), ctx(), _details(), routing_error="target is a relay account")
     assert "⚠️" in s and "state.json" in s
-    assert "⚠️" not in format_status(routing(), ctx(), "IDLE", {})
+    assert "⚠️" not in format_status(routing(), ctx(), _details())
 
 
 def test_mirror_with_explicit_account():
@@ -276,7 +276,7 @@ def _details(**over):
 
 def test_status_details_layout():
     c = ctx(user_name=lambda u: {555: "<@1> Alice", R1: "Relay1", O1: "Mir1"}.get(u))
-    s = format_status(routing({200: O1}), c, "ACTIVE", {}, details=_details())
+    s = format_status(routing({200: O1}), c, _details())
     lines = s.splitlines()
     assert lines[0].startswith("📡")
     assert "LIVE" in lines[1] and "1h02m05s" in lines[1]
@@ -287,14 +287,15 @@ def test_status_details_layout():
     assert "<#200>" in s and "Mir1 (21)" in s and "ready" in s
     assert "bật" in s and "100ms" in s and "passthrough" in s and "1920x1080@60" in s
     assert "412ms" in s and "audio" in s.lower()
+    assert "mirror rảnh: 22" in s  # unassigned mirror account O2
     assert "<@" not in s
 
 
 def test_status_shows_shortage_warning():
     d = _details(relay_wanted=3, relay_running=2, relay_available=2, relay_short_by=1, scale_down_in_s=None)
-    s = format_status(routing(), ctx(), "ACTIVE", {}, details=d)
+    s = format_status(routing(), ctx(), d)
     relay_line = s.splitlines()[4]
     assert "⚠️" in relay_line and "thiếu 1" in relay_line
-    s = format_status(routing(), ctx(), "ACTIVE", {}, details=_details(scale_down_in_s=42.4, last_watch_ms=None, audio_ok=False))
-    assert "giảm sau 42s" in s.splitlines()[4]
+    s = format_status(routing(), ctx(), _details(scale_down_in_s=42.4, last_watch_ms=None, audio_ok=False))
+    assert "giảm sau 43s"  # rounded up in s.splitlines()[4]
     assert "⚠️" not in s.splitlines()[4]

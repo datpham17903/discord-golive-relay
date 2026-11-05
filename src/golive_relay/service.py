@@ -423,12 +423,8 @@ class Service:
             if isinstance(cmd, ParseError):
                 outcome, text = "parse_error", cmd.text
             elif isinstance(cmd, Status):
-                now = time.monotonic()
-                states = {row["account"]: row["state"] for row in self.pool.status(now)}
-                outcome, text = "status", format_status(old, ctx, self.sup.state.value, states,
-                                                        prejoin=self.sup.prejoin_voice,
-                                                        routing_error=self._routing_error,
-                                                        details=self._status_details(now))
+                outcome, text = "status", format_status(old, ctx, self._status_details(time.monotonic()),
+                                                        routing_error=self._routing_error)
             elif isinstance(cmd, SetEnabled):
                 self._set_enabled(cmd.on)
                 outcome, text = "applied", describe_change(cmd, old, old, ctx)
@@ -774,7 +770,8 @@ class Service:
             fields[f"{name}_ms"] = round((at - start) * 1000)
             if seen is not None and name in _FROM_SEEN:
                 fields[f"{name}_from_seen_ms"] = round((at - seen) * 1000)
-        self._last_watch_ms = fields.get("watch_sent_from_seen_ms")
+        if "watch_sent_from_seen_ms" in fields:  # sessions that never sent a watch keep the last measurement
+            self._last_watch_ms = fields["watch_sent_from_seen_ms"]
         self.log("session_timing", **fields)
 
     # ----------------------------------------------------------- async steps
