@@ -35,7 +35,7 @@ from golive_relay.media.source import RelayMediaSource
 from golive_relay.obs import JsonLogger, Metrics, write_status
 from golive_relay.supervisor.outputs import OutputPool
 from golive_relay.supervisor.outputs_model import (
-    OutCloseGate, OutFailed, OutputAccount, OutputState, OutSetFatal, OutSetLive, OutSetQuarantine, OutSetRejections,
+    OutCloseGate, OutFailed, OutHealth, OutputAccount, OutputState, OutSetFatal, OutSetLive, OutSetQuarantine, OutSetRejections,
     OutSlate, OutStart, OutTeardown, OutTick, SessionEnded, SessionHold, SessionLive,
 )
 from golive_relay.supervisor.retry import RetryPolicy
@@ -585,6 +585,12 @@ class Service:
     # ------------------------------------------------------- output accounts
 
     def _pool_event(self, event: Any) -> None:
+        if isinstance(event, OutFailed):
+            role = next((a.role for a in self.cfg.output_accounts() if a.user_id == event.account), None)
+            self.log("output_failed", account=event.account, role=role, channel=self.pool.channel_of(event.account),
+                     reason=event.reason.value, retryable=event.retryable, detail=event.detail[:300])
+        elif isinstance(event, OutHealth) and not event.ok:
+            self.log("output_unhealthy", account=event.account, channel=self.pool.channel_of(event.account))
         for a in self.pool.handle(event, time.monotonic()):
             self._pool_action(a)
 

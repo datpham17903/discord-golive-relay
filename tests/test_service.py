@@ -684,6 +684,33 @@ def test_mirror_command_starts_account_in_mirror_channel(tmp_path, slate, source
     asyncio.run(main())
 
 
+def test_failed_mirror_publish_logs_output_failed(tmp_path, slate, source_gop):
+    uid, mirror_chan = 424242, 999
+
+    class FailingOut(FakeOutAdapter):
+        async def publish(self, g, n, fps, source, channel_id):
+            raise RuntimeError("boom")
+
+    env = _multi_env(tmp_path, slate, source_gop, uid, lambda acct, events, log: FailingOut(acct, events, []),
+                     role="mirror")
+
+    events: list = []
+    env.svc.log = lambda name, **kw: events.append((name, kw))
+
+    async def main():
+        task = await reach_relaying(env)
+        env.adapters[0].voice_ids = frozenset({env.chan, mirror_chan})
+        chat(env, f"!relay mirror {mirror_chan}")
+        await wait_until(lambda: any(n == "output_failed" for n, _ in events))
+        kw = dict(events)["output_failed"]
+        assert kw["account"] == uid and kw["role"] == "mirror" and kw["channel"] == mirror_chan
+        assert kw["reason"] == "connect_failed" and kw["retryable"] is True and "boom" in kw["detail"]
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
 # ------------------------------------------------------- start latency / slot race
 
 
