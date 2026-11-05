@@ -1543,22 +1543,24 @@ def test_chat_autoscale_toggle_persists_and_applies_live(tmp_path, slate, source
 
 
 def test_repeated_autoscale_on_keeps_the_idle_stop_countdown(tmp_path, slate, source_gop):
-    from golive_relay.supervisor.outputs_model import OutputAccount
+    from golive_relay.supervisor.outputs_model import OutputAccount, OutViewers
 
-    r1, r2 = 424242, 424243
+    r1 = 424242
     outs: list = []
-    env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1"), OutputAccount(r2, "t2")], outs,
+    env = _pool_env(tmp_path, slate, source_gop, [OutputAccount(r1, "t1")], outs,
                     stream_viewer_cap=1, relay_idle_stop_seconds=1.5)
 
     def stop_in():
-        return min(r[6] for r in env.svc.status_dict()["details"]["accounts"] if r[6] is not None)
+        return next(r[6] for r in env.svc.status_dict()["details"]["accounts"] if r[0] == r1)
 
     async def main():
         task = await reach_relaying(env)
-        await asyncio.sleep(0.1)
         chat(env, "!relay autoscale off", 1)
-        await wait_until(lambda: _published(outs, r1) and _published(outs, r2))
+        await wait_until(lambda: _published(outs, r1))
         chat(env, "!relay autoscale on", 2)
+        out = next(o for o in outs if o.acct.user_id == r1)
+        out.events(OutViewers(r1, frozenset()))
+        await wait_until(lambda: stop_in() is not None)
         first = stop_in()
         await asyncio.sleep(0.3)
         chat(env, "!relay autoscale on", 3)

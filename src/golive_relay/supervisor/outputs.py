@@ -153,14 +153,17 @@ class OutputPool:
     def relay_summary(self) -> dict:
         available = sum(1 for uid in self._relays if self._relay_candidate(self._accts[uid]))
         running = sum(1 for uid in self._relays if self._active(self._accts[uid]))
-        waiting = sum(1 for uid, _ in self._surplus_stops() if self._active(self._accts[uid]))
+        waiting = {uid for uid, _ in self._surplus_stops() if self._active(self._accts[uid])}
+        # relays with no known viewers (still joining) are not "kept because watched"
+        unknown = sum(1 for uid in self._relays if self._active(self._accts[uid]) and uid not in waiting
+                      and not self._accts[uid].viewers)
         return {
             "wanted": self._relay_target,
             "running": running,
             "available": available,
             "short_by": max(0, self._relay_target - available),
             # extra relays that stay because they have (or may still have) viewers
-            "kept": max(0, running - self._relay_target) - waiting,
+            "kept": max(0, running - self._relay_target - len(waiting) - unknown),
         }
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
@@ -188,7 +191,7 @@ class OutputPool:
                 "quarantine_incarnation": r.quarantine_inc,
                 "consecutive_rejections": r.rejections,
                 "viewers": None if r.viewers is None else len(r.viewers),
-                "stop_in": None if r.account.user_id not in stops else max(0.0, stops[r.account.user_id] - now),
+                "stop_in": None if r.account.user_id not in stops or not self._active(r) else max(0.0, stops[r.account.user_id] - now),
             }
             for r in self._accts.values()
         ]
@@ -296,11 +299,13 @@ class OutputPool:
         viewer data yet within four idle periods of going live)."""
         if not self._active(rec):
             return float("-inf")  # only queued: nothing to cut
+        if rec.live_at is None:
+            return None
         if rec.viewers is None:
-            return None if rec.live_at is None else rec.live_at + 4 * self._idle_stop
+            return rec.live_at + 4 * self._idle_stop
         if rec.viewers or rec.zero_since is None:
             return None
-        return rec.zero_since + self._idle_stop
+        return max(rec.zero_since, rec.live_at) + self._idle_stop
 
     def _surplus_stops(self) -> list[tuple[int, float]]:
         """Extra relays chosen to stop, earliest first, with the time each may stop: only relays without viewers,

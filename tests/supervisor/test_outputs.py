@@ -574,3 +574,43 @@ def test_kept_relay_counts_toward_a_higher_target():
     assert p.set_relay_target(2, t + 2.0) == []  # B already runs
     assert p.relay_summary()["kept"] == 0
     assert p.set_relay_target(3, t + 3.0) == [OutStart(C, 1, 1, CH)]
+
+
+def test_status_has_no_stop_in_for_a_queued_relay():
+    p = make((A, B))
+    p.set_relay_target(2, 0.0)
+    p.handle(SessionLive(1, 1, 7), 0.0)  # A starts, B waits for the stagger
+    p._relay_target = 1
+    assert p.status(0.0)[1]["state"] == "off" and p.status(0.0)[1]["stop_in"] is None
+
+
+def test_zero_viewer_clock_starts_only_once_the_relay_is_live():
+    p = make((A, B))
+    p.set_relay_target(2, 0.0)
+    t = bring_live(p, (A,))
+    p.handle(OutViewers(A, frozenset({900})), t)
+    acts = p.handle(OutTick(), t + 2.0)
+    n = next(a.attempt for a in acts if isinstance(a, OutStart) and a.account == B)
+    p.handle(OutJoined(B, 1, n, f"vs{B}"), t + 2.0)
+    p.handle(OutViewers(B, frozenset()), t + 2.0)  # empty set arrives while B still joins
+    p.set_relay_target(1, t + 3.0)
+    assert p.handle(OutTick(), t + 1000.0) == []
+    assert p.status(t + 1000.0)[1]["stop_in"] is None
+    p.handle(OutReady(B, 1, n, "H264"), t + 1000.0)
+    assert p.handle(OutTick(), t + 1029.0) == []
+    assert kinds(p.handle(OutTick(), t + 1030.0)) == [OutCloseGate, OutTeardown]
+
+
+def test_kept_counts_only_relays_with_known_viewers():
+    p = make((A, B))
+    p.set_relay_target(2, 0.0)
+    t = bring_live(p, (A,))
+    p.handle(OutViewers(A, frozenset({900})), t)
+    acts = p.handle(OutTick(), t + 2.0)
+    n = next(a.attempt for a in acts if isinstance(a, OutStart) and a.account == B)
+    p.handle(OutJoined(B, 1, n, f"vs{B}"), t + 2.0)  # B is still joining: no viewer data
+    p.set_relay_target(1, t + 3.0)
+    assert p.relay_summary()["kept"] == 0
+    p.handle(OutReady(B, 1, n, "H264"), t + 4.0)
+    p.handle(OutViewers(B, frozenset({901})), t + 4.0)
+    assert p.relay_summary()["kept"] == 1
