@@ -1187,7 +1187,11 @@ class Service:
         if not self._adaptive:
             return
         g = self._session_gen  # actions queued now are void once the session changes
-        for a in self._codec_ctl.handle(event, time.monotonic()):
+        before = self._codec_ctl.effective
+        actions = self._codec_ctl.handle(event, time.monotonic())
+        if self._codec_ctl.effective != before:
+            self.log("codec_change", old=before, new=self._codec_ctl.effective)
+        for a in actions:
             match a:
                 case cc.UpdateWatch(codecs=names):
                     self._queue(self._codec_run, a, g, self._codec_update_watch, names)
