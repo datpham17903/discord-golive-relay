@@ -13,6 +13,8 @@ import time
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 
+from golive_relay.media.bitstream import CODEC_ORDER
+
 from .liveness import LivenessTracker
 from .model import (
     Action, ApplyRouting, AuthRejected, ClearFatalLatch, CloseGate, CodecChanged, ConfigInvalid, ConnectFailed, CreateOutput,
@@ -65,6 +67,7 @@ class SupervisorConfig:
     prejoin_voice: bool = False
     watch_retry_interval: float = 1.0  # watch failed while joined (slot race): retry this fast, jittered
     watch_retry_cap: float = 300.0  # after this long of fast watch retries, normal backoff resumes
+    adaptive: bool = False  # adaptive codec mode: the output may negotiate any codec in CODEC_ORDER
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,7 +339,7 @@ class Supervisor:
                 self._outbound = True
                 if not self._codec_ok(e.negotiated_video_codec):
                     self._stop(StopReason.CODEC_MISMATCH, now, acts)
-            case CodecChanged() as e if self._cur(e):
+            case CodecChanged() as e if self._cur(e) and not self.cfg.adaptive:
                 if not self._codec_ok(e.negotiated_video_codec):
                     self._stop(StopReason.CODEC_MISMATCH, now, acts)
             case ConnectFailed() as e if self._cur(e):
@@ -388,8 +391,9 @@ class Supervisor:
         """Only the configured target's streams matter; anyone else's are ignored."""
         return s if s is not None and s.owner_id == self.cfg.target_user_id else None
 
-    @staticmethod
-    def _codec_ok(codec: str | None) -> bool:
+    def _codec_ok(self, codec: str | None) -> bool:
+        if self.cfg.adaptive:
+            return codec is not None and codec.upper() in CODEC_ORDER
         return codec is not None and codec.upper() == "H264"
 
     def _mark_ready(self, now: float) -> None:

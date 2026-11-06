@@ -35,10 +35,11 @@ from golive_relay.media.publisher import Publisher
 from golive_relay.media.slate import build_slate
 from golive_relay.media.source import RelayMediaSource
 from golive_relay.obs import JsonLogger, Metrics, write_status
+from golive_relay.supervisor import codec as cc
 from golive_relay.supervisor.outputs import OutputPool
 from golive_relay.supervisor.outputs_model import (
-    OutCloseGate, OutFailed, OutHealth, OutputAccount, OutputState, OutSetFatal, OutSetLive, OutSetQuarantine, OutSetRejections,
-    OutSlate, OutStart, OutTeardown, OutTick, SessionEnded, SessionHold, SessionLive,
+    OutCloseGate, OutCodecChanged, OutFailed, OutHealth, OutputAccount, OutputState, OutPli, OutReady, OutSetFatal, OutSetLive,
+    OutSetQuarantine, OutSetRejections, OutSlate, OutStart, OutTeardown, OutTick, SessionEnded, SessionHold, SessionLive,
 )
 from golive_relay.supervisor.retry import RetryPolicy
 from golive_relay.supervisor.machine import PersistedStateView, Supervisor, SupervisorConfig
@@ -46,7 +47,7 @@ from golive_relay.supervisor.routing import Routing
 from golive_relay.supervisor.scaling import relays_needed
 from golive_relay.supervisor.model import (
     ApplyRouting, ClearFatalLatch, CloseGate, ConfigInvalid, ConnectFailed, CreateOutput, DURABLE_FATAL, EnableChanged, Exit,
-    FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
+    CodecChanged, FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
     ParticipantsChanged, PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, StartConnect, StopReason, Teardown, Tick, VoiceLost, Watching, WorkerFailed,
@@ -92,6 +93,7 @@ def supervisor_config(cfg: RelayConfig) -> SupervisorConfig:
         retry_cooldown=r.retry_cooldown_seconds,
         rejection_limit=r.repeated_rejection_limit,
         prejoin_voice=r.prejoin_voice,
+        adaptive=cfg.codecs.output_codec == "adaptive",
     )
 
 
@@ -163,6 +165,7 @@ class Service:
                           allowed_channel_id=routing.channel_id)
         if st.prejoin_voice is not None:  # chat override persisted in state.json; config is only the default
             sup_cfg = replace(sup_cfg, prejoin_voice=st.prejoin_voice)
+        self._adaptive = cfg.codecs.output_codec == "adaptive"
         self.sup = Supervisor(sup_cfg, persisted_view(st), mirrors=routing.mirrors)
         opus = cfg.codecs.audio_mode == "passthrough"
         self.publisher = Publisher(
@@ -177,7 +180,11 @@ class Service:
             routing=self.sup.routing,
             excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
             relay_idle_stop_s=r.relay_idle_stop_seconds,
+            adaptive=self._adaptive,
         )
+        self._codec_ctl = self._new_codec_ctl()
+        self._src_dims: tuple[int, int] | None = None  # source size while it is passthrough-eligible
+        self._ingest_lock = asyncio.Lock()
         # chat override persisted in state.json; config is only the default
         self._autoscale = r.relay_autoscale if st.relay_autoscale is None else st.relay_autoscale
         if self._autoscale:
@@ -329,6 +336,7 @@ class Service:
             now = time.monotonic()
             self._handle(Tick())
             self._pool_event(OutTick())
+            self._codec_event(cc.Tick())
             self._scale_relays(now)  # OutTick above stops extra relays whose Go Live stayed without viewers
             self._check_voice(now)
             if now >= next_poll:
@@ -408,6 +416,9 @@ class Service:
         if isinstance(event, ChatCommand):
             self._on_chat(event)
             return
+        if isinstance(event, OutPli):  # ingest output: a viewer PLI the library cannot answer
+            self._request_pli()
+            return
         before = self.sup.state
         now = time.monotonic()
         acts = self.sup.handle(event, now)
@@ -421,6 +432,8 @@ class Service:
         if self.sup.state is not before:
             self.log("state", old=before.value, new=self.sup.state.value)
         self._execute(acts)
+        if self._adaptive:
+            self._codec_from_event(event)
         if isinstance(event, (ParticipantsChanged, GatewaySnapshot, RoutingChanged)):
             self._scale_relays(now)
         if isinstance(event, GatewaySnapshot):
@@ -642,6 +655,7 @@ class Service:
                 case ShowSlate(generation=g, reason=reason):
                     self.publisher.set_slate(self._slate)
                     self._pool_event(SessionHold(g, reason))
+                    self._codec_event(cc.Hold())
                     self._send(SetOutput(g, self._epoch, False))
                 case OpenGate(generation=g, epoch=e):
                     self._last_idr_req = 0.0
@@ -650,6 +664,7 @@ class Service:
                     self._send(SetOutput(g, e, True))
                     inc = self.sup.status(time.monotonic()).source_incarnation
                     self._pool_event(SessionLive(g, e, 0 if inc is None else inc))
+                    self._codec_event(cc.Live())
                     if self._session_since is None:
                         self._session_since = time.monotonic()
                     self._mark(g, "open_gate")
@@ -682,6 +697,9 @@ class Service:
                     self._pool_event(SessionEnded(g, reason, reason in INCARNATION_ENDED))
                     self._session_gen = None
                     self._session_since = None
+                    # the ingest output is only ever ended by this Teardown (_teardown), so the fresh controller drops "ingest"
+                    self._codec_ctl = self._new_codec_ctl()
+                    self._src_dims = None
                     worker, self._worker = self._worker, None
                     self._slate = self._canvas = None
                     self._queue(self._teardown, worker, leave)
@@ -715,8 +733,26 @@ class Service:
                      reason=event.reason.value, retryable=event.retryable, detail=event.detail[:300])
         elif isinstance(event, OutHealth) and not event.ok:
             self.log("output_unhealthy", account=event.account, channel=self.pool.channel_of(event.account))
+        elif isinstance(event, OutPli):
+            self._request_pli()
+            return
+        elif isinstance(event, OutCodecChanged):
+            if self.pool.is_current(event.account, event.generation, event.attempt):
+                self._codec_event(cc.OutputCodec(event.account, event.codec))
+            return
+        # a stale failure is ignored by the pool and must not drop the live output from the codec controller
+        failed_current = isinstance(event, OutFailed) and self.pool.is_current(
+            event.account, event.generation, event.attempt)
         for a in self.pool.handle(event, time.monotonic()):
             self._pool_action(a)
+        if failed_current:
+            self._codec_event(cc.OutputGone(event.account))
+        elif isinstance(event, OutReady) and self._adaptive and self.pool.is_current(
+                event.account, event.generation, event.attempt):
+            row = next((r for r in self.pool.status(time.monotonic()) if r["account"] == event.account), None)
+            if row is not None and row["state"] in (OutputState.READY.value, OutputState.LIVE.value):
+                self._out_pubs[event.account].set_codec(event.negotiated_video_codec)
+                self._codec_event(cc.OutputAdded(event.account, event.negotiated_video_codec, "AV1"))
 
     def _pool_action(self, a: Any) -> None:
         self.metrics.inc(f"action.{type(a).__name__}")
@@ -725,10 +761,15 @@ class Service:
                 if self._canvas is None or self._profile is None:
                     self._pool_event(OutFailed(uid, g, n, StopReason.CONNECT_FAILED, True, "no canvas"))
                 else:
-                    w, h = self._canvas
+                    w, h = self._video_dims()
                     p = self._profile
-                    source = RelayMediaSource(
-                        self._out_pubs[uid], VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000))
+                    if self._adaptive:  # the codec is only known once the Go Live negotiated it
+                        pub = self._out_pubs[uid]
+                        source = lambda c, pub=pub, w=w, h=h, p=p: RelayMediaSource(
+                            pub, VideoConfig(c, w, h, p.fps, p.video_bitrate_kbps * 1000))
+                    else:
+                        source = RelayMediaSource(
+                            self._out_pubs[uid], VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000))
                     self._out_queue(uid, self._out_publish, uid, g, n, p.fps, source, ch)
             case OutSetLive(account=uid, generation=g, epoch=e):
                 self._out_since.setdefault(uid, time.monotonic())
@@ -741,9 +782,11 @@ class Service:
                 self._out_pubs[uid].close()  # purges, so a closed publisher holds no frames
             case OutTeardown(account=uid):
                 self._out_since.pop(uid, None)
+                self._codec_event(cc.OutputGone(uid))
                 self._out_queue(uid, self._out_end, uid)
             case OutSetFatal(account=uid, reason=reason, detail=detail):
                 self._out_since.pop(uid, None)
+                self._codec_event(cc.OutputGone(uid))
                 self._persist(lambda s: set_account(
                     s, uid, fatal_latch={"reason": reason.value, "detail": detail, "at": time.time()}))
                 self._out_queue(uid, self._drop_output, uid)
@@ -782,7 +825,10 @@ class Service:
             adapter = self._out_adapters.get(uid)
             if adapter is None:
                 raise RuntimeError("output account not logged in")
-            await adapter.publish(g, n, fps, source, channel_id)
+            if self._adaptive:
+                await adapter.publish(g, n, fps, source, channel_id, adaptive=True)
+            else:
+                await adapter.publish(g, n, fps, source, channel_id)
         except Exception as exc:
             self._pool_event(OutFailed(uid, g, n, StopReason.CONNECT_FAILED, True, repr(exc)))
 
@@ -866,6 +912,8 @@ class Service:
                         "gate_ready": self.sup.gate_ready_at, "prejoined": self._in_voice, "marks": {}, "extra": {}}
         self._gen, self._epoch = a.generation, a.epoch
         self._canvas = None
+        self._codec_ctl = self._new_codec_ctl()
+        self._src_dims = None
         self._worker_dead_reported = False
         try:
             self._profile = self.cfg.output_profile()
@@ -1039,8 +1087,12 @@ class Service:
             codec = "H264"  # the ingest account sends nothing itself when ingest_publishes is false
             if publish:
                 codec = results[1]
+                if self._adaptive:  # the publisher drops other codecs until the controller swaps it
+                    self.publisher.set_codec(codec)
+                    w, h = self._video_dims()
                 adapter.play(RelayMediaSource(
-                    self.publisher, VideoConfig("H264", w, h, p.fps, p.video_bitrate_kbps * 1000)))
+                    self.publisher, VideoConfig(codec if self._adaptive else "H264", w, h, p.fps,
+                                                p.video_bitrate_kbps * 1000)))
         except Exception as exc:
             self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
             return
@@ -1065,7 +1117,7 @@ class Service:
 
     async def _create_ingest_output(self, g: int, adapter: Any, fps: int) -> str | None:
         t0 = time.monotonic()
-        codec = await adapter.create_output(g, fps)
+        codec = await (adapter.create_output_adaptive if self._adaptive else adapter.create_output)(g, fps)
         self._mark(g, "output_created", output_create_ms=round((time.monotonic() - t0) * 1000))
         return codec
 
@@ -1105,6 +1157,135 @@ class Service:
         task = asyncio.get_running_loop().create_task(self._keyframe("pli"))
         self._out_tasks.add(task)
         task.add_done_callback(self._out_tasks.discard)
+
+    def _request_pli(self) -> None:
+        now = time.monotonic()
+        if now - self._last_pli >= PLI_MIN_INTERVAL_S:
+            self._last_pli = now
+            self._pli()
+
+    # ------------------------------------------------------- adaptive codec
+
+    def _new_codec_ctl(self) -> cc.CodecController:
+        return cc.CodecController(pinned=self.cfg.codecs.video_mode != "passthrough")
+
+    def _video_dims(self) -> tuple[int, int]:
+        """Size of the video the outputs send: the source's own while it is passed through, else the canvas."""
+        dims = self._src_dims or self._canvas
+        if dims is None:
+            raise RuntimeError("canvas not locked")
+        return dims
+
+    def _codec_from_event(self, event: Any) -> None:
+        """Supervisor events that concern the ingest output: its negotiation and server op 14."""
+        if isinstance(event, OutputReady) and event.generation == self._gen and self.cfg.discord.ingest_publishes:
+            self._codec_event(cc.OutputAdded("ingest", event.negotiated_video_codec, "AV1"))
+        elif isinstance(event, CodecChanged) and event.generation == self._gen and self.cfg.discord.ingest_publishes:
+            self._codec_event(cc.OutputCodec("ingest", event.negotiated_video_codec))
+
+    def _codec_event(self, event: Any) -> None:
+        if not self._adaptive:
+            return
+        g = self._session_gen  # actions queued now are void once the session changes
+        for a in self._codec_ctl.handle(event, time.monotonic()):
+            match a:
+                case cc.UpdateWatch(codecs=names):
+                    self._queue(self._codec_run, a, g, self._codec_update_watch, names)
+                case cc.UpdateOutput(output_id="ingest", codecs=names):
+                    self._ingest_task(self._codec_run, a, g, self._codec_update_ingest, names)
+                case cc.UpdateOutput(output_id=uid, codecs=names):
+                    self._out_queue(uid, self._codec_run, a, g, self._codec_update_out, uid, names)
+                case cc.SwapOutput(output_id="ingest", codec=c):
+                    self._ingest_task(self._codec_swap, "ingest", c, g)
+                case cc.SwapOutput(output_id=uid, codec=c):
+                    self._out_queue(uid, self._codec_swap, uid, c, g)
+
+    def _codec_feed(self, g: int | None, event: Any) -> None:
+        if self._session_gen == g:
+            self._codec_event(event)
+
+    async def _codec_run(self, a: Any, g: int | None, fn: Callable[..., Any], *args: Any) -> None:
+        """Run one controller action; a no-op or a failure is fed back so the controller emits it again."""
+        if self._session_gen != g:
+            return
+        try:
+            done = await fn(*args)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._codec_feed(g, cc.ActionFailed(a))
+            raise
+        if not done:
+            self._codec_feed(g, cc.ActionFailed(a))
+
+    def _ingest_task(self, fn: Callable[..., Any], *args: Any) -> None:
+        """Ingest output ops run one at a time (the pool outputs have their own per-account queue)."""
+
+        async def run() -> None:
+            async with self._ingest_lock:
+                try:
+                    await fn(*args)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.log("ingest_codec_op_error", op=getattr(fn, "__name__", "?"), error=repr(exc))
+
+        task = asyncio.get_running_loop().create_task(run())
+        self._out_tasks.add(task)
+        task.add_done_callback(self._out_tasks.discard)
+
+    async def _codec_update_watch(self, names: tuple[str, ...]) -> bool:
+        return self._adapter is not None and await self._adapter.update_watch_codecs(names)
+
+    async def _codec_update_ingest(self, names: tuple[str, ...]) -> bool:
+        return self._adapter is not None and await self._adapter.update_output_codecs(names)
+
+    async def _codec_update_out(self, uid: int, names: tuple[str, ...]) -> bool:
+        adapter = self._out_adapters.get(uid)
+        return adapter is not None and await adapter.update_codecs(names)
+
+    async def _codec_swap(self, oid: int | str, codec: str, g: int | None) -> None:
+        """Rebind one output to ``codec`` in place. The publisher follows inside the adapter's swap, once the
+        negotiated codec is re-checked under its lock."""
+        if self._session_gen != g:
+            return
+        if oid == "ingest":
+            pub, adapter = self.publisher, self._adapter
+            swap = None if adapter is None else adapter.swap_output_source
+        else:
+            pub = self._out_pubs.get(oid)
+            if pub is None:
+                return
+            adapter = self._out_adapters.get(oid)
+            swap = None if adapter is None else adapter.swap_source
+        p, dims = self._profile, self._src_dims or self._canvas
+        if swap is None or p is None or dims is None:
+            self._codec_feed(g, cc.OutputBound(oid, None))
+            return
+        w, h = dims
+        prev = pub.codec
+
+        def make_source(c: str) -> RelayMediaSource:
+            pub.set_codec(c)
+            return RelayMediaSource(pub, VideoConfig(c, w, h, p.fps, p.video_bitrate_kbps * 1000))
+
+        try:
+            bound = await swap(make_source)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if pub.codec != prev:
+                pub.set_codec(prev)
+            self._codec_feed(g, cc.OutputBound(oid, None))
+            raise
+        if bound is None:
+            if pub.codec != prev:
+                pub.set_codec(prev)
+            self._codec_feed(g, cc.OutputBound(oid, None))
+            return
+        self._codec_feed(g, cc.OutputBound(oid, bound))
+        if bound != codec:  # the server renegotiated while we swapped
+            self._codec_feed(g, cc.OutputCodec(oid, bound))
 
     async def _start_adapter(self) -> None:
         if self._adapter is not None or self._shutdown_requested:
@@ -1177,13 +1358,13 @@ class Service:
             self._canvas = (int(data["width"]), int(data["height"]))
             self._mark(ev.generation, "first_frame")
             self._handle(FirstFrame(ev.generation, ev.epoch, self._canvas[0], self._canvas[1]))
+        elif kind == "source_codec":
+            self._src_dims = (int(data["width"]), int(data["height"])) if data.get("eligible") else None
+            self._codec_event(cc.SourceCodec(str(data["codec"]).upper(), bool(data.get("eligible"))))
         elif kind == "fresh_frame":
             self._handle(FreshFrame(ev.generation, ev.epoch))
         elif kind == "need_keyframe":
-            now = time.monotonic()
-            if now - self._last_pli >= PLI_MIN_INTERVAL_S:
-                self._last_pli = now
-                self._pli()
+            self._request_pli()
         elif kind == "fatal":
             self.log("worker_fatal", **data)
             self._handle(WorkerFailed(ev.generation, ev.epoch, str(data.get("reason", ""))))
@@ -1220,6 +1401,7 @@ class Service:
                 a = self._out_adapters.get(row["account"])
                 row["network"] = a.network_stats() if a is not None else {}
         d["details"] = asdict(self._status_details(time.monotonic()))
+        d["codec"] = d["details"]["codec"]
         return d
 
     def _viewers(self) -> int:
@@ -1283,6 +1465,8 @@ class Service:
             viewer_cap=self.cfg.runtime.stream_viewer_cap,
             ingest_publishes=self.cfg.discord.ingest_publishes,
             fatal_reason=None if self.sup.fatal is None else self.sup.fatal.value,
+            codec=self._codec_ctl.effective if self._adaptive else "H264",
+            codec_switch=self._codec_ctl.switching if self._adaptive else None,
         )
 
     def _write_status(self) -> None:
@@ -1357,18 +1541,21 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
     d = cfg.discord
     # Audio passthrough sends the target's Opus as-is (its own bitrate); only transcode encodes at a bitrate.
     audio_kbps = cfg.quality.audio_bitrate_kbps if cfg.codecs.audio_mode == "transcode" else None
+    adaptive = {"adaptive": True} if cfg.codecs.output_codec == "adaptive" else {}  # H264 mode passes no new kwargs
+    if adaptive:
+        log("adaptive_codec", note="codecs.watch_codecs and codecs.parent_codecs are ignored")
     with InstanceLocks([d.expected_relay_user_id, *(a.user_id for a in accounts)]):
         svc = Service(
             cfg, store, lambda events, ingress, lg: DiscordAdapter(
                 cfg, events, ingress, lg, network_stats=cfg.logging.network_stats,
-                audio_bitrate_kbps=audio_kbps, self_deaf=cfg.runtime.self_deaf_ingest),
+                audio_bitrate_kbps=audio_kbps, self_deaf=cfg.runtime.self_deaf_ingest, **adaptive),
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
                 network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs,
                 excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
                 audio_bitrate_kbps=audio_kbps, self_deaf=cfg.runtime.self_deaf_outputs,
-                bot_user_ids=frozenset({d.expected_relay_user_id, *(a.user_id for a in accounts)})),
+                bot_user_ids=frozenset({d.expected_relay_user_id, *(a.user_id for a in accounts)}), **adaptive),
             output_tokens=out_tokens,
         )
         return await svc.run(token)

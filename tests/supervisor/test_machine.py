@@ -1140,3 +1140,16 @@ def test_voice_lost_foreign_session_uses_cooldown():
     sup.handle(_ev("VoiceLost")("4006", foreign_session=True), 1.0)
     assert not has(sup.handle(Tick(), 60.9), _join_cls())
     assert has(sup.handle(Tick(), 61.0), _join_cls())
+
+
+def test_machine_adaptive_accepts_h265_ready():
+    sup = make(adaptive=True)
+    g, e = start(sup)
+    sup.handle(Joined(g, "s1"), 0.6)
+    sup.handle(Watching(g), 0.7)
+    sup.handle(SourceProgress(g, 0.8, True), 0.8)
+    sup.handle(FirstFrame(g, e, 1, 1), 0.9)
+    acts = sup.handle(OutputReady(g, "H265"), 1.0)
+    assert has(acts, OpenGate) and not has(acts, Teardown)
+    assert not has(sup.handle(CodecChanged(g, "AV1"), 2.0), Teardown)  # op 14 never tears down
+    assert has(sup.handle(OutputReady(g, "FOO"), 3.0), Teardown, reason=StopReason.CODEC_MISMATCH)

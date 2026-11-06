@@ -22,6 +22,7 @@ MAX_INPUT_PIXELS = 3840 * 2160  # decode guard; not configurable in v1
 VIDEO_ENCODERS = ("libx264", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "h264_vaapi")
 VIDEO_MODES = ("transcode", "passthrough")
 AUDIO_MODES = ("transcode", "passthrough")
+OUTPUT_CODECS = ("adaptive", "H264")
 HW_DECODE_DEVICES = ("none", "d3d11va", "cuda", "vaapi", "videotoolbox")  # matches hwaccel.HW_DEVICE_ORDER
 MAX_OUTPUT_ACCOUNTS = 9
 _CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -186,6 +187,7 @@ class RelayConfig:
             hw_decode=self.codecs.hw_decode,
             video_mode=self.codecs.video_mode,
             audio_mode=self.codecs.audio_mode,
+            codec_mode="adaptive" if self.codecs.output_codec == "adaptive" else "h264",
         )
 
     def profile_key(self) -> tuple[int, int, int]:
@@ -494,7 +496,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     codecs = CodecsConfig(
         r.str_("parent_codecs", ("auto_decode", "h264_only")),
         r.str_("watch_codecs", ("auto_decode", "h264_only")),
-        r.str_("output_codec", ("H264",)),
+        r.str_("output_codec", OUTPUT_CODECS) if "output_codec" in r.data else "adaptive",
         r.int_("output_rids"),
         r.opt_str("video_encoder", VIDEO_ENCODERS),
         # Software decode by default: live G2b on an iGPU (Radeon 780M) that was also encoding the

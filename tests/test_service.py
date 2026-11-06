@@ -153,11 +153,15 @@ class FakeAdapter:
 
 
 class Env:
-    def __init__(self, tmp_path: Path, slate, source_gop, enabled=True, latch=None, **runtime_kw) -> None:
+    def __init__(self, tmp_path: Path, slate, source_gop, enabled=True, latch=None, output_codec="H264",
+                 adapter_cls=None, worker_cls=None, ingest_publishes=True, **runtime_kw) -> None:
         cfg = load_config(ROOT / "config.example.yaml")
+        adapter_cls, worker_cls = adapter_cls or FakeAdapter, worker_cls or FakeWorker
         cfg = replace(
             cfg,
-            discord=replace(cfg.discord, expected_relay_user_id=100000000000000001),  # resolved at startup by relayctl run
+            codecs=replace(cfg.codecs, output_codec=output_codec),
+            discord=replace(cfg.discord, expected_relay_user_id=100000000000000001,  # resolved at startup by relayctl run
+                            ingest_publishes=ingest_publishes),
             runtime=replace(cfg.runtime, start_debounce_ms=0, **runtime_kw),
             liveness=replace(cfg.liveness, source_dead_timeout_seconds=30.0),
             storage=replace(cfg.storage, state_directory=tmp_path),
@@ -174,12 +178,12 @@ class Env:
         self.log_kw: list[tuple[str, dict]] = []
 
         def adapter_factory(events, ingress, log):
-            a = FakeAdapter(events, ingress, log, self.order)
+            a = adapter_cls(events, ingress, log, self.order)
             self.adapters.append(a)
             return a
 
         def worker_factory(profile):
-            w = FakeWorker(source_gop)
+            w = worker_cls(source_gop)
             self.workers.append(w)
             return w
 
@@ -307,13 +311,16 @@ class FakeOutAdapter:
     async def start(self, token: str) -> None:
         self.calls.append("start")
 
-    async def publish(self, g, n, fps, source, channel_id):
+    codec = "H264"
+
+    async def publish(self, g, n, fps, source, channel_id, adaptive=False):
         from golive_relay.supervisor.outputs_model import OutJoined, OutReady
 
         self.calls.append("publish")
+        self.attempt = n
         self.events(OutJoined(self.acct.user_id, g, n, "out-sess"))
-        self.events(OutReady(self.acct.user_id, g, n, "H264"))
-        return "H264"
+        self.events(OutReady(self.acct.user_id, g, n, self.codec))
+        return self.codec
 
     async def end(self) -> None:
         self.order.append("out_end")
@@ -363,10 +370,11 @@ def test_output_account_fans_out_and_stops_with_gate_closed(tmp_path, slate, sou
     asyncio.run(main())
 
 
-def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None, role="relay"):
+def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None, role="relay", **env_kw):
     from golive_relay.supervisor.outputs_model import OutputAccount
 
-    env = Env(tmp_path, slate, source_gop)
+    env = Env(tmp_path, slate, source_gop, **env_kw)
+    adapter_cls, worker_cls = env_kw.get("adapter_cls") or FakeAdapter, env_kw.get("worker_cls") or FakeWorker
     if state:
         env.store.update(state)
     cfg = replace(
@@ -375,8 +383,8 @@ def _multi_env(tmp_path, slate, source_gop, uid, out_factory, state=None, role="
         runtime=replace(env.cfg.runtime, retry_delays_seconds=(0.01,), relay_autoscale=False),
     )
     env.svc = Service(
-        cfg, env.store, lambda ev, ing, lg: env.adapters.append(FakeAdapter(ev, ing, lg, env.order)) or env.adapters[-1],
-        lambda profile: env.workers.append(FakeWorker(source_gop)) or env.workers[-1], lambda *a, **k: None,
+        cfg, env.store, lambda ev, ing, lg: env.adapters.append(adapter_cls(ev, ing, lg, env.order)) or env.adapters[-1],
+        lambda profile: env.workers.append(worker_cls(source_gop)) or env.workers[-1], lambda *a, **k: None,
         slate_builder=lambda *a: slate, install_signals=False, tick_s=0.02,
         output_adapter_factory=out_factory, output_tokens={uid: "tok2"},
     )
@@ -2031,3 +2039,175 @@ def test_run_service_audio_bitrate_by_audio_mode(tmp_path, slate, source_gop, mo
     assert asyncio.run(service_mod.run_service(cfg, "main-token")) == 0
     assert seen["ingest"]["audio_bitrate_kbps"] == expected
     assert seen["output"]["audio_bitrate_kbps"] == expected
+
+
+# ------------------------------------------------------------------ adaptive codec
+
+
+class AdaptiveWorker(FakeWorker):
+    """Announces an eligible H.265 source before the first frame, like the real worker."""
+
+    def send(self, msg) -> bool:
+        if isinstance(msg, Configure):
+            self._events.append(WorkerEvent(msg.generation, msg.epoch, "source_codec",
+                                            {"codec": "H265", "width": CANVAS[0], "height": CANVAS[1], "eligible": True}))
+        return super().send(msg)
+
+
+class AdaptiveAdapter(FakeAdapter):
+    def __init__(self, *a) -> None:
+        super().__init__(*a)
+        self.watch_lists: list = []
+        self.swaps: list[str] = []
+        self.negotiated = "H265"
+
+    async def create_output_adaptive(self, g, fps):
+        self.calls.append("create_output_adaptive")
+        return "H265"
+
+    async def update_watch_codecs(self, names) -> bool:
+        self.watch_lists.append(tuple(names))
+        return True
+
+    async def update_output_codecs(self, names) -> bool:
+        return True
+
+    async def swap_output_source(self, make_source):
+        src = make_source(self.negotiated)  # the codec the server negotiated by now
+        self.swaps.append(src.video_config.codec)
+        return src.video_config.codec
+
+
+def _adaptive_env(tmp_path, slate, source_gop, **kw):
+    return Env(tmp_path, slate, source_gop, output_codec="adaptive", adapter_cls=AdaptiveAdapter,
+               worker_cls=AdaptiveWorker, **kw)
+
+
+def test_adaptive_transcode_is_pinned_h264(tmp_path, slate, source_gop):
+    env = _adaptive_env(tmp_path, slate, source_gop)
+    assert env.svc._codec_ctl.pinned is False
+    cfg = replace(env.cfg, codecs=replace(env.cfg.codecs, video_mode="transcode"))
+    svc = Service(cfg, env.store, lambda *a: None, lambda p: None, lambda *a, **k: None,
+                  slate_builder=lambda *a: slate, install_signals=False)
+    assert svc._codec_ctl.pinned is True
+
+
+def test_service_routes_op14_to_controller_and_swaps(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.model import CodecChanged
+
+    env = _adaptive_env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        ad = env.adapters[0]
+        await wait_until(lambda: "create_output_adaptive" in ad.calls and env.svc._codec_ctl.effective == "H265")
+        assert env.svc.publisher.codec == "H265"
+        assert env.svc._status_details(time.monotonic()).codec == "H265"
+        ad.negotiated = "H264"
+        ad.events(CodecChanged(env.svc._gen, "H264"))  # a weak viewer joined the ingest output
+        await wait_until(lambda: ad.watch_lists and ad.watch_lists[-1] == ("H264", "VP8", "VP9"))
+        assert env.svc._status_details(time.monotonic()).codec_switch == ("H265", "H264")
+        env.workers[0]._events.append(WorkerEvent(
+            env.svc._gen, env.svc._epoch, "source_codec",
+            {"codec": "H264", "width": CANVAS[0], "height": CANVAS[1], "eligible": True}))
+        await wait_until(lambda: ad.swaps[-1:] == ["H264"])
+        assert env.svc.publisher.codec == "H264" and env.svc._codec_ctl.effective == "H264"
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_service_hold_debounced(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.codec import Tick as CodecTick
+    from golive_relay.supervisor.model import HoldReason, ShowSlate
+
+    env = _adaptive_env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        await wait_until(lambda: env.svc._codec_ctl.effective == "H265")
+        env.svc._execute([ShowSlate(env.svc._gen, HoldReason.NO_MEDIA)])
+        assert env.svc._codec_ctl.effective == "H265"  # a short stall changes nothing
+        env.svc._codec_ctl.held_since -= 3.0
+        env.svc._codec_event(CodecTick())
+        assert env.svc._codec_ctl.effective == "H264"
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_ingest_not_registered_without_ingest_publish(tmp_path, slate, source_gop):
+    env = _adaptive_env(tmp_path, slate, source_gop, ingest_publishes=False)
+
+    async def main():
+        task = await reach_relaying(env)
+        await wait_until(lambda: env.svc._codec_ctl.effective == "H265")
+        assert env.svc._codec_ctl._outs == {}
+        assert "create_output_adaptive" not in env.adapters[0].calls
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_stale_attempt_codec_event_dropped(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.outputs_model import OutCodecChanged
+
+    uid = 424242
+    outs: list[FakeOutAdapter] = []
+
+    class H265Out(FakeOutAdapter):
+        codec = "H265"
+
+    def out_factory(acct, events, log):
+        a = H265Out(acct, events, [])
+        outs.append(a)
+        return a
+
+    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory, output_codec="adaptive",
+                     adapter_cls=AdaptiveAdapter, worker_cls=AdaptiveWorker)
+
+    async def main():
+        task = await reach_relaying(env)
+        await wait_until(lambda: uid in env.svc._codec_ctl._outs)
+        o, g, n = env.svc._codec_ctl._outs[uid], env.svc._gen, outs[0].attempt
+        env.svc._pool_event(OutCodecChanged(uid, g, n + 1, "H264"))  # an old attempt
+        assert o.reported == "H265"
+        env.svc._pool_event(OutCodecChanged(uid, g, n, "H264"))
+        assert o.reported == "H264"
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_stale_attempt_failure_keeps_codec_output(tmp_path, slate, source_gop):
+    from golive_relay.supervisor.model import StopReason
+    from golive_relay.supervisor.outputs_model import OutFailed
+
+    uid = 424242
+    outs: list[FakeOutAdapter] = []
+
+    class H265Out(FakeOutAdapter):
+        codec = "H265"
+
+    def out_factory(acct, events, log):
+        a = H265Out(acct, events, [])
+        outs.append(a)
+        return a
+
+    env = _multi_env(tmp_path, slate, source_gop, uid, out_factory, output_codec="adaptive",
+                     adapter_cls=AdaptiveAdapter, worker_cls=AdaptiveWorker)
+
+    async def main():
+        task = await reach_relaying(env)
+        await wait_until(lambda: uid in env.svc._codec_ctl._outs)
+        g, n = env.svc._gen, outs[0].attempt
+        env.svc._pool_event(OutFailed(uid, g, n + 1, StopReason.CONNECT_FAILED, True, "stale"))
+        assert uid in env.svc._codec_ctl._outs
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())

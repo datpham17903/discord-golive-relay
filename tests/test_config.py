@@ -560,3 +560,16 @@ def test_check_operable_skips_profile_while_ingest_id_unresolved(tmp_path):
     cfg = _load(tmp_path, raw)
     cap, prof = _manifests(cfg, listed=False)
     assert check_operable(cfg, cap, prof) == []
+
+
+def test_config_output_codec_adaptive_default(tmp_path):
+    raw = _raw()
+    assert _load(tmp_path, raw).codecs.output_codec == "adaptive"
+    assert _load(tmp_path, raw).output_profile().codec_mode == "adaptive"
+    del raw["codecs"]["output_codec"]
+    assert _load(tmp_path, raw).codecs.output_codec == "adaptive"
+    raw["codecs"]["output_codec"] = "H264"
+    cfg = _load(tmp_path, raw)
+    assert cfg.codecs.output_codec == "H264" and cfg.output_profile().codec_mode == "h264"
+    raw["codecs"]["output_codec"] = "H265"
+    assert any("codecs.output_codec" in e for e in _errors(tmp_path, raw))

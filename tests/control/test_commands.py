@@ -603,3 +603,15 @@ def test_format_operators_lists_config_chat_and_roles_without_mentions() -> None
     assert empty.startswith("👥") and "không có" in empty
     many = format_operators(_ops(added=frozenset(range(10**17, 10**17 + 300))), ctx())
     assert len(many) < 2000
+
+
+def test_status_single_codec_line():
+    c = ctx()
+    s = format_status(routing({200: O1}), c, _details(codec="H265"))
+    assert s.count("Codec:") == 1 and "> Codec: H.265" in s
+    assert "Codec:" not in format_status(routing({200: O1}), c, _details())
+
+
+def test_status_switch_arrow():
+    s = format_status(routing({200: O1}), ctx(), _details(codec="H265", codec_switch=("H265", "H264")))
+    assert "> Codec: H.265 → H.264 (đang chuyển)" in s
