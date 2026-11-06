@@ -165,6 +165,7 @@ class StatusDetails:
     autoscale: bool
     debounce_ms: int
     video_mode: str
+    audio_mode: str
     output_size: str
     last_watch_ms: float | None
     audio_ok: bool
@@ -477,6 +478,7 @@ def _footer(d: StatusDetails, with_public: bool) -> str:
         f"debounce {d.debounce_ms} ms",
         f"autoscale {'bật' if d.autoscale else 'tắt'}",
         f"{d.output_size.replace('x', '×', 1)} {d.video_mode}",
+        f"audio {d.audio_mode}",
     ]
     if with_public:
         parts.append(f"lệnh công khai: {', '.join(d.public_commands) or 'không có'}")

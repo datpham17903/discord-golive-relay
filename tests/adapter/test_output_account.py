@@ -285,6 +285,21 @@ def test_publish_plays_with_configured_audio_bitrate() -> None:
     asyncio.run(go())
 
 
+def test_publish_plays_without_bitrate_in_audio_passthrough() -> None:
+    async def go():
+        calls: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), audio_bitrate_kbps=None,
+        )
+        await a.start("tok")
+        await a.publish(5, 1, 30, "SRC", CHAN)
+        assert ("play_kw", {}) in calls
+        await a.end()
+
+    asyncio.run(go())
+
+
 def test_own_go_live_viewers_emitted_without_bots() -> None:
     async def go():
         events: list = []

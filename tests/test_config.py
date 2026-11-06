@@ -297,6 +297,17 @@ def test_video_mode_default_and_parse(tmp_path):
     assert any("codecs.video_mode" in e for e in _errors(tmp_path, raw))
 
 
+def test_audio_mode_default_and_parse(tmp_path):
+    raw = _raw()
+    raw["codecs"].pop("audio_mode", None)
+    cfg = _load(tmp_path, raw)
+    assert cfg.codecs.audio_mode == "passthrough" and cfg.output_profile().audio_mode == "passthrough"
+    raw["codecs"]["audio_mode"] = "transcode"
+    assert _load(tmp_path, raw).output_profile().audio_mode == "transcode"
+    raw["codecs"]["audio_mode"] = "auto"
+    assert any("codecs.audio_mode" in e for e in _errors(tmp_path, raw))
+
+
 def test_codec_modes_accept_h264_only(tmp_path):
     raw = _raw()
     raw["codecs"]["parent_codecs"] = raw["codecs"]["watch_codecs"] = "h264_only"

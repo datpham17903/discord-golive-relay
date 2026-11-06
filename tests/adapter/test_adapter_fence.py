@@ -234,3 +234,12 @@ def test_opus_packet_info_parses_toc() -> None:
     assert opus_packet_info(b"\xf8\xff\xfe") == (20, "mono", "celt", 1)
     assert opus_packet_info(b"") is None
     assert opus_packet_info(bytes([0x03])) is None
+
+
+def test_play_without_bitrate_in_audio_passthrough() -> None:
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"}, audio_bitrate_kbps=None)
+    calls: list = []
+    a._out = NS(play=lambda source, **kw: calls.append((source, kw)))
+    a.play("SRC")
+    assert calls == [("SRC", {})]

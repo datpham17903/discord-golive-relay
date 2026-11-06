@@ -55,6 +55,7 @@ class OutputProfile:
     video_encoder: str = "auto"  # "auto" | an encoder name from golive_relay.media.hwaccel
     hw_decode: str = "none"  # "none" | "auto" | a hardware device type
     video_mode: str = "transcode"  # "transcode" | "passthrough" (forward eligible H.264 without re-encoding)
+    audio_mode: str = "transcode"  # "transcode" | "passthrough" (forward the target's 20 ms Opus packets unchanged)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,8 +116,9 @@ class EgressVideo:
 class EgressAudio:
     generation: int
     epoch: int
-    pcm: bytes  # AUDIO_FRAME_BYTES
+    pcm: bytes  # AUDIO_FRAME_BYTES; b"" in audio passthrough
     deadline: float
+    opus: bytes = b""  # audio passthrough: one 20 ms Opus packet as received
 
 
 @dataclass(frozen=True, slots=True)

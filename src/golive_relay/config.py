@@ -21,6 +21,7 @@ from golive_relay.worker.messages import OutputProfile
 MAX_INPUT_PIXELS = 3840 * 2160  # decode guard; not configurable in v1
 VIDEO_ENCODERS = ("libx264", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "h264_vaapi")
 VIDEO_MODES = ("transcode", "passthrough")
+AUDIO_MODES = ("transcode", "passthrough")
 HW_DECODE_DEVICES = ("none", "d3d11va", "cuda", "vaapi", "videotoolbox")  # matches hwaccel.HW_DEVICE_ORDER
 MAX_OUTPUT_ACCOUNTS = 9
 _CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -69,6 +70,7 @@ class CodecsConfig:
     video_encoder: str = "auto"
     hw_decode: str = "none"
     video_mode: str = "transcode"
+    audio_mode: str = "passthrough"
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +183,7 @@ class RelayConfig:
             video_encoder=self.codecs.video_encoder,
             hw_decode=self.codecs.hw_decode,
             video_mode=self.codecs.video_mode,
+            audio_mode=self.codecs.audio_mode,
         )
 
     def profile_key(self) -> tuple[int, int, int]:
@@ -496,6 +499,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         # source share and the relay, d3d11va raised relay latency from ~80 to ~240 ms.
         r.opt_str("hw_decode", HW_DECODE_DEVICES, default="none"),
         r.str_("video_mode", VIDEO_MODES) if "video_mode" in r.data else "transcode",
+        r.str_("audio_mode", AUDIO_MODES) if "audio_mode" in r.data else "passthrough",
     )
     if codecs.output_rids > 1:
         errors.append("codecs.output_rids: only 1 is supported")

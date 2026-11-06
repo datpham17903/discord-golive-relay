@@ -692,6 +692,72 @@ def test_audio_does_not_disturb_video_jitter_state():
     assert not w.offsets and not w.lateness
 
 
+OPUS_SILENCE = b"\xf8\xff\xfe"
+PT_AUDIO = dataclasses.replace(PROFILE, audio_mode="passthrough")
+
+
+def _audio_run(profile, packets, sender_offset=None, jitter_s=0.2, t0=1000.0):
+    w, egress, _ = make_worker(profile)
+    w.jitter_s = jitter_s
+    for i, p in enumerate(packets):
+        now = t0 + i * 0.02
+        w.handle(IngressAudio(1, 0, 7, i * 960, None, now, None if sender_offset is None else now + sender_offset, p), now)
+    return w, egress.audio()
+
+
+def test_audio_passthrough_forwards_original_bytes_with_transcode_deadlines():
+    packets = gen_opus(40)
+    _, pt = _audio_run(PT_AUDIO, packets)
+    _, tc = _audio_run(PROFILE, packets)
+    assert [a.opus for a in pt] == packets and all(a.pcm == b"" for a in pt)
+    assert len(tc) == len(pt)
+    assert [a.deadline for a in pt] == pytest.approx([a.deadline for a in tc], abs=1e-9)
+    assert all(a.opus == b"" for a in tc)  # transcode emits PCM only
+
+
+@pytest.mark.parametrize("sender_offset", [1.0, -0.5, 5.0])
+def test_audio_passthrough_timed_by_arrival_not_sender_clock(sender_offset):
+    from golive_relay.media.publisher import Publisher
+
+    t0 = 1000.0
+    _, audio = _audio_run(PT_AUDIO, gen_opus(40), sender_offset, t0=t0)
+    assert len(audio) >= 40
+    for k, a in enumerate(audio):
+        assert 0.0 <= a.deadline - (t0 + k * 0.02) <= 0.2 + 0.1
+    clock = [t0]
+    pub = Publisher(lambda g, e, t: True, clock=lambda: clock[0], opus=True)
+    pub.set_source(1, 0)
+    audible, i = 0, 0
+    for k in range(150):
+        clock[0] = t0 + k * 0.02
+        while i < len(audio) and t0 + i * 0.02 <= clock[0]:  # one packet arrives every 20 ms
+            pub.offer_audio(audio[i])
+            i += 1
+        audible += pub.next_audio() != OPUS_SILENCE
+    assert audible >= len(audio) - 2
+
+
+def test_audio_passthrough_drops_and_counts_unsupported_packets():
+    ok = bytes([0xFC, 1, 2])  # CELT 20 ms stereo, one frame
+    packets = [
+        ok,
+        bytes([0xF4, 1]),  # CELT 10 ms
+        bytes([0x14, 1]),  # SILK 40 ms
+        bytes([0xFD, 1, 2]),  # two 20 ms frames
+        b"",  # no TOC
+        OPUS_SILENCE,  # the source's own silence frame is forwarded as-is
+        bytes([0x7C, 1]),  # hybrid 20 ms stereo
+    ]
+    w, audio = _audio_run(PT_AUDIO, packets)
+    assert [a.opus for a in audio] == [ok, OPUS_SILENCE, bytes([0x7C, 1])]
+    assert w.stats["audio_unsupported"] == 4
+    deadlines = [a.deadline for a in audio]
+    assert deadlines == sorted(deadlines)
+    w.last_stats = 0.0
+    w.tick(2000.0)
+    assert w.events.items[-1].data["audio_unsupported"] == 4
+
+
 def test_need_keyframe_repeats_at_most_once_per_second(aus640, monkeypatch):
     from golive_relay.worker import process
 

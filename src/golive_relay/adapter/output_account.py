@@ -41,7 +41,7 @@ class OutputAccountAdapter:
         network_stats: bool = False,
         codec_mode: str = "auto_decode",
         excluded_viewer_ids: frozenset[int] = frozenset(),
-        audio_bitrate_kbps: int = 64,
+        audio_bitrate_kbps: int | None = 64,
         bot_user_ids: frozenset[int] = frozenset(),
     ) -> None:
         self.user_id = user_id
@@ -151,7 +151,10 @@ class OutputAccountAdapter:
         )
         codec = self._out.negotiated_video_codec
         self._events(OutReady(self.user_id, generation, attempt, codec))
-        self._out.play(source, bitrate=self._audio_bitrate_kbps)
+        if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder
+            self._out.play(source)
+        else:
+            self._out.play(source, bitrate=self._audio_bitrate_kbps)
         self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
         return codec
 

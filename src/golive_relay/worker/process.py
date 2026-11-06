@@ -1,5 +1,5 @@
 """PyAV worker process: decode, locked canvas, source-paced H.264 re-encode (hardware when available) or opt-in
-H.264 passthrough, Opus -> PCM (spec §9).
+H.264 passthrough, Opus -> PCM or Opus passthrough (spec §9).
 
 The worker receives no token and writes no media to disk. All queues are
 bounded; late input is dropped, never queued.
@@ -21,6 +21,7 @@ from av.video.frame import PictureType
 
 from golive_relay.media import hwaccel
 from golive_relay.media.h264 import ensure_low_delay_vui, has_parameter_sets, sps_dimensions
+from golive_relay.media.opus import opus_packet_info
 from golive_relay.worker.canvas import compute_canvas, letterbox
 from golive_relay.worker.ipc import BoundedChannel
 from golive_relay.worker.messages import (
@@ -138,7 +139,7 @@ class Worker:
         self._reset_epoch()
         self.stats: dict[str, Any] = {
             "frames_out": 0, "idr": 0, "repeats": 0, "decoded": 0, "rate_skipped": 0, "backpressure_skips": 0,
-            "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "decode_errors": 0,
+            "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "audio_unsupported": 0, "decode_errors": 0,
             "stale_ignored": 0, "passthrough_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
 
     def _reset_epoch(self) -> None:
@@ -601,6 +602,9 @@ class Worker:
         if now - m.mono_received > INGRESS_MAX_AGE_S:
             self.stats["audio_dropped"] += 1
             return
+        if self.profile.audio_mode == "passthrough":
+            self._audio_passthrough(m)
+            return
         if self.adec is None:
             self.adec = _new_audio_decoder()
             self.resampler = av.AudioResampler(format="s16", layout="stereo", rate=48_000)
@@ -627,6 +631,22 @@ class Worker:
             item = EgressAudio(self.generation, self.epoch, block, deadline)
             if not self.egress.put_nowait(item, "audio", len(block)):
                 self.stats["audio_dropped"] += 1
+
+    def _audio_passthrough(self, m: IngressAudio) -> None:
+        """Forward one 20 ms Opus packet unchanged: the sender reads one frame per 20 ms and advances RTP by 960,
+        so any other packet is dropped, never re-packetized."""
+        info = opus_packet_info(m.data)
+        if info is None or info[0] != 20 or info[3] != 1:
+            self.stats["audio_unsupported"] += 1
+            return
+        unwrapper = self.audio_unwrappers.setdefault(m.ssrc, RtpUnwrapper(AUDIO_CLOCK_RATE))
+        rtp_s = unwrapper.unwrap(m.rtp_ts) / AUDIO_CLOCK_RATE
+        base = rtp_s + self._audio_offset(m.ssrc, rtp_s, m.mono_received) + AUDIO_PLAYOUT_DELAY_S
+        deadline = max(base + self.jitter_s, self.last_audio_deadline)  # same as the PCM path's first block
+        self.last_audio_deadline = deadline
+        item = EgressAudio(self.generation, self.epoch, b"", deadline, m.data)
+        if not self.egress.put_nowait(item, "audio", len(m.data)):
+            self.stats["audio_dropped"] += 1
 
     def _audio_offset(self, ssrc: int, rtp_s: float, arrival: float) -> float:
         """Minimum recent (arrival - rtp_s) of this audio ssrc, like video's ``_present_at``."""

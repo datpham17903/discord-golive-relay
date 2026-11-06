@@ -26,6 +26,7 @@ codecs:
   video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
   hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
   video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
+  audio_mode: passthrough    # transcode | passthrough; passthrough forwards the target's Opus as-is (its own bitrate, audio_bitrate_kbps unused); transcode re-encodes at audio_bitrate_kbps
 
 quality:
   mode: fixed                # auto | fixed; fixed always outputs fixed_* (lower-resolution sources are scaled up, which needs a re-encode)
@@ -36,7 +37,7 @@ quality:
   fixed_height: 1080
   fixed_fps: 60
   video_bitrate_kbps: 8000   # 20000 caused Discord error 2003 on a shared uplink (G2b)
-  audio_bitrate_kbps: 128
+  audio_bitrate_kbps: 128    # used only with codecs.audio_mode: transcode
   approved_profile_manifest: "manifests/verified-profiles.json"
 
 audio:
