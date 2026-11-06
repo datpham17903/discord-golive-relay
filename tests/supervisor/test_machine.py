@@ -1126,6 +1126,14 @@ def test_voice_lost_in_session_tears_down_with_leave():
     assert sup.status(2.0).state is RelayState.BACKOFF
 
 
+def test_voice_lost_from_prejoin_ignored_during_session():
+    sup = make(prejoin_voice=True)
+    g, _ = start(sup)
+    acts = sup.handle(_ev("VoiceLost")("4006", foreign_session=True, from_prejoin=True), 0.6)
+    assert not has(acts, Teardown)
+    assert sup.status(0.6).state is RelayState.CONNECTING
+
+
 def test_voice_lost_foreign_session_uses_cooldown():
     sup = make(prejoin_voice=True, retry_delays=(5.0, 10.0), retry_cooldown=60.0)
     assert has(idle_in_channel(sup), _join_cls())

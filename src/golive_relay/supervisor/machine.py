@@ -271,7 +271,8 @@ class Supervisor:
                     self._prejoin_after = now + self._prejoin_retry.next_delay()
             case VoiceLost() as e:
                 if self.state in _SESSION:
-                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="voice lost")
+                    if not e.from_prejoin:
+                        self._stop(StopReason.CONNECT_FAILED, now, acts, detail="voice lost")
                 elif self._in_voice:
                     self._in_voice = False
                     self._leave_at = None

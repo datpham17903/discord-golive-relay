@@ -1453,7 +1453,7 @@ def test_repeated_4006_prejoin_restarts_adapter_once(tmp_path, slate, source_gop
 
 def test_4006_with_foreign_session_does_not_restart_adapter(tmp_path, slate, source_gop):
     env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.1,),
-              retry_cooldown_seconds=0.1)
+              retry_cooldown_seconds=0.6)
 
     async def main():
         task = asyncio.create_task(env.svc.run("tok"))
@@ -1462,10 +1462,69 @@ def test_4006_with_foreign_session_does_not_restart_adapter(tmp_path, slate, sou
         a.foreign, a.last_vsu_session = True, "other-session"
         a.join = _failing_join(a, lambda: True)
         a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
-        await wait_until(lambda: a.calls.count("join") >= 3, timeout=3.0)
+        stamps = []
+        real_join = a.join
+
+        async def timed_join(on_voice_state=None):
+            stamps.append(time.monotonic())
+            return await real_join(on_voice_state)
+
+        a.join = timed_join
+        await wait_until(lambda: len(stamps) >= 2, timeout=5.0)
+        assert stamps[1] - stamps[0] >= 0.5  # retry_cooldown (0.6), not retry_delays (0.1)
         assert len(env.adapters) == 1 and "close" not in a.calls
         assert "foreign_voice_session" in env.logs
         assert [kw["vsu_session"] for n, kw in env.log_kw if n == "prejoin_failed"][0] == "other-session"
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_late_foreign_prejoin_failure_does_not_tear_down_connecting_session(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.1,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.foreign, a.last_vsu_session = True, "other-session"
+        block = asyncio.Event()
+
+        async def join(on_voice_state=None):
+            a.calls.append("join")
+            if a.calls.count("join") == 1:
+                await block.wait()  # the session's own join stays pending
+                return "sess-1"
+            raise VoiceClosed("4006")
+
+        a.join = join
+        a.events(env.snapshot())
+        await wait_until(lambda: env.svc.sup.state is RelayState.CONNECTING and "join" in a.calls)
+        env.svc._in_voice = False
+        await env.svc._prejoin()  # a pre-join queued before the session started fails late
+        assert "prejoin_failed" in env.logs
+        assert env.svc.sup.state is RelayState.CONNECTING
+        block.set()
+        await wait_until(lambda: env.svc._in_voice)
+        env.svc.request_shutdown()
+        await asyncio.wait_for(task, 10)
+
+    asyncio.run(main())
+
+
+def test_4006_on_connect_path_restarts_adapter(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, retry_delays_seconds=(0.1,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.join = _failing_join(a, lambda: True)
+        a.events(env.snapshot())
+        await wait_until(lambda: len(env.adapters) == 2 and env.adapters[1].started, timeout=5.0)
+        assert a.calls.count("join") == 2 and "close" in a.calls
+        assert "voice_4006_restart_adapter" in env.logs
         env.svc.request_shutdown()
         await task
 

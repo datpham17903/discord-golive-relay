@@ -395,6 +395,7 @@ class Service:
 
     def _connect_join_failed(self, g: int, adapter: Any, exc: BaseException) -> None:
         self.log("join_failed", error=repr(exc), code=getattr(exc, "code", None), vsu_session=adapter.last_vsu_session)
+        # order matters: ConnectFailed must run first so _session_gen is cleared before _voice_join_failed may restart the adapter
         self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
         self._voice_join_failed(adapter, exc)
 
@@ -1009,7 +1010,7 @@ class Service:
             self.log("prejoin_failed", error=repr(exc), code=getattr(exc, "code", None),
                      vsu_session=adapter.last_vsu_session)
             if self._voice_join_failed(adapter, exc):
-                self._handle(VoiceLost(repr(exc), foreign_session=True))  # retried after the retry cooldown
+                self._handle(VoiceLost(repr(exc), foreign_session=True, from_prejoin=True))  # retried after the retry cooldown
             else:
                 self._handle(PrejoinFailed(repr(exc)))  # the Supervisor retries the pre-join after a retry delay
 

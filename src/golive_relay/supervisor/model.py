@@ -182,6 +182,7 @@ class VoiceLost:
 
     detail: str = ""
     foreign_session: bool = False
+    from_prejoin: bool = False  # a pre-join failed: it says nothing about a session that connects on its own
 
 
 @dataclass(frozen=True, slots=True)
