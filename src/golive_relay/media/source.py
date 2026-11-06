@@ -10,14 +10,15 @@ from golive_relay.media.publisher import Publisher
 
 
 class RelayMediaSource(MediaSource):
-    """Pull-based source: audio is always PCM (silence when idle), video is {} when nothing is due."""
+    """Pull-based source: audio is PCM, or Opus in audio passthrough (silence when idle), video is {} when nothing
+    is due."""
 
     def __init__(self, publisher: Publisher, video_config: VideoConfig) -> None:
         self._publisher = publisher
         self._video_config = video_config
 
     def is_opus(self) -> bool:
-        return False
+        return self._publisher.opus  # fixed per publisher, so constant for the play() session
 
     def read(self) -> bytes:
         return self._publisher.next_audio()

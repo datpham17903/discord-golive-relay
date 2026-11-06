@@ -1757,3 +1757,76 @@ def test_status_details_from_service(tmp_path, slate, source_gop):
         assert await task == 0
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize("mode,opus", [("passthrough", True), ("transcode", False)])
+def test_audio_mode_selects_opus_publishers(tmp_path, slate, source_gop, mode, opus):
+    from golive_relay.supervisor.outputs_model import OutputAccount
+
+    env = Env(tmp_path, slate, source_gop)
+    cfg = replace(
+        env.cfg,
+        codecs=replace(env.cfg.codecs, audio_mode=mode),
+        discord=replace(env.cfg.discord, output_accounts=(OutputAccount(1, "t1"), OutputAccount(2, "t2"))),
+    )
+    svc = Service(cfg, env.store, lambda *a: None, lambda p: None, lambda *a, **k: None,
+                  slate_builder=lambda *a: slate, install_signals=False)
+    assert svc.publisher.opus is opus
+    assert set(svc._out_pubs) == {1, 2}
+    assert all(p.opus is opus for p in svc._out_pubs.values())
+
+
+@pytest.mark.parametrize("mode,expected", [("passthrough", None), ("transcode", 96)])
+def test_run_service_audio_bitrate_by_audio_mode(tmp_path, slate, source_gop, monkeypatch, mode, expected):
+    from golive_relay import service as service_mod
+    from golive_relay.adapter import discord_adapter, output_account
+    from golive_relay.control import cli
+    from golive_relay.supervisor.outputs_model import OutputAccount
+
+    env = Env(tmp_path, slate, source_gop)
+    acct = OutputAccount(424242, "relay-token-2")
+    cfg = replace(
+        env.cfg,
+        codecs=replace(env.cfg.codecs, audio_mode=mode),
+        quality=replace(env.cfg.quality, audio_bitrate_kbps=96),
+        discord=replace(env.cfg.discord, output_accounts=(acct,)),
+    )
+    seen: dict[str, dict] = {}
+
+    class FakeDiscordAdapter:
+        def __init__(self, *a, **kw) -> None:
+            seen["ingest"] = kw
+
+    class FakeOutputAccountAdapter:
+        def __init__(self, *a, **kw) -> None:
+            seen["output"] = kw
+
+    class FakeLocks:
+        def __init__(self, ids) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a) -> None:
+            return None
+
+    class FakeService:
+        def __init__(self, cfg, store, adapter_factory, worker_factory, log, output_adapter_factory, output_tokens):
+            self.factories = (adapter_factory, output_adapter_factory)
+
+        async def run(self, token) -> int:
+            adapter_factory, out_factory = self.factories
+            adapter_factory(None, None, None)
+            out_factory(acct, None, None)
+            return 0
+
+    monkeypatch.setattr(discord_adapter, "DiscordAdapter", FakeDiscordAdapter)
+    monkeypatch.setattr(output_account, "OutputAccountAdapter", FakeOutputAccountAdapter)
+    monkeypatch.setattr(cli, "load_token", lambda cred: "tok")
+    monkeypatch.setattr(service_mod, "InstanceLocks", FakeLocks)
+    monkeypatch.setattr(service_mod, "Service", FakeService)
+
+    assert asyncio.run(service_mod.run_service(cfg, "main-token")) == 0
+    assert seen["ingest"]["audio_bitrate_kbps"] == expected
+    assert seen["output"]["audio_bitrate_kbps"] == expected

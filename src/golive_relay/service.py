@@ -162,8 +162,9 @@ class Service:
         if st.prejoin_voice is not None:  # chat override persisted in state.json; config is only the default
             sup_cfg = replace(sup_cfg, prejoin_voice=st.prejoin_voice)
         self.sup = Supervisor(sup_cfg, persisted_view(st), mirrors=routing.mirrors)
+        opus = cfg.codecs.audio_mode == "passthrough"
         self.publisher = Publisher(
-            lambda g, e, now: self.sup.gate_allows(g, e, now), on_need_idr=self._need_idr
+            lambda g, e, now: self.sup.gate_allows(g, e, now), on_need_idr=self._need_idr, opus=opus
         )
         r = cfg.runtime
         accounts = cfg.output_accounts()
@@ -185,7 +186,7 @@ class Service:
         self._last_watch_ms: float | None = None  # watch_sent_from_seen_ms of the last logged session
         self._audio_ok = False  # non-silent target audio in the last status window
         self._out_pubs: dict[int, Publisher] = {
-            a.user_id: Publisher(self._out_gate(a.user_id), on_need_idr=self._need_idr) for a in accounts
+            a.user_id: Publisher(self._out_gate(a.user_id), on_need_idr=self._need_idr, opus=opus) for a in accounts
         }
         self._out_factory = output_adapter_factory
         self._out_tokens = output_tokens or {}
@@ -1214,6 +1215,7 @@ class Service:
             autoscale=self._autoscale,
             debounce_ms=self.cfg.runtime.start_debounce_ms,
             video_mode=self.cfg.codecs.video_mode,
+            audio_mode=self.cfg.codecs.audio_mode,
             output_size=f"{w}x{h}@{fps}",
             last_watch_ms=self._last_watch_ms,
             audio_ok=self._audio_ok,
@@ -1296,17 +1298,19 @@ async def run_service(cfg: RelayConfig, token: str) -> int:
     log = JsonLogger(sys.stderr, [token, *out_tokens.values()]).event
     store = StateStore(cfg.storage.state_directory)
     d = cfg.discord
+    # Audio passthrough sends the target's Opus as-is (its own bitrate); only transcode encodes at a bitrate.
+    audio_kbps = cfg.quality.audio_bitrate_kbps if cfg.codecs.audio_mode == "transcode" else None
     with InstanceLocks([d.expected_relay_user_id, *(a.user_id for a in accounts)]):
         svc = Service(
             cfg, store, lambda events, ingress, lg: DiscordAdapter(
                 cfg, events, ingress, lg, network_stats=cfg.logging.network_stats,
-                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps),
+                audio_bitrate_kbps=audio_kbps, self_deaf=cfg.runtime.self_deaf_ingest),
             WorkerHandle.start, log,
             output_adapter_factory=lambda acct, events, lg: OutputAccountAdapter(
                 acct.user_id, d.guild_id, d.allowed_voice_channel_id, events, lg,
                 network_stats=cfg.logging.network_stats, codec_mode=cfg.codecs.parent_codecs,
                 excluded_viewer_ids=cfg.authorization.excluded_viewer_ids,
-                audio_bitrate_kbps=cfg.quality.audio_bitrate_kbps,
+                audio_bitrate_kbps=audio_kbps, self_deaf=cfg.runtime.self_deaf_outputs,
                 bot_user_ids=frozenset({d.expected_relay_user_id, *(a.user_id for a in accounts)})),
             output_tokens=out_tokens,
         )

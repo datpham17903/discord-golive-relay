@@ -299,6 +299,7 @@ def _details(**over):
         autoscale=True,
         debounce_ms=100,
         video_mode="passthrough",
+        audio_mode="passthrough",
         output_size="1920x1080@60",
         last_watch_ms=412.0,
         audio_ok=True,
@@ -328,7 +329,7 @@ def test_status_details_layout():
     assert "> 🟡 <#200> ← **Mir1** · đang kết nối" in s
     assert "> ⚫ **22** · rảnh" in s
     assert lines[-1] == ("-# ⚙️ prejoin bật · debounce 100 ms · autoscale bật · 1920×1080@60 passthrough"
-                         " · lệnh công khai: không có · cooldown 0s/0s")
+                         " · audio passthrough · lệnh công khai: không có · cooldown 0s/0s")
     assert "<@" not in s
 
 

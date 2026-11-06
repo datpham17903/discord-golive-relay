@@ -285,6 +285,21 @@ def test_publish_plays_with_configured_audio_bitrate() -> None:
     asyncio.run(go())
 
 
+def test_publish_plays_without_bitrate_in_audio_passthrough() -> None:
+    async def go():
+        calls: list = []
+        a = OutputAccountAdapter(
+            USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+            decodable={"H264"}, client_factory=lambda: FakeClient(calls), audio_bitrate_kbps=None,
+        )
+        await a.start("tok")
+        await a.publish(5, 1, 30, "SRC", CHAN)
+        assert ("play_kw", {}) in calls
+        await a.end()
+
+    asyncio.run(go())
+
+
 def test_own_go_live_viewers_emitted_without_bots() -> None:
     async def go():
         events: list = []
@@ -311,5 +326,22 @@ def test_own_go_live_viewers_emitted_without_bots() -> None:
         events.clear()
         await a._client.on_stream_update(own([]), own([5, 6]))  # a new run reports again
         assert events == [OutViewers(USER, frozenset({5, 6}))]
+
+    asyncio.run(go())
+
+
+def test_publish_self_deaf_follows_config() -> None:
+    async def go():
+        for kw, want in (({}, True), ({"self_deaf": False}, False)):
+            calls: list = []
+            a = OutputAccountAdapter(
+                USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+                decodable={"H264"}, client_factory=lambda: FakeClient(calls), **kw,
+            )
+            await a.start("tok")
+            await a.publish(1, 1, 30, "SRC", CHAN)
+            connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
+            assert connect["self_mute"] is True and connect["self_deaf"] is want
+            await a.end()
 
     asyncio.run(go())

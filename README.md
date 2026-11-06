@@ -138,15 +138,18 @@ relayctl validate --config config.yaml
 | `codecs.video_encoder` | `auto`, `libx264`, `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf`, `h264_videotoolbox` (`h264_vaapi` is accepted but not usable) | `auto` | force a specific encoder (section 9) |
 | `codecs.hw_decode` | `none`, `auto`, `d3d11va`, `cuda`, `vaapi`, `videotoolbox` | `none` | see section 9 |
 | `codecs.video_mode` | `passthrough` forwards the target's H.264 as-is (near-zero CPU, lower latency; the target's bitrate is sent unchanged and keyframes come from PLI requests to the target); `transcode` decodes and re-encodes at `video_bitrate_kbps`. Non-H.264 or oversized sources always fall back to transcode | `passthrough` | use `transcode` if relay viewers hit Discord error 2003 (target bitrate too high for your uplink) |
-| `quality.mode` | `fixed` (always output `fixed_*`; a source of exactly that size is passed through, any other size is decoded and scaled to fit with black bars, which costs CPU and adds no detail) or `auto` (use `max_*`, never upscale) | `fixed` | use `auto` to keep the source size |
+| `codecs.audio_mode` | `passthrough` forwards the target's Opus packets as-is (its own bitrate, no re-encode; packets other than one 20 ms frame are dropped and counted as `audio_unsupported`); `transcode` decodes and re-encodes at `quality.audio_bitrate_kbps` | `passthrough` | use `transcode` if relayed audio is missing while the target's audio is not |
+| `quality.mode` | `auto` (use `max_*`: a source up to that size is passed through unchanged, a larger one is scaled down; never upscales) or `fixed` (always output `fixed_*`; any other source size is decoded and scaled with black bars, which costs a lot of CPU and adds no detail) | `auto` | use `fixed` only if every output must be exactly `fixed_*` |
 | `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 1920 x 1080 @ 60 | lower for weak CPU or network |
 | `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | lower for weak CPU or network |
 | `quality.video_bitrate_kbps` | Encode bitrate per output | `8000` | lower if you see error 2003 (section 10) |
-| `quality.audio_bitrate_kbps` | Audio bitrate | `128` | rarely |
+| `quality.audio_bitrate_kbps` | Audio bitrate (only with `codecs.audio_mode: transcode`) | `128` | rarely |
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
 | `audio.source` | Audio source | `target_stream_only` | never (only value) |
 | `runtime.start_debounce_ms` | Wait before reacting to a start | `100` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
+| `runtime.self_deaf_ingest` | The ingest joins voice self-muted and self-deafened (bots are always self-muted), so voice chat is never sent to it. Set `false` if a deafened ingest stops receiving the target's Go Live audio | `true` | only if the stream audio goes missing |
+| `runtime.self_deaf_outputs` | Relay and mirror accounts join self-muted and self-deafened (they only publish) | `true` | rarely |
 | `runtime.idle_voice_grace_seconds` | Grace while the target is idle in voice | `30` | rarely |
 | `runtime.hold_recovery_timeout_seconds` | How long a HOLD (slate) may last | `15` | rarely |
 | `runtime.connect_timeout_seconds` | Voice connect timeout | `15` | slow networks |

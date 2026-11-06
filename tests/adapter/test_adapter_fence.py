@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace as NS
 
-from golive_relay.adapter.discord_adapter import DiscordAdapter
+from golive_relay.adapter.discord_adapter import DiscordAdapter, opus_packet_info
 from golive_relay.supervisor.model import (
     GatewayChanged,
     GatewayState,
@@ -192,8 +192,29 @@ def test_ingress_audio_window_counts_packets_and_opus_silence() -> None:
     for p in (pkt("audio", b"\xf8\xff\xfe"), pkt("audio", b"\xf8\xff\xfe"), pkt("audio", b"\x78\x01"),
               pkt("video", b"\xf8\xff\xfe"), pkt("audio", b"\x78\x01", user=99)):
         a._on_packet(p)
-    assert a.take_audio_window() == {"packets": 3, "silence": 2}
-    assert a.take_audio_window() == {"packets": 0, "silence": 0}
+    w = a.take_audio_window()
+    assert (w["packets"], w["silence"]) == (3, 2)
+    w = a.take_audio_window()
+    assert (w["packets"], w["silence"]) == (0, 0)
+
+
+def test_ingress_audio_format_and_sequence_counters() -> None:
+    a, _ = make()
+    pkt = lambda seq, payload: NS(user_id=TARGET, media_type="audio", ssrc=8, sequence=seq, received_at=None,
+                                  rtcp_time=None, codec="opus", timestamp=0, payload=payload)
+    celt20s = bytes([0xFC]) + b"\x00" * 9  # config 31, stereo, 1 frame
+    silk60m2 = bytes([0x19, 0x00])  # config 3 (SILK 60 ms), mono, code 1 -> 2 frames
+    for p in (pkt(65534, celt20s), pkt(65535, celt20s), pkt(2, silk60m2),  # wrap 65535 -> 0, 1 missing twice
+              pkt(1, celt20s), pkt(2, b"\xf8\xff\xfe"), pkt(3, b""), pkt(4, bytes([0xFB]))):
+        a._on_packet(p)
+    w = a.take_audio_window()
+    assert (w["packets"], w["silence"], w["bad"]) == (7, 1, 2)
+    assert (w["seq_gaps"], w["seq_back"]) == (2, 2)
+    assert w["durations"] == {"20": 3, "120": 1}
+    assert w["channels"] == {"stereo": 3, "mono": 1}
+    assert w["modes"] == {"celt": 3, "silk": 1, "hybrid": 0}
+    assert (w["multi_frame"], w["bytes"]) == (1, 32)
+    assert "kbps" in w
 
 
 def test_play_passes_configured_audio_bitrate() -> None:
@@ -203,3 +224,43 @@ def test_play_passes_configured_audio_bitrate() -> None:
     a._out = NS(play=lambda source, **kw: calls.append((source, kw)))
     a.play("SRC")
     assert calls == [("SRC", {"bitrate": 128})]
+
+
+def test_opus_packet_info_parses_toc() -> None:
+    assert opus_packet_info(bytes([0xFC])) == (20, "stereo", "celt", 1)
+    assert opus_packet_info(bytes([0xF0])) == (10, "mono", "celt", 1)  # config 30
+    assert opus_packet_info(bytes([0x18])) == (60, "mono", "silk", 1)
+    assert opus_packet_info(bytes([0x7B, 0x03])) == (60, "mono", "hybrid", 3)
+    assert opus_packet_info(b"\xf8\xff\xfe") == (20, "mono", "celt", 1)
+    assert opus_packet_info(b"") is None
+    assert opus_packet_info(bytes([0x03])) is None
+
+
+def test_play_without_bitrate_in_audio_passthrough() -> None:
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"}, audio_bitrate_kbps=None)
+    calls: list = []
+    a._out = NS(play=lambda source, **kw: calls.append((source, kw)))
+    a.play("SRC")
+    assert calls == [("SRC", {})]
+
+
+def test_join_passes_self_mute_and_configured_self_deaf() -> None:
+    import asyncio
+
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    for deaf in (True, False):
+        a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"}, self_deaf=deaf)
+        seen: list = []
+
+        async def connect(**kw):
+            seen.append(kw)
+            return NS(session_id="s")
+
+        a._guild_channel = lambda: NS(connect=connect)
+        asyncio.run(a.join())
+        assert seen[0]["self_mute"] is True and seen[0]["self_deaf"] is deaf
+    a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"})
+    a._guild_channel = lambda: NS(connect=connect)
+    asyncio.run(a.join())
+    assert seen[-1]["self_deaf"] is True

@@ -20,6 +20,7 @@ from discord.ext import native_voice as nv
 from golive_relay.adapter import codecs
 from golive_relay.config import ControlConfig
 from golive_relay.control.commands import ChatCommand
+from golive_relay.media.opus import OPUS_SILENCE, opus_packet_info
 from golive_relay.supervisor.model import (
     AuthRejected,
     ConfigInvalid,
@@ -41,7 +42,11 @@ from golive_relay.worker.messages import IngressAudio, IngressVideo
 
 PROGRESS_MIN_INTERVAL_S = 0.25  # 4 per second
 CONNECT_TIMEOUT_S = 15
-OPUS_SILENCE = b"\xf8\xff\xfe"  # the frame a sender emits while muted / silent
+
+
+def _new_audio_window() -> dict[str, Any]:
+    return {"packets": 0, "silence": 0, "bytes": 0, "bad": 0, "seq_gaps": 0, "seq_back": 0, "multi_frame": 0,
+            "durations": {}, "channels": {"stereo": 0, "mono": 0}, "modes": {"celt": 0, "silk": 0, "hybrid": 0}}
 
 
 class _Client(discord.Client):
@@ -70,7 +75,8 @@ class DiscordAdapter:
         paused_verified: bool = False,
         decodable: set[str] | None = None,
         network_stats: bool = False,
-        audio_bitrate_kbps: int = 64,
+        audio_bitrate_kbps: int | None = 64,
+        self_deaf: bool = True,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -92,6 +98,7 @@ class DiscordAdapter:
             codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
+        self._self_deaf = self_deaf
         self._watch_cls = nv.StreamClient.with_config(
             codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
@@ -112,7 +119,9 @@ class DiscordAdapter:
         self._last_seq: dict[int, int | None] = {}
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
         self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
-        self._audio_window = {"packets": 0, "silence": 0}
+        self._audio_window = _new_audio_window()
+        self._audio_window_start = time.monotonic()
+        self._audio_last_seq: dict[int, int] = {}
 
     # ------------------------------------------------------------ lifecycle
 
@@ -407,7 +416,8 @@ class DiscordAdapter:
         self._voice_state_cb = on_voice_state
         try:
             self._vc = await channel.connect(
-                cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
+                cls=self._parent_cls, self_mute=True, self_deaf=self._self_deaf, reconnect=False,
+                timeout=CONNECT_TIMEOUT_S
             )
         except BaseException:
             self._vc = None  # the voice-state echo may already have set it
@@ -452,12 +462,18 @@ class DiscordAdapter:
         return self._out.negotiated_video_codec
 
     def play(self, source: Any) -> None:
-        self._out.play(source, bitrate=self._audio_bitrate_kbps)
+        if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder
+            self._out.play(source)
+        else:
+            self._out.play(source, bitrate=self._audio_bitrate_kbps)
 
-    def take_audio_window(self) -> dict[str, int]:
-        """Target audio packets received since the last call, and how many were Opus silence frames."""
+    def take_audio_window(self) -> dict[str, Any]:
+        """Target audio stats since the last call: packets, Opus silence frames, and the non-silence format."""
+        now = time.monotonic()
         with self._audio_lock:
-            w, self._audio_window = self._audio_window, {"packets": 0, "silence": 0}
+            w, self._audio_window = self._audio_window, _new_audio_window()
+            elapsed, self._audio_window_start = now - self._audio_window_start, now
+        w["kbps"] = round(w["bytes"] * 8 / elapsed / 1000) if elapsed > 0 else 0
         return w
 
     def network_stats(self) -> dict[str, dict[str, int]]:
@@ -525,14 +541,42 @@ class DiscordAdapter:
         else:
             msg = IngressAudio(generation, epoch, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload))
             with self._audio_lock:
-                self._audio_window["packets"] += 1
-                self._audio_window["silence"] += msg.data == OPUS_SILENCE
+                self._count_audio(pkt.ssrc, pkt.sequence, msg.data)
         self._ingress(msg)
         fresh = pkt.sequence is None or self._last_seq.get(pkt.ssrc) != pkt.sequence
         self._last_seq[pkt.ssrc] = pkt.sequence
         if fresh and now - self._last_progress[video] >= PROGRESS_MIN_INTERVAL_S and self._loop is not None:
             self._last_progress[video] = now
             self._loop.call_soon_threadsafe(self._emit, SourceProgress(generation, now, video))
+
+    def _count_audio(self, ssrc: int, seq: int | None, data: bytes) -> None:
+        """Native thread, audio lock held: per-packet counters (no decoding)."""
+        w = self._audio_window
+        w["packets"] += 1
+        if seq is not None:
+            last = self._audio_last_seq.get(ssrc)
+            self._audio_last_seq[ssrc] = seq if last is None else last
+            if last is not None:
+                delta = (seq - last) & 0xFFFF
+                if delta == 0 or delta >= 0x8000:
+                    w["seq_back"] += 1
+                else:
+                    w["seq_gaps"] += delta - 1
+                    self._audio_last_seq[ssrc] = seq
+        if data == OPUS_SILENCE:
+            w["silence"] += 1
+            return
+        info = opus_packet_info(data)
+        if info is None:
+            w["bad"] += 1
+            return
+        ms, channels, mode, frames = info
+        w["bytes"] += len(data)
+        key = f"{ms:g}"
+        w["durations"][key] = w["durations"].get(key, 0) + 1
+        w["channels"][channels] += 1
+        w["modes"][mode] += 1
+        w["multi_frame"] += frames > 1
 
     def _request_video(self, ssrc: int) -> None:
         sc = self._sc

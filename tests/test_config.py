@@ -65,7 +65,7 @@ def test_output_profile():
     cfg = load_config(EXAMPLE)
     prof = cfg.output_profile()
     assert isinstance(prof, OutputProfile)
-    assert (prof.mode, prof.fixed_width, prof.fixed_height, prof.fps) == ("fixed", 1920, 1080, 60)
+    assert (prof.mode, prof.max_width, prof.max_height, prof.fps) == ("auto", 1920, 1080, 60)
     assert prof.video_bitrate_kbps == 8000
     assert prof.keyframe_interval_s == 2
     assert prof.audio_enabled is True
@@ -297,6 +297,17 @@ def test_video_mode_default_and_parse(tmp_path):
     assert any("codecs.video_mode" in e for e in _errors(tmp_path, raw))
 
 
+def test_audio_mode_default_and_parse(tmp_path):
+    raw = _raw()
+    raw["codecs"].pop("audio_mode", None)
+    cfg = _load(tmp_path, raw)
+    assert cfg.codecs.audio_mode == "passthrough" and cfg.output_profile().audio_mode == "passthrough"
+    raw["codecs"]["audio_mode"] = "transcode"
+    assert _load(tmp_path, raw).output_profile().audio_mode == "transcode"
+    raw["codecs"]["audio_mode"] = "auto"
+    assert any("codecs.audio_mode" in e for e in _errors(tmp_path, raw))
+
+
 def test_codec_modes_accept_h264_only(tmp_path):
     raw = _raw()
     raw["codecs"]["parent_codecs"] = raw["codecs"]["watch_codecs"] = "h264_only"
@@ -361,6 +372,17 @@ def test_control_config_operators_optional_when_enabled(tmp_path: Path):
     assert any("control.command_prefix" in e for e in _errors(tmp_path, raw))
     raw["control"] = {"bogus": 1}
     assert any("control.bogus" in e for e in _errors(tmp_path, raw))
+
+
+def test_self_deaf_defaults_on_and_validates(tmp_path):
+    for key in ("self_deaf_ingest", "self_deaf_outputs"):
+        raw = _raw()
+        raw["runtime"].pop(key, None)
+        assert getattr(_load(tmp_path, raw).runtime, key) is True
+        raw["runtime"][key] = False
+        assert getattr(_load(tmp_path, raw).runtime, key) is False
+        raw["runtime"][key] = "yes"
+        assert any(key in e for e in _errors(tmp_path, raw))
 
 
 def test_prejoin_voice_defaults_on(tmp_path):

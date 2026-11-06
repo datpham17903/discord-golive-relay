@@ -220,3 +220,49 @@ def test_audio_window_counts_played_held_late_and_evicted(slate):
     w = e.pub.take_window()
     assert (w["audio_played"], w["audio_held_reads"], w["audio_late_dropped"], w["audio_evicted"]) == (1, 1, 1, 3)
     assert e.pub.take_window()["audio_played"] == 0
+
+
+OPUS_SILENCE = b"\xf8\xff\xfe"
+
+
+def _opus_env(slate):
+    e = Env(slate)
+    e.pub = Publisher(lambda g, ep, t: e.gate_open, clock=lambda: e.now, opus=True)
+    return e
+
+
+def _opus(i: int, deadline: float) -> EgressAudio:
+    return EgressAudio(1, 1, b"", deadline, opus=bytes([0xFC, i]))
+
+
+def test_opus_publisher_plays_frames_at_deadline_and_silence_otherwise(slate):
+    e = _opus_env(slate)
+    assert e.pub.next_audio() == OPUS_SILENCE  # no source: gate closed
+    e.pub.set_source(1, 1)
+    assert e.pub.next_audio() == OPUS_SILENCE  # nothing queued
+    e.pub.offer_audio(_opus(1, e.now - 1.0))  # too late
+    e.pub.offer_audio(_opus(2, e.now))
+    e.pub.offer_audio(_opus(3, e.now + 0.1))
+    assert e.pub.next_audio() == bytes([0xFC, 2])
+    assert e.pub.next_audio() == OPUS_SILENCE  # holding for a future deadline
+    e.now += 0.1
+    assert e.pub.next_audio() == bytes([0xFC, 3])
+    for i in range(MAX_PCM_BLOCKS + 2):
+        e.pub.offer_audio(_opus(i, e.now + 1.0))
+    w = e.pub.take_window()
+    assert (w["audio_played"], w["audio_held_reads"], w["audio_late_dropped"], w["audio_evicted"]) == (2, 1, 1, 2)
+    e.gate_open = False
+    assert e.pub.next_audio() == OPUS_SILENCE
+    e.pub.close()
+    assert e.pub.next_audio() == OPUS_SILENCE
+
+
+def test_opus_source_passes_source_silence_and_never_empty(slate):
+    e = _opus_env(slate)
+    src = RelayMediaSource(e.pub, VideoConfig("H264", 64, 64, 10, 100000))
+    assert src.is_opus()
+    assert src.read() == OPUS_SILENCE
+    e.pub.set_source(1, 1)
+    e.pub.offer_audio(EgressAudio(1, 1, b"", e.now, opus=OPUS_SILENCE))
+    assert src.read() == OPUS_SILENCE
+    assert all(src.read() != b"" for _ in range(5))

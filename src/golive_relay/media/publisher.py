@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator
 from discord.ext.native_voice.media import VideoFrame
 
 from golive_relay.media.h264 import has_parameter_sets, idr_pic_id, is_idr
+from golive_relay.media.opus import OPUS_SILENCE
 from golive_relay.media.slate import SlateGop
 from golive_relay.worker.messages import AUDIO_FRAME_BYTES, EgressAudio, EgressVideo
 
@@ -40,11 +41,15 @@ class Publisher:
         clock: Callable[[], float] = time.monotonic,
         max_late_s: float = 0.2,
         on_need_idr: Callable[[], None] = lambda: None,
+        opus: bool = False,
     ) -> None:
         self._gate = gate
         self._clock = clock
         self._max_late = max_late_s
         self._on_need_idr = on_need_idr
+        # Audio passthrough: the queue holds Opus frames and every read returns one 20 ms Opus frame.
+        self.opus = opus
+        self._silence = OPUS_SILENCE if opus else _SILENCE
         self._lock = threading.Lock()
         self._source: tuple[int, int] | None = None
         self._slate: SlateGop | None = None
@@ -208,14 +213,14 @@ class Publisher:
             now = self._clock()
             if not self._gate_open_locked(now):
                 self._audio.clear()
-                return _SILENCE
+                return self._silence
             while self._audio:
                 if self._audio[0].deadline > now:
                     self._window["audio_held_reads"] += 1
-                    return _SILENCE  # hold until the shared-timeline deadline, like video
+                    return self._silence  # hold until the shared-timeline deadline, like video
                 au = self._audio.popleft()
                 if now - au.deadline <= self._max_late:
                     self._window["audio_played"] += 1
-                    return au.pcm
+                    return au.opus if self.opus else au.pcm
                 self._window["audio_late_dropped"] += 1
-            return _SILENCE
+            return self._silence
