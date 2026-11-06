@@ -266,3 +266,59 @@ def test_opus_source_passes_source_silence_and_never_empty(slate):
     e.pub.offer_audio(EgressAudio(1, 1, b"", e.now, opus=OPUS_SILENCE))
     assert src.read() == OPUS_SILENCE
     assert all(src.read() != b"" for _ in range(5))
+
+
+def _codec_au(e, data, codec, idr=False):
+    return EgressVideo(1, 1, data, idr, 100.0, e.now, None, False, codec)
+
+
+def test_drops_other_codec_aus(slate):
+    e = Env(slate)
+    e.pub.set_source(1, 1)
+    e.pub.offer_video(_codec_au(e, b"\x00\x00\x01\x40", "H265"))
+    assert e.pub.next_video() is None
+    assert e.idr_requests == 0
+
+
+def test_h265_waits_for_entry_point(monkeypatch, slate):
+    e = Env(slate)
+    e.pub.set_codec("H265")
+    e.idr_requests = 0
+    e.pub.set_source(1, 1)
+    seen = []
+    import golive_relay.media.publisher as mod
+    monkeypatch.setattr(mod, "is_entry_point", lambda c, d: seen.append(c) or d == b"entry")
+    e.pub.offer_video(_codec_au(e, b"delta", "H265"))
+    assert e.pub.next_video() is None
+    assert e.idr_requests == 1
+    e.pub.offer_video(_codec_au(e, b"entry", "H265"))
+    e.pub.offer_video(_codec_au(e, b"delta", "H265"))
+    assert e.pub.next_video().data == b"entry"
+    assert e.pub.next_video().data == b"delta"
+    assert set(seen) == {"H265"}
+
+
+def test_no_slate_when_codec_not_h264(slate):
+    e = Env(slate)
+    e.pub.set_slate(slate)
+    e.pub.set_source(1, 1)
+    e.gate_open = False
+    assert e.pub.next_video() is not None
+    e.pub.set_codec("H265")
+    assert e.pub.next_video() is None
+
+
+def test_set_codec_clears_queue_and_awaits_entry(slate):
+    e = Env(slate)
+    e.pub.set_source(1, 1)
+    e.pub.offer_video(e.au(slate.variants[0][0], True))
+    e.pub.set_codec("H265")
+    assert e.pub.codec == "H265"
+    assert e.idr_requests == 1  # the new codec needs an entry point from the worker
+    assert e.pub._slate_iter is None
+    assert e.pub.next_video() is None
+    e.pub.set_codec("H264")
+    e.pub.offer_video(e.au(slate.variants[0][1], False))
+    assert e.pub.next_video() is None  # non-entry discarded
+    e.pub.offer_video(e.au(slate.variants[0][0], True))
+    assert e.pub.next_video().data == slate.variants[0][0]
