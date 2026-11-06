@@ -22,6 +22,7 @@ MAX_INPUT_PIXELS = 3840 * 2160  # decode guard; not configurable in v1
 VIDEO_ENCODERS = ("libx264", "h264_nvenc", "h264_amf", "h264_qsv", "h264_mf", "h264_videotoolbox", "h264_vaapi")
 VIDEO_MODES = ("transcode", "passthrough")
 AUDIO_MODES = ("transcode", "passthrough")
+OUTPUT_CODECS = ("adaptive", "H264")
 HW_DECODE_DEVICES = ("none", "d3d11va", "cuda", "vaapi", "videotoolbox")  # matches hwaccel.HW_DEVICE_ORDER
 MAX_OUTPUT_ACCOUNTS = 9
 _CREDENTIAL_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -186,6 +187,7 @@ class RelayConfig:
             hw_decode=self.codecs.hw_decode,
             video_mode=self.codecs.video_mode,
             audio_mode=self.codecs.audio_mode,
+            codec_mode="adaptive" if self.codecs.output_codec == "adaptive" else "h264",
         )
 
     def profile_key(self) -> tuple[int, int, int]:
@@ -267,6 +269,14 @@ class _Reader:
             return "auto"
         return v
 
+    def is_auto(self, key: str) -> bool:
+        """True (and the key counted as read) when the key is absent or the string ``auto``."""
+        v = self.data.get(key)
+        if v is None or v == "auto":
+            self._seen.add(key)
+            return True
+        return False
+
     def int_(self, key: str, *, minimum: int = 1, even: bool = False) -> int:
         v = self._get(key)
         if isinstance(v, bool) or not isinstance(v, int):
@@ -314,6 +324,12 @@ class _Reader:
                 self._err(key, "must be a boolean")
             return False
         return v
+
+
+def _bitrate(r: _Reader, key: str) -> int:
+    """``auto`` (or absent) is 0: the encoder picks a bitrate from the output size, the announced video
+    state uses the library default; otherwise an integer kbps."""
+    return 0 if r.is_auto(key) else r.int_(key)
 
 
 def _optional(r: _Reader, key: str, default: Any) -> Any:
@@ -494,7 +510,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
     codecs = CodecsConfig(
         r.str_("parent_codecs", ("auto_decode", "h264_only")),
         r.str_("watch_codecs", ("auto_decode", "h264_only")),
-        r.str_("output_codec", ("H264",)),
+        r.str_("output_codec", OUTPUT_CODECS) if "output_codec" in r.data else "adaptive",
         r.int_("output_rids"),
         r.opt_str("video_encoder", VIDEO_ENCODERS),
         # Software decode by default: live G2b on an iGPU (Radeon 780M) that was also encoding the
@@ -516,7 +532,7 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         fixed_width=r.int_("fixed_width", even=True),
         fixed_height=r.int_("fixed_height", even=True),
         fixed_fps=r.int_("fixed_fps"),
-        video_bitrate_kbps=r.int_("video_bitrate_kbps"),
+        video_bitrate_kbps=_bitrate(r, "video_bitrate_kbps"),
         audio_bitrate_kbps=r.int_("audio_bitrate_kbps"),
         approved_profile_manifest=r.str_("approved_profile_manifest"),
     )

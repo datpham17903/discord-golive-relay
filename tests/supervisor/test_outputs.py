@@ -36,7 +36,7 @@ MCH = 600
 MCH2 = 601
 
 
-def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_ids=(), idle=30.0):
+def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_ids=(), idle=30.0, adaptive=False):
     return OutputPool(
         [OutputAccount(i, f"c{i}", "mirror" if i in mirror_ids else "relay") for i in ids],
         persisted or {},
@@ -45,6 +45,7 @@ def make(ids=(A, B), persisted=None, limit=3, mirrors=None, excluded=(), mirror_
         routing=Routing(SRC, CH, mirrors or {}),
         excluded_viewer_ids=frozenset(excluded),
         relay_idle_stop_s=idle,
+        adaptive=adaptive,
     )
 
 
@@ -616,3 +617,17 @@ def test_kept_counts_only_relays_with_known_viewers():
     p.handle(OutViewers(B, frozenset({901})), t + 4.0)
     assert p.relay_summary()["kept"] == 1
     assert p.relay_summary()["kept_ids"] == (B,)
+
+
+def test_pool_adaptive_accepts_av1_ready():
+    p = make((A,), adaptive=True)
+    p.handle(SessionLive(1, 1, 7), 0.0)
+    p.handle(OutJoined(A, 1, 1, "vs"), 0.1)
+    p.handle(OutReady(A, 1, 1, "AV1"), 0.2)
+    assert p.status(0.2)[0]["state"] != "backoff"
+    assert p.is_current(A, 1, 1) and not p.is_current(A, 1, 2)
+    p.handle(OutJoined(A, 1, 1, "vs"), 0.3)
+    q = make((A,), adaptive=True)
+    q.handle(SessionLive(1, 1, 7), 0.0)
+    q.handle(OutJoined(A, 1, 1, "vs"), 0.1)
+    assert kinds(q.handle(OutReady(A, 1, 1, "FOO"), 0.2)) == [OutCloseGate, OutTeardown]

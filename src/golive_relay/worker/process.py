@@ -19,7 +19,7 @@ from typing import Any
 import av
 from av.video.frame import PictureType
 
-from golive_relay.media import hwaccel
+from golive_relay.media import bitstream, hwaccel
 from golive_relay.media.h264 import ensure_low_delay_vui, has_parameter_sets, sps_dimensions
 from golive_relay.media.opus import opus_packet_info
 from golive_relay.worker.canvas import compute_canvas, letterbox
@@ -100,7 +100,8 @@ def _select_encoder(profile: OutputProfile) -> hwaccel.EncoderProbe:
 
 
 def _new_encoder(width: int, height: int, profile: OutputProfile, name: str) -> Any:
-    return hwaccel.open_encoder(name, width, height, profile.fps, profile.video_bitrate_kbps * 1000)
+    kbps = profile.video_bitrate_kbps or hwaccel.auto_bitrate_kbps(width, height, profile.fps)  # 0 = auto
+    return hwaccel.open_encoder(name, width, height, profile.fps, kbps * 1000)
 
 
 def _new_audio_decoder() -> Any:
@@ -137,6 +138,7 @@ class Worker:
         self.t0: float | None = None
         self.pts = -1
         self._reset_epoch()
+        self.dims_cache: dict[tuple[str, bytes], tuple[int, int]] = {}
         self.stats: dict[str, Any] = {
             "frames_out": 0, "idr": 0, "repeats": 0, "decoded": 0, "rate_skipped": 0, "backpressure_skips": 0,
             "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "audio_unsupported": 0, "decode_errors": 0,
@@ -146,6 +148,8 @@ class Worker:
         self.decoder: Any = None
         self.pt_active = False  # forwarding the target's H.264 without decoding (decided at a source IDR)
         self.pt_decided = False
+        self.pt_codec = ""  # codec of the passthrough lane (adaptive mode)
+        self.src_state: tuple[str, int, int, bool] | None = None  # last source_codec announced
         self.last_pt_idr = float("-inf")
         self.codec = ""
         self.decode_path = ""
@@ -214,6 +218,7 @@ class Worker:
             self.jbuf.clear()
             self.output_enabled = msg.enabled
             if msg.enabled:
+                self.src_state = None  # source_codec is announced again at the next entry point
                 self.last_enc_rtp = None  # the rate-skip reference is from before the pause
                 self.last_encode_at = float("-inf")
                 self.force_idr = True
@@ -253,7 +258,8 @@ class Worker:
                 self.jbuf.clear()  # an access unit is never dropped alone
             self._request_keyframe(reset_decoder=True)
             return
-        if m.codec == "H264" and self.profile.video_mode == "passthrough":
+        adaptive = self.profile.codec_mode == "adaptive"
+        if (m.codec == "H264" or adaptive) and self.profile.video_mode == "passthrough":
             if self._passthrough(m, now):
                 return
         elif self.pt_active or self.pt_decided:
@@ -276,6 +282,8 @@ class Worker:
             self.codec = m.codec
             self.need_key = True
         is_key = _KEYFRAME_CHECKS.get(m.codec)
+        if is_key is None and adaptive:  # AV1 / VP8 / VP9: the decoder must not start mid-GOP either
+            is_key = lambda d, c=m.codec: bitstream.is_keyframe(c, d)
         if self.need_key and is_key is not None and not is_key(m.data):
             self._request_keyframe()
             return
@@ -305,13 +313,45 @@ class Worker:
         fits = (w, h) == (p.fixed_width, p.fixed_height) if p.mode == "fixed" else w <= p.max_width and h <= p.max_height
         return fits and w * h <= p.max_input_pixels
 
+    def _announce_source(self, codec: str, dims: tuple[int, int], eligible: bool) -> None:
+        """Adaptive mode: tell the main process the source codec, size and passthrough eligibility when they change."""
+        state = (codec, dims[0], dims[1], eligible)
+        if state != self.src_state:
+            self.src_state = state
+            self._event("source_codec", codec=codec, width=dims[0], height=dims[1], eligible=eligible)
+
+    def _probe_dims(self, codec: str, data: bytes) -> tuple[int, int] | None:
+        key = (codec, data[:128])  # the headers that carry the size sit at the start of an entry AU
+        dims = self.dims_cache.get(key)
+        if dims is None:
+            dims = bitstream.probe_dimensions(codec, data)
+            if dims is not None:
+                if len(self.dims_cache) >= 16:
+                    self.dims_cache.clear()
+                self.dims_cache[key] = dims
+        return dims
+
     def _passthrough(self, m: IngressVideo, now: float) -> bool:
         """True when passthrough consumed the access unit; False hands it to the decode/encode path."""
+        assert self.profile is not None
         data = m.data
-        key = _h264_is_idr(data) and has_parameter_sets(data)
+        adaptive = self.profile.codec_mode == "adaptive"
+        if adaptive and m.codec != self.pt_codec:
+            if self.pt_active or self.pt_decided:  # the target switched codec: wait for an entry point
+                self.jbuf.clear()
+                self.offsets.clear()
+                self.lateness.clear()
+                self.force_idr = True
+                self.last_enc_rtp, self.last_encode_at = None, float("-inf")
+            self.pt_active = self.pt_decided = False
+            self.pt_codec = m.codec
+        key = bitstream.is_entry_point(m.codec, data) if adaptive else _h264_is_idr(data) and has_parameter_sets(data)
         if key:
-            dims = sps_dimensions(data)
-            if dims is None or not self._pt_eligible(dims):
+            dims = self._probe_dims(m.codec, data) if adaptive else sps_dimensions(data)
+            eligible = dims is not None and self._pt_eligible(dims)
+            if adaptive and dims is not None:
+                self._announce_source(m.codec, dims, eligible)
+            if not eligible:
                 if self.pt_active:  # leave passthrough: the encoder follows from this IDR
                     self.jbuf.clear()
                     self.force_idr = True
@@ -336,7 +376,7 @@ class Worker:
             if not key:
                 self._pt_resync()
                 return True
-        if _h264_is_idr(data):
+        if m.codec == "H264" and _h264_is_idr(data):
             data = ensure_low_delay_vui(data)
         self.jbuf.append((self._present_at(rtp_s, m.mono_received), data, m.mono_received, rtp_s))
         if len(self.jbuf) > JITTER_MAX_FRAMES:
@@ -356,7 +396,8 @@ class Worker:
             self.canvas = dims
             self.announce_fresh = False
             self._event("first_frame", width=dims[0], height=dims[1], source_width=dims[0], source_height=dims[1],
-                        codec=m.codec, ssrc=m.ssrc, encoder="passthrough", decode="none", frame_format="h264")
+                        codec=m.codec, ssrc=m.ssrc, encoder="passthrough", decode="none",
+                        frame_format=m.codec.lower())
         elif self.announce_fresh:
             self.announce_fresh = False
             self._event("fresh_frame")
@@ -375,6 +416,8 @@ class Worker:
 
     def _frame(self, f: Any, m: IngressVideo, now: float) -> None:
         assert self.profile is not None
+        if self.profile.codec_mode == "adaptive":
+            self._announce_source(m.codec, (f.width, f.height), False)  # decoded here: never passthrough
         if f.width * f.height > self.profile.max_input_pixels:
             if not self.oversize_reported:
                 self.oversize_reported = True
@@ -510,8 +553,10 @@ class Worker:
         # (dropping it would freeze viewers until the next source IDR, ~0.7 s live).
         if self.jbuf and self.jbuf[0][0] <= now and not self.egress.full("video"):
             _, au, rcv, rtp_s = self.jbuf.popleft()
-            idr = _h264_is_idr(au)
-            item = EgressVideo(self.generation, self.epoch, au, idr, self._frame_time_ms(rtp_s), now, rcv, False)
+            adaptive = self.profile.codec_mode == "adaptive"
+            idr = bitstream.is_keyframe(self.pt_codec, au) if adaptive else _h264_is_idr(au)
+            item = EgressVideo(self.generation, self.epoch, au, idr, self._frame_time_ms(rtp_s), now, rcv, False,
+                               self.pt_codec if adaptive else "H264")
             if self.egress.put_nowait(item, "video", len(au)):
                 self.stats["frames_out"] += 1
                 self.stats["passthrough_frames"] += 1

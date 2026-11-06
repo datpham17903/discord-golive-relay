@@ -13,7 +13,8 @@ from collections.abc import Callable, Iterator
 
 from discord.ext.native_voice.media import VideoFrame
 
-from golive_relay.media.h264 import has_parameter_sets, idr_pic_id, is_idr
+from golive_relay.media.bitstream import is_entry_point
+from golive_relay.media.h264 import idr_pic_id, is_idr
 from golive_relay.media.opus import OPUS_SILENCE
 from golive_relay.media.slate import SlateGop
 from golive_relay.worker.messages import AUDIO_FRAME_BYTES, EgressAudio, EgressVideo
@@ -42,7 +43,9 @@ class Publisher:
         max_late_s: float = 0.2,
         on_need_idr: Callable[[], None] = lambda: None,
         opus: bool = False,
+        codec: str = "H264",
     ) -> None:
+        self.codec = codec
         self._gate = gate
         self._clock = clock
         self._max_late = max_late_s
@@ -70,6 +73,16 @@ class Publisher:
             self._source = (generation, epoch)
             self._await_idr = True
 
+    def set_codec(self, codec: str) -> None:
+        with self._lock:
+            self.codec = codec
+            self._video.clear()
+            self._video_bytes = 0
+            self._last_idr_id = None
+            self._slate_iter = None
+            self._await_idr = True
+        self._on_need_idr()
+
     def set_slate(self, slate: SlateGop | None) -> None:
         with self._lock:
             self._slate = slate
@@ -93,6 +106,8 @@ class Publisher:
         need = False
         with self._lock:
             if self._source != (au.generation, au.epoch):
+                return
+            if au.codec != self.codec:
                 return
             if len(self._video) >= MAX_EGRESS_AUS or self._video_bytes + len(au.data) > MAX_EGRESS_BYTES:
                 self._video.clear()
@@ -124,6 +139,11 @@ class Publisher:
         if need:
             self._on_need_idr()
         return frame
+
+    @property
+    def last_send_at(self) -> float | None:
+        """Clock time of the last video frame handed to the player."""
+        return self._last_send
 
     def _note_send_locked(self) -> None:
         now = self._clock()
@@ -161,9 +181,10 @@ class Publisher:
                 self._await_idr = True
                 need = True
                 continue
-            idr = is_idr(au.data)
+            h264 = self.codec == "H264"
+            idr = h264 and is_idr(au.data)
             if self._await_idr:
-                if not (idr and has_parameter_sets(au.data)):
+                if not is_entry_point(self.codec, au.data):
                     need = True
                     continue
                 self._await_idr = False
@@ -199,7 +220,7 @@ class Publisher:
 
     def _next_slate_locked(self) -> VideoFrame | None:
         slate = self._slate
-        if slate is None:
+        if slate is None or self.codec != "H264":
             return None
         au = next(self._slate_iter, None) if self._slate_iter is not None else None
         if au is None:

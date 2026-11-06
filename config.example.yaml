@@ -20,23 +20,23 @@ authorization:
 
 codecs:
   parent_codecs: h264_only   # auto_decode | h264_only; h264_only makes Discord pick H.264 for the target's stream
-  watch_codecs: h264_only    # (it chooses a codec every participant decodes) so passthrough always applies
-  output_codec: H264
+  watch_codecs: h264_only    # (it chooses a codec every participant decodes) so passthrough always applies; both ignored when output_codec is adaptive
+  output_codec: adaptive     # adaptive | H264; adaptive forwards the target's video in the best codec every viewer of every output decodes (AV1 > H265 > H264 > VP8 > VP9), H264 is the old fixed mode
   output_rids: 1
   video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
   hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
-  video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
+  video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's video as-is (near-zero CPU, lower latency; every codec with output_codec adaptive, only H.264 with output_codec H264) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; sources larger than max_* fall back to H.264 transcode
   audio_mode: passthrough    # transcode | passthrough; passthrough forwards the target's Opus as-is (its own bitrate, audio_bitrate_kbps unused); transcode re-encodes at audio_bitrate_kbps
 
 quality:
   mode: auto                 # auto | fixed; auto passes the source through up to max_* (larger sources are scaled down); fixed always outputs fixed_* (other sizes are re-encoded, which costs CPU)
-  max_width: 1920            # max_* only used in auto; 1080p60 validated live (G2b, 2026-11-01)
-  max_height: 1080
+  max_width: 2560            # max_* only used in auto; up to 1440p60 is passed through (1080p60 validated live G2b 2026-11-01)
+  max_height: 1440
   max_fps: 60
   fixed_width: 1920          # fixed_* only used in fixed
   fixed_height: 1080
   fixed_fps: 60
-  video_bitrate_kbps: 8000   # 20000 caused Discord error 2003 on a shared uplink (G2b)
+  video_bitrate_kbps: auto   # auto | kbps; only used when re-encoding (passthrough keeps the target's own bitrate). auto: ~7.8 Mbps at 1080p60, 12 Mbps at 1440p60 (cap; 20000 caused Discord error 2003 in G2b)
   audio_bitrate_kbps: 128    # used only with codecs.audio_mode: transcode
   approved_profile_manifest: "manifests/verified-profiles.json"
 

@@ -16,7 +16,8 @@ from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
 from golive_relay.supervisor.outputs_model import (
-    MirrorParticipants, OutAuthRejected, OutHealth, OutJoined, OutReady, OutViewers, OutVoiceObserved, PoolEvent,
+    MirrorParticipants, OutAuthRejected, OutCodecChanged, OutHealth, OutJoined, OutPli, OutReady, OutViewers,
+    OutVoiceObserved, PoolEvent,
 )
 
 CONNECT_TIMEOUT_S = 15
@@ -44,6 +45,7 @@ class OutputAccountAdapter:
         audio_bitrate_kbps: int | None = 64,
         bot_user_ids: frozenset[int] = frozenset(),
         self_deaf: bool = True,
+        adaptive: bool = False,
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
@@ -55,8 +57,11 @@ class OutputAccountAdapter:
         self.log = log
         decodable = codecs.probe_decoders() if decodable is None else decodable
         self._parent_cls = self._make_parent_cls(
-            nv.VoiceClient.with_config(codecs=codecs.parent_codecs(codecs.advertised(decodable, codec_mode)))
+            nv.VoiceClient.with_config(
+                codecs=codecs.adaptive_decode_codecs(decodable) if adaptive
+                else codecs.parent_codecs(codecs.advertised(decodable, codec_mode)))
         )
+        self._swap_lock = asyncio.Lock()
         self._client_factory = client_factory or discord.Client
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
@@ -132,7 +137,9 @@ class OutputAccountAdapter:
         if channel is not None:
             self._events(MirrorParticipants(self.user_id, frozenset(channel.voice_states), self.channel_id))
 
-    async def publish(self, generation: int, attempt: int, fps: int, source: Any, channel_id: int) -> str | None:
+    async def publish(
+        self, generation: int, attempt: int, fps: int, source: Any, channel_id: int, adaptive: bool = False
+    ) -> str | None:
         """Join ``channel_id``, create the Go Live and play ``source``; returns the negotiated video codec."""
         self.channel_id = channel_id
         guild = self._client.get_guild(self.guild_id)
@@ -149,17 +156,40 @@ class OutputAccountAdapter:
         )
         self._events(OutJoined(self.user_id, generation, attempt, self._vc.session_id))
         self._emit_participants()
-        self._out = await self._vc.create_stream(
-            cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
-        )
+        if adaptive:
+            cls = codecs.adaptive_output_stream_client(
+                fps, self._network_stats,
+                lambda codec: self._events(OutCodecChanged(self.user_id, generation, attempt, codec)),
+                lambda: self._events(OutPli(self.user_id)),
+            )
+        else:
+            cls = codecs.output_stream_client(fps, self._network_stats)
+        self._out = await self._vc.create_stream(cls=cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
         codec = self._out.negotiated_video_codec
         self._events(OutReady(self.user_id, generation, attempt, codec))
+        if adaptive and callable(source):  # adaptive: the caller builds the source for the negotiated codec
+            source = source(codec)
+        self._play(source)
+        self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
+        return codec
+
+    async def update_codecs(self, names: Any) -> bool:
+        """Offer the voice server a new codec list for this output (SESSION_UPDATE); False (no-op) without an output."""
+        out = self._out
+        if out is None:
+            return False
+        await out.ws.session_update(codecs.video_codec_list(names, encode=True))
+        return True
+
+    def _play(self, source: Any) -> None:
         if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder
             self._out.play(source)
         else:
             self._out.play(source, bitrate=self._audio_bitrate_kbps)
-        self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
-        return codec
+
+    async def swap_source(self, make_source: Callable[[str], Any]) -> str | None:
+        """Swap the running output to a source for the currently negotiated codec; returns the bound codec."""
+        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log, self._play)
 
     async def _watch_health(self, generation: int, attempt: int, out: Any, vc: Any) -> None:
         """A dropped stream or voice connection without a voice-state change is reported once as unhealthy."""

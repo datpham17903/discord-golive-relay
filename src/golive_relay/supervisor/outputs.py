@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
+from golive_relay.media.bitstream import CODEC_ORDER
 from golive_relay.supervisor.model import FatalReason, StopReason
 from golive_relay.supervisor.outputs_model import (
     AccountPersisted,
@@ -87,7 +88,9 @@ class OutputPool:
         routing: Routing,
         excluded_viewer_ids: frozenset[int] = frozenset(),
         relay_idle_stop_s: float = 30.0,
+        adaptive: bool = False,
     ) -> None:
+        self._adaptive = adaptive
         self._stagger = stagger_s
         self._idle_stop = relay_idle_stop_s
         self._limit = rejection_limit
@@ -170,6 +173,9 @@ class OutputPool:
             "kept": kept,
             "kept_ids": tuple(watched[len(watched) - kept:]) if kept else (),
         }
+
+    def is_current(self, account: int, generation: int, attempt: int) -> bool:
+        return self._current(account, generation, attempt) is not None
 
     def account_live(self, account: int, generation: int, epoch: int) -> bool:
         rec = self._accts.get(account)
@@ -410,7 +416,7 @@ class OutputPool:
         if rec is None or rec.state is not OutputState.JOINING:
             return
         s = self._session
-        if ev.negotiated_video_codec != "H264":
+        if (ev.negotiated_video_codec or "").upper() not in CODEC_ORDER if self._adaptive else ev.negotiated_video_codec != "H264":
             self._backoff(rec, StopReason.CODEC_MISMATCH, now, out)
             return
         rec.retry.reset()

@@ -913,3 +913,174 @@ def test_passthrough_mode_uses_transcode_for_other_codecs():
     w.handle(IngressVideo(1, 0, "H265", 1, 0, None, now, None, b"\x00\x00\x00\x01\x40\x01\x00"), now)
     assert w.decoder is not None and not w.pt_active and not egress.video()
     assert not events.events("first_frame")
+
+
+# ------------------------------------------------------------ adaptive codec passthrough
+
+AD = dataclasses.replace(PT, codec_mode="adaptive")
+AD_SMALL = dataclasses.replace(AD, max_width=320, max_height=240)
+_ADAPTIVE_ENC = {
+    "H265": ("libx265", {"x265-params": "keyint=30:min-keyint=30:bframes=0:scenecut=0:log-level=error:repeat-headers=1"}),
+    "AV1": ("libsvtav1", {"preset": "12", "g": "30"}),
+    "VP9": ("libvpx-vp9", {"g": "30"}),
+}
+
+
+def gen_codec(codec: str, width: int = 320, height: int = 240, n: int = 45) -> list[bytes]:
+    if codec == "H264":
+        return gen_h264(width, height, n / FPS)
+    name, opts = _ADAPTIVE_ENC[codec]
+    try:
+        enc = av.CodecContext.create(name, "w")
+    except Exception:
+        pytest.skip(f"encoder {name} unavailable")
+    enc.width, enc.height, enc.pix_fmt = width, height, "yuv420p"
+    enc.time_base, enc.framerate = Fraction(1, FPS), Fraction(FPS, 1)
+    enc.options = opts
+    enc.open()
+    out: list[bytes] = []
+    for i in range(n):
+        f = av.VideoFrame(width, height, "yuv420p")
+        f.planes[0].update(bytes([(i * 5) & 0xFF]) * f.planes[0].buffer_size)
+        f.planes[1].update(b"\x80" * f.planes[1].buffer_size)
+        f.planes[2].update(b"\x80" * f.planes[2].buffer_size)
+        f.pts = i
+        out += [bytes(p) for p in enc.encode(f)]
+    out += [bytes(p) for p in enc.encode(None)]
+    return [a for a in out if a]
+
+
+def feed_codec(w, codec, aus, t0, epoch=0, start=0, ssrc=1):
+    now = t0
+    for i, au in enumerate(aus):
+        now = t0 + i / FPS
+        w.handle(IngressVideo(1, epoch, codec, ssrc, (start + i) * 3000, None, now, None, au), now)
+        w.tick(now)
+    return now
+
+
+def _check_forwards_unchanged(codec):
+    aus = gen_codec(codec)
+    w, egress, events = make_worker(AD)
+    now = feed_codec(w, codec, aus, time.monotonic())
+    drain(w, now)
+    out = egress.video()
+    assert [v.data for v in out] == aus
+    assert all(v.codec == codec for v in out)
+    assert out[0].is_idr and w.decoder is None and w.encoder is None and w.pt_active
+    ff = events.events("first_frame")
+    assert len(ff) == 1 and ff[0].data["encoder"] == "passthrough" and ff[0].data["frame_format"] == codec.lower()
+    assert (ff[0].data["width"], ff[0].data["height"]) == (320, 240)
+    sc = events.events("source_codec")
+    assert [e.data for e in sc] == [{"codec": codec, "width": 320, "height": 240, "eligible": True}]
+
+
+def test_adaptive_forwards_h265_unchanged():
+    _check_forwards_unchanged("H265")
+
+
+def test_adaptive_forwards_av1_unchanged():
+    _check_forwards_unchanged("AV1")
+
+
+def test_adaptive_forwards_vp9_unchanged():
+    _check_forwards_unchanged("VP9")
+
+
+def test_source_codec_before_first_frame():
+    w, _, events = make_worker(AD)
+    feed_codec(w, "H264", gen_codec("H264"), time.monotonic())
+    kinds = [e.kind for e in events.items if e.kind in ("source_codec", "first_frame")]
+    assert kinds == ["source_codec", "first_frame"]
+
+
+def test_source_codec_on_change_and_each_epoch():
+    h264, h265 = gen_codec("H264"), gen_codec("H265")
+    w, egress, events = make_worker(AD)
+    now = feed_codec(w, "H265", h265, time.monotonic())
+    now = feed_codec(w, "H264", h264, now + 0.1, start=100)
+    codecs = [e.data["codec"] for e in events.events("source_codec")]
+    assert codecs == ["H265", "H264"] and len(events.events("first_frame")) == 1
+    w.handle(ResetPipeline(1, 1), now)
+    now = feed_codec(w, "H264", h264, now + 0.1, epoch=1, start=200)
+    assert len(events.events("source_codec")) == 3
+    w.handle(SetOutput(1, 1, False), now)
+    w.handle(SetOutput(1, 1, True), now)
+    feed_codec(w, "H264", h264, now + 0.1, epoch=1, start=300)
+    assert len(events.events("source_codec")) == 4
+    assert len(events.events("first_frame")) == 1
+
+
+def test_adaptive_waits_for_entry_after_codec_change():
+    h265, h264 = gen_codec("H265"), gen_codec("H264")
+    w, egress, events = make_worker(AD)
+    now = feed_codec(w, "H265", h265, time.monotonic())
+    drain(w, now)
+    before = len(egress.video())
+    now = feed_codec(w, "H264", h264[1:5], now + 0.1, start=100)  # P-frames: no entry point yet
+    drain(w, now)
+    assert len(egress.video()) == before and events.events("need_keyframe") and not w.jbuf
+    assert [e.data["codec"] for e in events.events("source_codec")] == ["H265"]
+    now = feed_codec(w, "H264", h264[:3], now + 0.1, start=200)
+    drain(w, now)
+    new = egress.video()[before:]
+    assert [v.data for v in new[1:]] == h264[1:3] and new[0].is_idr and all(v.codec == "H264" for v in new)
+    assert [e.data["codec"] for e in events.events("source_codec")] == ["H265", "H264"]
+
+
+def test_adaptive_oversize_transcodes_eligible_false():
+    aus = gen_codec("H265", 640, 360, 30)
+    w, egress, events = make_worker(AD_SMALL)
+    now = feed_codec(w, "H265", aus, time.monotonic())
+    drain(w, now)
+    assert not w.pt_active and w.encoder is not None
+    assert [e.data for e in events.events("source_codec")] == [
+        {"codec": "H265", "width": 640, "height": 360, "eligible": False}]
+    video = egress.video()
+    assert video and video[0].codec == "H264" and video[0].is_idr
+    kinds = [e.kind for e in events.items if e.kind in ("source_codec", "first_frame")]
+    assert kinds == ["source_codec", "first_frame"]
+
+
+def test_adaptive_decoder_gated_on_keyframe_for_av1():
+    class Recorder:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def decode(self, packet):
+            self.calls += 1
+            return []
+
+    aus = gen_codec("AV1", 640, 360, 30)
+    w, egress, events = make_worker(AD_SMALL)
+    now = feed_codec(w, "AV1", aus, time.monotonic())
+    assert not w.pt_active and w.decoder is not None
+    w.decoder = rec = Recorder()
+    w.need_key = True  # e.g. after a decode error
+    now = feed_codec(w, "AV1", aus[1:4], now + 0.1, start=100)  # inter frames
+    assert rec.calls == 0 and events.events("need_keyframe")
+    feed_codec(w, "AV1", aus[:1], now + 0.1, start=200)
+    assert rec.calls == 1
+
+
+def test_adaptive_transcode_mode_reports_eligible_false():
+    w, egress, events = make_worker(dataclasses.replace(PROFILE, codec_mode="adaptive"))
+    feed_codec(w, "H264", gen_codec("H264"), time.monotonic())
+    assert [e.data for e in events.events("source_codec")] == [
+        {"codec": "H264", "width": 320, "height": 240, "eligible": False}]
+    kinds = [e.kind for e in events.items if e.kind in ("source_codec", "first_frame")]
+    assert kinds == ["source_codec", "first_frame"] and not w.pt_active
+
+
+def test_vui_rewrite_only_for_h264(monkeypatch):
+    from golive_relay.worker import process
+
+    calls = []
+    real = process.ensure_low_delay_vui
+    monkeypatch.setattr(process, "ensure_low_delay_vui", lambda d: (calls.append(d), real(d))[1])
+    w, _, _ = make_worker(AD)
+    feed_codec(w, "H265", gen_codec("H265"), time.monotonic())
+    assert not calls
+    w, _, _ = make_worker(AD)
+    feed_codec(w, "H264", gen_codec("H264"), time.monotonic())
+    assert calls

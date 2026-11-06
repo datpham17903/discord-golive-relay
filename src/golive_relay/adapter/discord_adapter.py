@@ -23,6 +23,7 @@ from golive_relay.control.commands import ChatCommand
 from golive_relay.media.opus import OPUS_SILENCE, opus_packet_info
 from golive_relay.supervisor.model import (
     AuthRejected,
+    CodecChanged,
     ConfigInvalid,
     Event,
     GatewayChanged,
@@ -38,6 +39,7 @@ from golive_relay.supervisor.model import (
     TargetVoice,
     TargetVoiceChanged,
 )
+from golive_relay.supervisor.outputs_model import OutPli
 from golive_relay.worker.messages import IngressAudio, IngressVideo
 
 PROGRESS_MIN_INTERVAL_S = 0.25  # 4 per second
@@ -77,6 +79,7 @@ class DiscordAdapter:
         network_stats: bool = False,
         audio_bitrate_kbps: int | None = 64,
         self_deaf: bool = True,
+        adaptive: bool = False,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -94,13 +97,15 @@ class DiscordAdapter:
         self._paused_verified = paused_verified
         decodable = codecs.probe_decoders() if decodable is None else decodable
         modes = getattr(cfg, "codecs", None)
+        self._adaptive = adaptive
         self._parent_cls = self._make_parent_cls(
             codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._self_deaf = self_deaf
         self._watch_cls = nv.StreamClient.with_config(
-            codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
+            codecs=codecs.adaptive_decode_codecs(decodable) if adaptive
+            else codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
         )
         self._client: _Client | None = None
@@ -111,6 +116,7 @@ class DiscordAdapter:
         self._voice_state_cb: Callable[[], None] | None = None
         self._sc: Any = None
         self._out: Any = None
+        self._swap_lock = asyncio.Lock()
         self._incarnation = 0
         self._stream: SourceStream | None = None
         self._generation = 0
@@ -393,7 +399,8 @@ class DiscordAdapter:
 
     def _make_parent_cls(self, decodable: set[str]) -> type:
         adapter = self
-        base = nv.VoiceClient.with_config(codecs=codecs.parent_codecs(decodable))
+        base = nv.VoiceClient.with_config(
+            codecs=codecs.adaptive_decode_codecs(decodable) if self._adaptive else codecs.parent_codecs(decodable))
 
         class RelayParentVoiceClient(base):  # type: ignore[valid-type, misc]
             async def on_voice_state_update(self, data: Any) -> None:
@@ -477,6 +484,33 @@ class DiscordAdapter:
             cls=codecs.output_stream_client(fps, self._network_stats), reconnect=False, timeout=CONNECT_TIMEOUT_S
         )
         return self._out.negotiated_video_codec
+
+    async def create_output_adaptive(self, generation: int, fps: int) -> str | None:
+        """Create the output Go Live offering every codec; op 14 becomes CodecChanged, unanswerable PLIs OutPli."""
+        cls = codecs.adaptive_output_stream_client(
+            fps, self._network_stats,
+            lambda codec: self._emit(CodecChanged(generation, codec)),
+            lambda: self._events(OutPli(None)),
+        )
+        self._out = await self._vc.create_stream(cls=cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
+        return self._out.negotiated_video_codec
+
+    async def update_watch_codecs(self, names: Any) -> bool:
+        """Narrow or widen the codecs the target may send (SESSION_UPDATE); False (no-op) when not watching."""
+        if self._sc is None:
+            return False
+        await self._sc.ws.session_update(codecs.video_codec_list(names, encode=False))
+        return True
+
+    async def update_output_codecs(self, names: Any) -> bool:
+        if self._out is None:
+            return False
+        await self._out.ws.session_update(codecs.video_codec_list(names, encode=True))
+        return True
+
+    async def swap_output_source(self, make_source: Callable[[str], Any]) -> str | None:
+        """Swap the running output to a source for the currently negotiated codec; returns the bound codec."""
+        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log, self.play)
 
     def play(self, source: Any) -> None:
         if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder

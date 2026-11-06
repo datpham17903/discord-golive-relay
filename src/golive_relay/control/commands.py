@@ -178,6 +178,15 @@ class StatusDetails:
     ingest_publishes: bool = False
     fatal_reason: str | None = None
     relay_kept_ids: tuple[int, ...] = ()  # exactly the extra relays counted in relay_kept
+    codec: str | None = None  # codec every output carries now (one for the whole chain); None = unknown
+    codec_switch: tuple[str, str] | None = None  # (from, to) while the chain is changing codec
+
+
+_CODEC_NAMES = {"AV1": "AV1", "H265": "H.265", "H264": "H.264", "VP8": "VP8", "VP9": "VP9"}
+
+
+def _codec_name(codec: str) -> str:
+    return _CODEC_NAMES.get(codec, codec)
 
 
 _NAME_UNSAFE = str.maketrans("", "", "<>@`[]()*_~|\\:")
@@ -514,6 +523,11 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
         f"> {who}",
         f"> Kênh chính {_ch(routing.channel_id)} · 👥 **{d.viewers}** người",
     ]
+    if d.codec is not None:
+        line = f"> Codec: {_codec_name(d.codec)}"
+        if d.codec_switch is not None:
+            line += f" → {_codec_name(d.codec_switch[1])} (đang chuyển)"
+        source.append(line)
 
     relays = [a for a in d.accounts if a[1] == "relay"]
     relay_title = ""

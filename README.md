@@ -132,17 +132,17 @@ relayctl validate --config config.yaml
 | `discord.output_accounts` | Deprecated alias of `relay_accounts` (Python prints a `FutureWarning` to stderr when the config loads; nothing goes to the JSON log); cannot be combined with the new lists | absent | migrate to `relay_accounts` |
 | `authorization.agreement_ref` | Note pointing to the consent record | placeholder | always |
 | `authorization.excluded_viewer_ids` | Viewer IDs the target asked to exclude | `[]` | the target asks |
-| `codecs.parent_codecs`, `watch_codecs` | Video codecs the relay offers to decode. `h264_only` makes Discord send the target's stream as H.264 for every viewer of it (it picks a codec all participants decode), so passthrough always applies; `auto_decode` offers every codec PyAV decodes | `h264_only` | rarely |
-| `codecs.output_codec` | Output codec | `H264` | never (only value) |
+| `codecs.parent_codecs`, `watch_codecs` | (Ignored when `output_codec` is `adaptive`.) Video codecs the relay offers to decode. `h264_only` makes Discord send the target's stream as H.264 for every viewer of it (it picks a codec all participants decode), so passthrough always applies; `auto_decode` offers every codec PyAV decodes | `h264_only` | rarely |
+| `codecs.output_codec` | `adaptive` forwards the target's video unchanged in one common codec (see "Codec" below); `H264` keeps the old fixed H.264 mode | `adaptive` | set `H264` to restore the old behaviour |
 | `codecs.output_rids` | Output layers | `1` | never (only 1 supported) |
 | `codecs.video_encoder` | `auto`, `libx264`, `h264_nvenc`, `h264_amf`, `h264_qsv`, `h264_mf`, `h264_videotoolbox` (`h264_vaapi` is accepted but not usable) | `auto` | force a specific encoder (section 9) |
 | `codecs.hw_decode` | `none`, `auto`, `d3d11va`, `cuda`, `vaapi`, `videotoolbox` | `none` | see section 9 |
-| `codecs.video_mode` | `passthrough` forwards the target's H.264 as-is (near-zero CPU, lower latency; the target's bitrate is sent unchanged and keyframes come from PLI requests to the target); `transcode` decodes and re-encodes at `video_bitrate_kbps`. Non-H.264 or oversized sources always fall back to transcode | `passthrough` | use `transcode` if relay viewers hit Discord error 2003 (target bitrate too high for your uplink) |
+| `codecs.video_mode` | `passthrough` forwards the target's video as-is (near-zero CPU, lower latency; the target's bitrate is sent unchanged and keyframes come from PLI requests to the target). With `output_codec: adaptive` every codec is passed through; with `output_codec: H264` only H.264 is. `transcode` decodes and re-encodes to H.264 at `video_bitrate_kbps`. Sources larger than `max_*` always fall back to H.264 transcode | `passthrough` | use `transcode` if relay viewers hit Discord error 2003 (target bitrate too high for your uplink) |
 | `codecs.audio_mode` | `passthrough` forwards the target's Opus packets as-is (its own bitrate, no re-encode; packets other than one 20 ms frame are dropped and counted as `audio_unsupported`); `transcode` decodes and re-encodes at `quality.audio_bitrate_kbps` | `passthrough` | use `transcode` if relayed audio is missing while the target's audio is not |
 | `quality.mode` | `auto` (use `max_*`: a source up to that size is passed through unchanged, a larger one is scaled down; never upscales) or `fixed` (always output `fixed_*`; any other source size is decoded and scaled with black bars, which costs a lot of CPU and adds no detail) | `auto` | use `fixed` only if every output must be exactly `fixed_*` |
-| `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 1920 x 1080 @ 60 | lower for weak CPU or network |
+| `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 2560 x 1440 @ 60 | lower for weak CPU or network |
 | `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | lower for weak CPU or network |
-| `quality.video_bitrate_kbps` | Encode bitrate per output | `8000` | lower if you see error 2003 (section 10) |
+| `quality.video_bitrate_kbps` | `auto` or kbps. Only used when re-encoding; passthrough keeps the target's own bitrate. `auto` scales with the output size (about 7.8 Mbps at 1080p60, capped at 12 Mbps) | `auto` | set a number (for example `8000`) if you see error 2003 (section 10) |
 | `quality.audio_bitrate_kbps` | Audio bitrate (only with `codecs.audio_mode: transcode`) | `128` | rarely |
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
@@ -216,6 +216,12 @@ With `runtime.relay_autoscale: true` (the default) only as many relay accounts p
   - A relay that is still connecting, or that has not received any viewer list yet, counts as watched for up to 4 x `relay_idle_stop_seconds` (2 minutes) after its Go Live started; after that it is treated as having no viewers. So a fresh relay is never cut before viewer data can arrive, and if Discord never sends viewer data, extra relays still stop.
 - A FATAL or quarantined relay, a relay in backoff, and a relay that failed for good in the current session are replaced by the next free relay account; a relay that is running keeps its slot over an idle one. When there are not enough usable relay accounts, `!relay status` shows a ⚠️ shortage.
 - `relay_autoscale: false` keeps every relay account publishing during a session.
+
+### Codec
+
+With `codecs.output_codec: adaptive` (the default) every output (the ingest's own Go Live, relays and mirrors) forwards the target's video unchanged in ONE common codec: the highest of AV1 > H265 > H264 > VP8 > VP9 that the target produces and that every viewer of every output decodes. When a weaker viewer joins any output the whole chain drops to a codec that viewer decodes (the relay asks the target for it with a voice SESSION_UPDATE and swaps each output in place, with no reconnect), and it rises again after that viewer leaves. `!relay status` shows the current codec on one line, for example `Codec: H.265` or `Codec: H.265 → H.264 (đang chuyển)` while it changes. `watch_codecs` and `parent_codecs` are ignored in this mode.
+
+Limits: with `video_mode: transcode`, or when the source is oversized or does not match `quality.mode: fixed`, the codec is pinned to H.264 (the worker transcodes as before). The slate shown during a stall is H.264, so a viewer that only decodes VP8/VP9 sees no slate. Set `output_codec: H264` to restore the old fixed H.264 mode exactly.
 
 ### Approved profile manifest
 
