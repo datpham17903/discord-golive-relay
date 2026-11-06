@@ -66,7 +66,7 @@ def test_output_profile():
     prof = cfg.output_profile()
     assert isinstance(prof, OutputProfile)
     assert (prof.mode, prof.max_width, prof.max_height, prof.fps) == ("auto", 2560, 1440, 60)
-    assert prof.video_bitrate_kbps == 8000
+    assert prof.video_bitrate_kbps == 0  # auto
     assert prof.keyframe_interval_s == 2
     assert prof.audio_enabled is True
     assert (prof.video_encoder, prof.hw_decode) == ("auto", "none")
@@ -573,3 +573,17 @@ def test_config_output_codec_adaptive_default(tmp_path):
     assert cfg.codecs.output_codec == "H264" and cfg.output_profile().codec_mode == "h264"
     raw["codecs"]["output_codec"] = "H265"
     assert any("codecs.output_codec" in e for e in _errors(tmp_path, raw))
+
+
+def test_video_bitrate_auto_or_number(tmp_path):
+    from golive_relay.media.hwaccel import auto_bitrate_kbps
+
+    assert auto_bitrate_kbps(1920, 1080, 60) == 7800
+    assert auto_bitrate_kbps(2560, 1440, 60) == 12000  # capped
+    assert auto_bitrate_kbps(1280, 720, 30) == 3000  # floor
+    for value, want in (("auto", 0), (8000, 8000)):
+        text = EXAMPLE.read_text(encoding="utf-8").replace(
+            "video_bitrate_kbps: auto", f"video_bitrate_kbps: {value}")
+        p = tmp_path / f"c{want}.yaml"
+        p.write_text(text, encoding="utf-8")
+        assert load_config(p).quality.video_bitrate_kbps == want

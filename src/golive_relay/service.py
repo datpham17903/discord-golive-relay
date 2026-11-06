@@ -31,6 +31,7 @@ from golive_relay.control.cooldown import ChatCooldowns
 from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
 from golive_relay.control.state import PersistedState, StateCorrupt, StateStore, account_view, set_account
+from golive_relay.media import hwaccel
 from golive_relay.media.publisher import Publisher
 from golive_relay.media.slate import build_slate
 from golive_relay.media.source import RelayMediaSource
@@ -1074,7 +1075,8 @@ class Service:
                 raise RuntimeError("canvas not locked")
             w, h = self._canvas
             publish = self.cfg.discord.ingest_publishes
-            steps = [self._get_slate(g, (w, h, p.fps, p.keyframe_interval_s, p.video_bitrate_kbps))]
+            kbps = p.video_bitrate_kbps or hwaccel.auto_bitrate_kbps(w, h, p.fps)  # 0 = auto
+            steps = [self._get_slate(g, (w, h, p.fps, p.keyframe_interval_s, kbps))]
             if publish:
                 steps.append(self._create_ingest_output(g, adapter, p.fps))
             # Both run to completion, so a failed slate never leaves a create_stream running unowned.

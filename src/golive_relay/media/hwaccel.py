@@ -110,6 +110,12 @@ def platform_encoders() -> tuple[str, ...]:
     return AUTO_ORDER.get(sys.platform, ("libx264",))
 
 
+def auto_bitrate_kbps(width: int, height: int, fps: int) -> int:
+    """Encode bitrate for ``video_bitrate_kbps: auto``: ~7.8 Mbps at 1080p60, scaled by pixel rate and kept
+    within 3-12 Mbps (20 Mbps hit Discord error 2003 on a shared uplink in G2b)."""
+    return max(3000, min(12000, round(width * height * fps / 16000 / 100) * 100))
+
+
 def open_encoder(name: str, width: int, height: int, fps: int, bitrate_bps: int) -> Any:
     spec = ENCODER_SPECS[name]
     enc = av.CodecContext.create(name, "w")

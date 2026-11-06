@@ -142,7 +142,7 @@ relayctl validate --config config.yaml
 | `quality.mode` | `auto` (use `max_*`: a source up to that size is passed through unchanged, a larger one is scaled down; never upscales) or `fixed` (always output `fixed_*`; any other source size is decoded and scaled with black bars, which costs a lot of CPU and adds no detail) | `auto` | use `fixed` only if every output must be exactly `fixed_*` |
 | `quality.max_width/height/fps` | Output cap in `auto` mode (width and height must be even) | 2560 x 1440 @ 60 | lower for weak CPU or network |
 | `quality.fixed_width/height/fps` | Output in `fixed` mode | 1920 x 1080 @ 60 | lower for weak CPU or network |
-| `quality.video_bitrate_kbps` | Encode bitrate per output | `8000` | lower if you see error 2003 (section 10) |
+| `quality.video_bitrate_kbps` | `auto` or kbps. Only used when re-encoding; passthrough keeps the target's own bitrate. `auto` scales with the output size (about 7.8 Mbps at 1080p60, capped at 12 Mbps) | `auto` | set a number (for example `8000`) if you see error 2003 (section 10) |
 | `quality.audio_bitrate_kbps` | Audio bitrate (only with `codecs.audio_mode: transcode`) | `128` | rarely |
 | `quality.approved_profile_manifest` | Approved profiles file | `manifests/verified-profiles.json` | different location |
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |

@@ -100,7 +100,8 @@ def _select_encoder(profile: OutputProfile) -> hwaccel.EncoderProbe:
 
 
 def _new_encoder(width: int, height: int, profile: OutputProfile, name: str) -> Any:
-    return hwaccel.open_encoder(name, width, height, profile.fps, profile.video_bitrate_kbps * 1000)
+    kbps = profile.video_bitrate_kbps or hwaccel.auto_bitrate_kbps(width, height, profile.fps)  # 0 = auto
+    return hwaccel.open_encoder(name, width, height, profile.fps, kbps * 1000)
 
 
 def _new_audio_decoder() -> Any:
