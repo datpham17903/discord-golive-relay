@@ -21,6 +21,7 @@ class OutputAdded:
     output_id: object
     codec: str
     offer_top: str
+    bound: str | None = None  # codec of the source it was started with, if any
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,10 @@ class CodecController:
     def effective(self) -> str | None:
         return self._e
 
+    def bound_outputs(self) -> list[object]:
+        """Outputs currently bound to the effective codec."""
+        return [oid for oid, o in self._outs.items() if self._e is not None and o.bound == self._e]
+
     @property
     def switching(self) -> tuple[str, str] | None:
         return self._switching
@@ -129,6 +134,7 @@ class CodecController:
                 event.codec,
                 event.offer_top,
                 None if self.pinned else down_from(event.offer_top),
+                event.bound,
             )
         elif isinstance(event, OutputCodec):
             o = self._outs.get(event.output_id)

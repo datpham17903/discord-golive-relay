@@ -66,6 +66,7 @@ OVERFLOW_MIN_INTERVAL_S = 1.0
 LOGIN_STAGGER_S = 2.0
 OUT_LOGIN_WAIT_S = 30.0
 SLATE_CACHE_SIZE = 4
+CODEC_STALL_S = 5.0  # adaptive: a bound output silent this long while the source flows is re-swapped
 VOICE_LOST_GRACE_S = 20.0  # > CONNECT_TIMEOUT_S: the library may still recover a 4014 or resume a 4015
 VOICE_4006_RESTART_MIN_S = 300.0  # at most one adapter restart for repeated voice close 4006 per 5 minutes
 INCARNATION_ENDED = frozenset({StopReason.SOURCE_STOPPED, StopReason.SOURCE_LEFT_WHITELIST})
@@ -183,6 +184,7 @@ class Service:
             adaptive=self._adaptive,
         )
         self._codec_ctl = self._new_codec_ctl()
+        self._last_egress_at = 0.0
         self._src_dims: tuple[int, int] | None = None  # source size while it is passthrough-eligible
         self._ingest_lock = asyncio.Lock()
         # chat override persisted in state.json; config is only the default
@@ -337,6 +339,7 @@ class Service:
             self._handle(Tick())
             self._pool_event(OutTick())
             self._codec_event(cc.Tick())
+            self._check_codec_stall(now)
             self._scale_relays(now)  # OutTick above stops extra relays whose Go Live stayed without viewers
             self._check_voice(now)
             if now >= next_poll:
@@ -752,7 +755,7 @@ class Service:
             row = next((r for r in self.pool.status(time.monotonic()) if r["account"] == event.account), None)
             if row is not None and row["state"] in (OutputState.READY.value, OutputState.LIVE.value):
                 self._out_pubs[event.account].set_codec(event.negotiated_video_codec)
-                self._codec_event(cc.OutputAdded(event.account, event.negotiated_video_codec, "AV1"))
+                self._codec_event(cc.OutputAdded(event.account, event.negotiated_video_codec, "AV1", event.negotiated_video_codec))
 
     def _pool_action(self, a: Any) -> None:
         self.metrics.inc(f"action.{type(a).__name__}")
@@ -1167,6 +1170,7 @@ class Service:
     # ------------------------------------------------------- adaptive codec
 
     def _new_codec_ctl(self) -> cc.CodecController:
+        self._stall_kick: dict[object, float] = {}
         return cc.CodecController(pinned=self.cfg.codecs.video_mode != "passthrough")
 
     def _video_dims(self) -> tuple[int, int]:
@@ -1179,7 +1183,7 @@ class Service:
     def _codec_from_event(self, event: Any) -> None:
         """Supervisor events that concern the ingest output: its negotiation and server op 14."""
         if isinstance(event, OutputReady) and event.generation == self._gen and self.cfg.discord.ingest_publishes:
-            self._codec_event(cc.OutputAdded("ingest", event.negotiated_video_codec, "AV1"))
+            self._codec_event(cc.OutputAdded("ingest", event.negotiated_video_codec, "AV1", event.negotiated_video_codec))
         elif isinstance(event, CodecChanged) and event.generation == self._gen and self.cfg.discord.ingest_publishes:
             self._codec_event(cc.OutputCodec("ingest", event.negotiated_video_codec))
 
@@ -1203,6 +1207,24 @@ class Service:
                     self._ingest_task(self._codec_swap, "ingest", c, g)
                 case cc.SwapOutput(output_id=uid, codec=c):
                     self._out_queue(uid, self._codec_swap, uid, c, g)
+
+    def _check_codec_stall(self, now: float) -> None:
+        """An output bound to the current codec that sends nothing while the source flows is re-swapped
+        (the swap resets the publisher and asks the target for a keyframe)."""
+        if not self._adaptive or now - self._last_egress_at > 1.0:
+            return
+        for oid in self._codec_ctl.bound_outputs():
+            pub = self.publisher if oid == "ingest" else self._out_pubs.get(oid)
+            if pub is None:
+                continue
+            if oid not in self._stall_kick:  # grace period from when the output is first seen bound
+                self._stall_kick[oid] = now
+                continue
+            since = max(pub.last_send_at or 0.0, self._stall_kick.get(oid, 0.0))
+            if now - since > CODEC_STALL_S:
+                self._stall_kick[oid] = now
+                self.log("codec_stall", output=str(oid), codec=self._codec_ctl.effective)
+                self._codec_event(cc.OutputBound(oid, None))
 
     def _codec_feed(self, g: int | None, event: Any) -> None:
         if self._session_gen == g:
@@ -1283,10 +1305,12 @@ class Service:
             self._codec_feed(g, cc.OutputBound(oid, None))
             raise
         if bound is None:
+            self.log("codec_swap", output=str(oid), codec=codec, bound=None)
             if pub.codec != prev:
                 pub.set_codec(prev)
             self._codec_feed(g, cc.OutputBound(oid, None))
             return
+        self.log("codec_swap", output=str(oid), codec=codec, bound=bound)
         self._codec_feed(g, cc.OutputBound(oid, bound))
         if bound != codec:  # the server renegotiated while we swapped
             self._codec_feed(g, cc.OutputCodec(oid, bound))
@@ -1339,6 +1363,7 @@ class Service:
     def _pump_worker(self, worker: Any) -> None:
         for au in worker.poll_egress(16):
             if isinstance(au, EgressVideo):
+                self._last_egress_at = time.monotonic()
                 for pub in self._publishers():
                     pub.offer_video(au)
             elif isinstance(au, EgressAudio):
@@ -1390,6 +1415,7 @@ class Service:
         d["adapter_running"] = self._adapter is not None
         d["metrics"] = self.metrics.snapshot()
         d["ingest_send"] = self.publisher.take_window()
+        d["ingest_send"]["codec"] = self.publisher.codec
         d["ingress_audio"] = self._adapter.take_audio_window() if self._adapter is not None else {}
         audio = d["ingress_audio"]
         self._audio_ok = audio.get("packets", 0) > audio.get("silence", 0)

@@ -140,6 +140,11 @@ class Publisher:
             self._on_need_idr()
         return frame
 
+    @property
+    def last_send_at(self) -> float | None:
+        """Clock time of the last video frame handed to the player."""
+        return self._last_send
+
     def _note_send_locked(self) -> None:
         now = self._clock()
         self._window["sent"] += 1

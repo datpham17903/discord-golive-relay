@@ -128,24 +128,50 @@ def adaptive_output_stream_client(
     return AdaptiveOutputStreamClient
 
 
+async def _await_transport(fut: Any) -> None:
+    """Wait for a library transport-start future without ever cancelling it."""
+    await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), 10.0)
+
+
 async def swap_output_source(
-    out: Any, lock: asyncio.Lock, make_source: Callable[[str], Any], log: Callable[..., None]
+    out: Any, lock: asyncio.Lock, make_source: Callable[[str], Any], log: Callable[..., None],
+    replay: Callable[[Any], None] | None = None,
 ) -> str | None:
-    """Replace the running output's source in place for the codec the server negotiated now."""
+    """Replace the running output's source in place for the codec the server negotiated now. A player
+    that is gone or stopped is restarted with ``replay`` instead."""
     async with lock:
         codec = out.negotiated_video_codec if out is not None else None
         if codec is None:
             log("codec_swap_skipped", reason="no output or codec")
             return None
-        if out._player is None:
+        alive = out._player is not None and out.is_playing()
+        if not alive and replay is None:
             log("codec_swap_failed", codec=codec, error="no player")
             return None
+        if alive:
+            # set_source cancels a still-pending start_video, and the player stops on that cancellation
+            pending = out._player._video_transport_start
+            if pending is not None and not pending.done():
+                try:
+                    await _await_transport(pending)
+                except asyncio.CancelledError:
+                    if not pending.cancelled():
+                        raise
+                except Exception as exc:
+                    log("codec_swap_pending_start", codec=codec, error=repr(exc))
         out._video_keyframes.clear()
         out._video_keyframe_resend_requests.clear()
         out._video_keyframe_replay_active = False
         src = make_source(codec)
         try:
-            out.source = src
+            if alive and out.is_playing():
+                out.source = src
+            elif replay is not None:
+                log("codec_swap_replay", codec=codec)
+                replay(src)
+            else:
+                log("codec_swap_failed", codec=codec, error="player stopped")
+                return None
         except discord.ClientException as exc:
             log("codec_swap_failed", codec=codec, error=repr(exc))
             return None
@@ -157,7 +183,7 @@ async def swap_output_source(
             return codec
         try:
             # shield: a timeout must not cancel the library's own transport-start future
-            await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(fut)), 10.0)
+            await _await_transport(fut)
         except TimeoutError:
             log("codec_swap_failed", codec=codec, error="video transport start timed out")
             return None

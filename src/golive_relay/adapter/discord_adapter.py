@@ -510,7 +510,7 @@ class DiscordAdapter:
 
     async def swap_output_source(self, make_source: Callable[[str], Any]) -> str | None:
         """Swap the running output to a source for the currently negotiated codec; returns the bound codec."""
-        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log)
+        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log, self.play)
 
     def play(self, source: Any) -> None:
         if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder

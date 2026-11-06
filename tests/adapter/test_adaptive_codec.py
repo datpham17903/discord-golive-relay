@@ -104,7 +104,9 @@ class FakePlayer:
 
 
 class FakeOut:
-    def __init__(self, codec="H265", fut=None, fail=False) -> None:
+    """``fut``: a start_video still pending from before the swap; ``next_fut``: the one set_source/play schedule."""
+
+    def __init__(self, codec="H265", fut=None, fail=False, next_fut=None, playing=True) -> None:
         self.negotiated_video_codec = codec
         self._video_keyframes = {1: [b"x"]}
         self._video_keyframe_resend_requests = {1}
@@ -112,9 +114,19 @@ class FakeOut:
         self._player = FakePlayer(fut)
         self._video_codec = None
         self.fail = fail
+        self.next_fut = next_fut
+        self.playing = playing
         self.assigned: list = []
+        self.played: list = []
         self.started: list = []
         self.ws = FakeWs()
+
+    def is_playing(self) -> bool:
+        return self._player is not None and self.playing
+
+    def play(self, v, **kw) -> None:
+        self.played.append(v)
+        self._player, self.playing = FakePlayer(self.next_fut), True
 
     @property
     def source(self):
@@ -125,6 +137,7 @@ class FakeOut:
         if self.fail:
             raise discord.ClientException("codec mismatch")
         self.assigned.append(v)
+        self._player._video_transport_start = self.next_fut
 
     async def start_video(self, **kw) -> None:
         self.started.append(kw)
@@ -142,7 +155,7 @@ def test_swap_clears_keyframe_cache_and_awaits_transport() -> None:
     async def main():
         fut: concurrent.futures.Future = concurrent.futures.Future()
         a = adapter()
-        a._out = out = FakeOut(fut=fut)
+        a._out = out = FakeOut(next_fut=fut)
         made: list = []
         task = asyncio.create_task(a.swap_source(lambda c: made.append(c) or src_for(c)))
         await asyncio.sleep(0.01)
@@ -154,6 +167,30 @@ def test_swap_clears_keyframe_cache_and_awaits_transport() -> None:
         out2 = a._out = FakeOut()  # no pending transport start: start_video ourselves
         assert await a.swap_source(src_for) == "H265"
         assert out2.started == [{"width": 640, "height": 360, "fps": 30, "bitrate": 0}]
+
+    asyncio.run(main())
+
+
+def test_swap_waits_for_pending_initial_start() -> None:
+    async def main():
+        first: concurrent.futures.Future = concurrent.futures.Future()
+        a = adapter()
+        a._out = out = FakeOut(fut=first)
+        task = asyncio.create_task(a.swap_source(src_for))
+        await asyncio.sleep(0.01)
+        assert not task.done() and out.assigned == []  # set_source would cancel the pending start
+        first.set_result(None)
+        assert await task == "H265" and len(out.assigned) == 1
+
+    asyncio.run(main())
+
+
+def test_swap_replays_a_stopped_player() -> None:
+    async def main():
+        a = adapter()
+        out = a._out = FakeOut(playing=False)
+        assert await a.swap_source(src_for) == "H265"
+        assert out.assigned == [] and len(out.played) == 1 and out.started  # fresh player, video started
 
     asyncio.run(main())
 
@@ -188,11 +225,11 @@ def test_swap_player_none_and_completed_transport() -> None:
         out = a._out = FakeOut()
         out._player = None
         made: list = []
-        assert await a.swap_source(lambda c: made.append(c) or src_for(c)) is None
-        assert logs and made == [] and out.assigned == []
+        assert await a.swap_source(lambda c: made.append(c) or src_for(c)) == "H265"
+        assert made == ["H265"] and out.assigned == [] and len(out.played) == 1  # no player: replayed
         fut: concurrent.futures.Future = concurrent.futures.Future()
         fut.set_result(None)
-        out = a._out = FakeOut(fut=fut)
+        out = a._out = FakeOut(next_fut=fut)
         assert await a.swap_source(src_for) == "H265" and out.started == []
         out = a._out = FakeOut()  # no pending start but the library already runs this codec
         out._video_codec = "H265"
@@ -207,13 +244,13 @@ def test_swap_transport_timeout(monkeypatch) -> None:
         logs: list = []
         a.log = lambda *x, **k: logs.append(x)
         fut: concurrent.futures.Future = concurrent.futures.Future()
-        a._out = FakeOut(fut=fut)
+        a._out = FakeOut(next_fut=fut)
         real = asyncio.wait_for
         monkeypatch.setattr(asyncio, "wait_for", lambda aw, timeout: real(aw, 0.05))
         assert await a.swap_source(src_for) is None and logs
         fut2: concurrent.futures.Future = concurrent.futures.Future()
         fut2.cancel()
-        a._out = FakeOut(fut=fut2)
+        a._out = FakeOut(next_fut=fut2)
         logs.clear()
         assert await a.swap_source(src_for) is None and logs
 

@@ -169,10 +169,7 @@ class OutputAccountAdapter:
         self._events(OutReady(self.user_id, generation, attempt, codec))
         if adaptive and callable(source):  # adaptive: the caller builds the source for the negotiated codec
             source = source(codec)
-        if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder
-            self._out.play(source)
-        else:
-            self._out.play(source, bitrate=self._audio_bitrate_kbps)
+        self._play(source)
         self._health_task = asyncio.create_task(self._watch_health(generation, attempt, self._out, self._vc))
         return codec
 
@@ -184,9 +181,15 @@ class OutputAccountAdapter:
         await out.ws.session_update(codecs.video_codec_list(names, encode=True))
         return True
 
+    def _play(self, source: Any) -> None:
+        if self._audio_bitrate_kbps is None:  # audio passthrough: the source is Opus, no encoder
+            self._out.play(source)
+        else:
+            self._out.play(source, bitrate=self._audio_bitrate_kbps)
+
     async def swap_source(self, make_source: Callable[[str], Any]) -> str | None:
         """Swap the running output to a source for the currently negotiated codec; returns the bound codec."""
-        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log)
+        return await codecs.swap_output_source(self._out, self._swap_lock, make_source, self.log, self._play)
 
     async def _watch_health(self, generation: int, attempt: int, out: Any, vc: Any) -> None:
         """A dropped stream or voice connection without a voice-state change is reported once as unhealthy."""

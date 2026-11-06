@@ -2211,3 +2211,28 @@ def test_stale_attempt_failure_keeps_codec_output(tmp_path, slate, source_gop):
         assert await task == 0
 
     asyncio.run(main())
+
+
+def test_codec_stall_watchdog_reswaps_silent_output(tmp_path, slate, source_gop):
+    from golive_relay.service import CODEC_STALL_S
+
+    env = _adaptive_env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        ad = env.adapters[0]
+        await wait_until(lambda: env.svc._codec_ctl.bound_outputs() == ["ingest"])
+        assert ad.swaps == []  # started with the negotiated codec's source: no redundant swap
+        svc, now = env.svc, time.monotonic()
+        svc._last_egress_at = now
+        svc._stall_kick.clear()
+        svc._check_codec_stall(now)  # first sight starts the grace period
+        assert svc._codec_ctl.bound_outputs() == ["ingest"]
+        svc.publisher._last_send = None
+        svc._last_egress_at = now + CODEC_STALL_S  # the source is still flowing
+        svc._check_codec_stall(now + CODEC_STALL_S + 0.1)
+        assert svc._codec_ctl.bound_outputs() == []  # unbound: the controller swaps it again
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
