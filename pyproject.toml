@@ -10,12 +10,16 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # discord.py-self is pinned by git commit and discord-native-voice is installed
 # with --no-deps; see manifests/build-manifest.json and manifests/requirements.lock.txt.
 dependencies = [
     "av==19.0.2",
     "PyYAML>=6,<7",
+    # discord-native-voice 0.1.1 cannot decrypt DAVE media with davey 0.2.x (live: packets arrive,
+    # no frame is ever assembled); discord.py-self[voice] would otherwise pull the newest davey.
+    "davey==0.1.7",
+    "discord-protos==1.2.399",
 ]
 
 [project.optional-dependencies]

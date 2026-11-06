@@ -38,7 +38,7 @@ The relay stops by itself when the target stops sharing, leaves the voice channe
 | Item | Need |
 | --- | --- |
 | OS | Windows 10/11, Linux (VPS target), macOS (encoders only, not tested live) |
-| Python | 3.10 or newer (developed on 3.14) |
+| Python | 3.12 or newer (PyAV 19 needs 3.12; developed on 3.14, tested on 3.12) |
 | Network | Outbound UDP and TCP to Discord (voice uses UDP) |
 | GPU | Optional. libx264 (CPU) always works |
 
