@@ -76,6 +76,7 @@ class DiscordAdapter:
         decodable: set[str] | None = None,
         network_stats: bool = False,
         audio_bitrate_kbps: int | None = 64,
+        self_deaf: bool = True,
     ) -> None:
         """``cfg`` is RelayConfig (or its discord section). ``ingress`` is called on the
         native receive thread and must be thread-safe. ``paused_verified`` False
@@ -97,6 +98,7 @@ class DiscordAdapter:
             codecs.advertised(decodable, getattr(modes, "parent_codecs", "auto_decode")))
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
+        self._self_deaf = self_deaf
         self._watch_cls = nv.StreamClient.with_config(
             codecs=codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
@@ -414,7 +416,8 @@ class DiscordAdapter:
         self._voice_state_cb = on_voice_state
         try:
             self._vc = await channel.connect(
-                cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
+                cls=self._parent_cls, self_mute=True, self_deaf=self._self_deaf, reconnect=False,
+                timeout=CONNECT_TIMEOUT_S
             )
         except BaseException:
             self._vc = None  # the voice-state echo may already have set it

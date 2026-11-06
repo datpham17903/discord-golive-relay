@@ -148,6 +148,8 @@ relayctl validate --config config.yaml
 | `audio.enabled` | Relay the stream audio | `true` | set `false` for video only |
 | `audio.source` | Audio source | `target_stream_only` | never (only value) |
 | `runtime.start_debounce_ms` | Wait before reacting to a start | `100` | `0`-`100` when viewers race for the 50 slots of the target's Go Live, so the ingest watches first |
+| `runtime.self_deaf_ingest` | The ingest joins voice self-muted and self-deafened (bots are always self-muted), so voice chat is never sent to it. Set `false` if a deafened ingest stops receiving the target's Go Live audio | `true` | only if the stream audio goes missing |
+| `runtime.self_deaf_outputs` | Relay and mirror accounts join self-muted and self-deafened (they only publish) | `true` | rarely |
 | `runtime.idle_voice_grace_seconds` | Grace while the target is idle in voice | `30` | rarely |
 | `runtime.hold_recovery_timeout_seconds` | How long a HOLD (slate) may last | `15` | rarely |
 | `runtime.connect_timeout_seconds` | Voice connect timeout | `15` | slow networks |

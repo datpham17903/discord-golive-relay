@@ -328,3 +328,20 @@ def test_own_go_live_viewers_emitted_without_bots() -> None:
         assert events == [OutViewers(USER, frozenset({5, 6}))]
 
     asyncio.run(go())
+
+
+def test_publish_self_deaf_follows_config() -> None:
+    async def go():
+        for kw, want in (({}, True), ({"self_deaf": False}, False)):
+            calls: list = []
+            a = OutputAccountAdapter(
+                USER, GUILD, CHAN, [].append, lambda *a, **k: None,
+                decodable={"H264"}, client_factory=lambda: FakeClient(calls), **kw,
+            )
+            await a.start("tok")
+            await a.publish(1, 1, 30, "SRC", CHAN)
+            connect = next(c[1] for c in calls if isinstance(c, tuple) and c[0] == "connect")
+            assert connect["self_mute"] is True and connect["self_deaf"] is want
+            await a.end()
+
+    asyncio.run(go())

@@ -374,6 +374,17 @@ def test_control_config_operators_optional_when_enabled(tmp_path: Path):
     assert any("control.bogus" in e for e in _errors(tmp_path, raw))
 
 
+def test_self_deaf_defaults_on_and_validates(tmp_path):
+    for key in ("self_deaf_ingest", "self_deaf_outputs"):
+        raw = _raw()
+        raw["runtime"].pop(key, None)
+        assert getattr(_load(tmp_path, raw).runtime, key) is True
+        raw["runtime"][key] = False
+        assert getattr(_load(tmp_path, raw).runtime, key) is False
+        raw["runtime"][key] = "yes"
+        assert any(key in e for e in _errors(tmp_path, raw))
+
+
 def test_prejoin_voice_defaults_on(tmp_path):
     raw = _raw()
     del raw["runtime"]["prejoin_voice"]

@@ -60,6 +60,8 @@ runtime:
   relay_autoscale: true       # start relay_accounts only when the main channel needs them; false = all relays always publish
   relay_idle_stop_seconds: 30    # an extra relay stops only after its Go Live had no viewer this long
   stream_viewer_cap: 50       # viewers one Go Live can hold
+  self_deaf_ingest: true      # the ingest joins voice self-muted and self-deafened; set false if a deafened ingest stops receiving the target's stream audio
+  self_deaf_outputs: true     # relay/mirror accounts join self-muted and self-deafened (they only publish)
 
 liveness:
   source_dead_timeout_seconds: null   # must be the value measured in M0 before enabling

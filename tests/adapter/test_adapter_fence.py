@@ -243,3 +243,24 @@ def test_play_without_bitrate_in_audio_passthrough() -> None:
     a._out = NS(play=lambda source, **kw: calls.append((source, kw)))
     a.play("SRC")
     assert calls == [("SRC", {})]
+
+
+def test_join_passes_self_mute_and_configured_self_deaf() -> None:
+    import asyncio
+
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    for deaf in (True, False):
+        a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"}, self_deaf=deaf)
+        seen: list = []
+
+        async def connect(**kw):
+            seen.append(kw)
+            return NS(session_id="s")
+
+        a._guild_channel = lambda: NS(connect=connect)
+        asyncio.run(a.join())
+        assert seen[0]["self_mute"] is True and seen[0]["self_deaf"] is deaf
+    a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"})
+    a._guild_channel = lambda: NS(connect=connect)
+    asyncio.run(a.join())
+    assert seen[-1]["self_deaf"] is True

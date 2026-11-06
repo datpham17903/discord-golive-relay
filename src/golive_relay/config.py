@@ -110,6 +110,8 @@ class RuntimeConfig:
     relay_autoscale: bool = True
     relay_idle_stop_seconds: float = 30.0
     stream_viewer_cap: int = 50
+    self_deaf_ingest: bool = True
+    self_deaf_outputs: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -552,6 +554,8 @@ def _build(raw: Any, errors: list[str]) -> RelayConfig | None:
         relay_autoscale=r.opt_bool("relay_autoscale", default=True),
         relay_idle_stop_seconds=(r.num("relay_idle_stop_seconds") or 30.0) if "relay_idle_stop_seconds" in r.data else 30.0,
         stream_viewer_cap=r.int_("stream_viewer_cap") if "stream_viewer_cap" in r.data else 50,
+        self_deaf_ingest=r.opt_bool("self_deaf_ingest", default=True),
+        self_deaf_outputs=r.opt_bool("self_deaf_outputs", default=True),
     )
     if "relay_scale_down_seconds" in r.data:
         r._get("relay_scale_down_seconds")

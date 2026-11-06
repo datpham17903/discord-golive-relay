@@ -43,6 +43,7 @@ class OutputAccountAdapter:
         excluded_viewer_ids: frozenset[int] = frozenset(),
         audio_bitrate_kbps: int | None = 64,
         bot_user_ids: frozenset[int] = frozenset(),
+        self_deaf: bool = True,
     ) -> None:
         self.user_id = user_id
         self.guild_id = guild_id
@@ -59,6 +60,7 @@ class OutputAccountAdapter:
         self._client_factory = client_factory or discord.Client
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
+        self._self_deaf = self_deaf
         self._client: Any = None
         self._gateway_task: asyncio.Task[Any] | None = None
         self._vc: Any = None
@@ -142,7 +144,8 @@ class OutputAccountAdapter:
             self._emit_participants()
             raise RuntimeError("excluded viewer in voice channel")
         self._vc = await channel.connect(
-            cls=self._parent_cls, self_mute=True, reconnect=False, timeout=CONNECT_TIMEOUT_S
+            cls=self._parent_cls, self_mute=True, self_deaf=self._self_deaf, reconnect=False,
+            timeout=CONNECT_TIMEOUT_S
         )
         self._events(OutJoined(self.user_id, generation, attempt, self._vc.session_id))
         self._emit_participants()
