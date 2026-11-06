@@ -25,7 +25,7 @@ codecs:
   output_rids: 1
   video_encoder: auto        # auto | libx264 | h264_nvenc | h264_amf | h264_qsv | h264_mf | h264_videotoolbox | h264_vaapi
   hw_decode: none            # none | auto | <device type, e.g. d3d11va, cuda>; auto can be slower on a busy iGPU
-  video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's H.264 as-is (near-zero CPU, lower latency) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; non-H.264 or oversized sources fall back to transcode
+  video_mode: passthrough    # transcode | passthrough; passthrough forwards the target's video as-is (near-zero CPU, lower latency; every codec with output_codec adaptive, only H.264 with output_codec H264) but keeps its bitrate (Discord error 2003 if too high); keyframes come from PLI to the target; sources larger than max_* fall back to H.264 transcode
   audio_mode: passthrough    # transcode | passthrough; passthrough forwards the target's Opus as-is (its own bitrate, audio_bitrate_kbps unused); transcode re-encodes at audio_bitrate_kbps
 
 quality:
