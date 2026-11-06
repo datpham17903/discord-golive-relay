@@ -105,6 +105,23 @@ class OutFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class OutCodecChanged:
+    """Server op 14 on the account's output: the negotiated video codec is now ``codec``."""
+
+    account: int
+    generation: int
+    attempt: int
+    codec: str
+
+
+@dataclass(frozen=True, slots=True)
+class OutPli:
+    """A viewer asked the output for a keyframe the library cannot answer; ``account`` None is the ingest output."""
+
+    account: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class OutHealth:
     account: int
     generation: int
@@ -150,6 +167,7 @@ class OutTick:
 
 PoolEvent = (
     SessionLive | SessionHold | SessionEnded | OutJoined | OutReady | OutFailed | OutHealth
+    | OutCodecChanged | OutPli
     | OutVoiceObserved | MirrorParticipants | OutViewers | OutAuthRejected | OutTick
 )
 
