@@ -425,6 +425,8 @@ class Service:
             return
         before = self.sup.state
         now = time.monotonic()
+        if isinstance(event, ConnectFailed) and event.detail:
+            self.log("connect_failed", generation=event.generation, detail=event.detail[:300])
         acts = self.sup.handle(event, now)
         s = self.sup.stream
         if s is not None and (s.key, s.incarnation) != self._seen_stream:
