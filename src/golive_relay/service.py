@@ -49,7 +49,7 @@ from golive_relay.supervisor.model import (
     FatalReason, FirstFrame, FreshFrame, GatewayChanged, GatewaySnapshot, GatewayState, Joined, JoinVoice, LeaveVoice, OpenGate, OutputReady,
     ParticipantsChanged, PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline,
     RelayState, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
-    SourceProgress, StartConnect, StopReason, Teardown, Tick, Watching, WorkerFailed,
+    SourceProgress, StartConnect, StopReason, Teardown, Tick, VoiceLost, Watching, WorkerFailed,
 )
 from golive_relay.worker.messages import (
     Configure, EgressAudio, EgressVideo, ForceIdr, ResetPipeline, SetOutput, WorkerEvent,
@@ -65,6 +65,8 @@ OVERFLOW_MIN_INTERVAL_S = 1.0
 LOGIN_STAGGER_S = 2.0
 OUT_LOGIN_WAIT_S = 30.0
 SLATE_CACHE_SIZE = 4
+VOICE_LOST_GRACE_S = 20.0  # > CONNECT_TIMEOUT_S: the library may still recover a 4014 or resume a 4015
+VOICE_4006_RESTART_MIN_S = 300.0  # at most one adapter restart for repeated voice close 4006 per 5 minutes
 INCARNATION_ENDED = frozenset({StopReason.SOURCE_STOPPED, StopReason.SOURCE_LEFT_WHITELIST})
 # session_timing milestones also reported relative to stream_seen
 _FROM_SEEN = ("voice_state_confirmed", "watch_sent", "watching", "voice_connected")
@@ -213,6 +215,9 @@ class Service:
         self._session_gen: int | None = None  # generation of the running session; None after its Teardown
         self._in_voice = False
         self._session_id: str | None = None
+        self._voice_dead_since: float | None = None  # in voice per _in_voice, but the adapter's voice is not connected
+        self._voice_4006 = 0  # join failures with voice close 4006 since the last successful join
+        self._last_4006_restart: float | None = None
         self._token = ""
         self._ops: asyncio.Queue[tuple[Callable[..., Any], tuple]] = asyncio.Queue()
         self._done = asyncio.Event()
@@ -325,6 +330,7 @@ class Service:
             self._handle(Tick())
             self._pool_event(OutTick())
             self._scale_relays(now)  # OutTick above stops extra relays whose Go Live stayed without viewers
+            self._check_voice(now)
             if now >= next_poll:
                 self._poll_state()
                 next_poll = now + STATE_POLL_S
@@ -351,6 +357,46 @@ class Service:
                 self.log("op_error", op=getattr(fn, "__name__", "?"), error=repr(exc))
             finally:
                 self._ops.task_done()
+
+    def _check_voice(self, now: float) -> None:
+        """A voice connection that stays dead past the grace period is left and reported (VoiceLost)."""
+        adapter = self._adapter
+        if not self._in_voice or adapter is None or adapter.voice_alive():
+            self._voice_dead_since = None
+            return
+        if self._voice_dead_since is None:
+            self._voice_dead_since = now
+        if now - self._voice_dead_since < VOICE_LOST_GRACE_S:
+            return
+        self._voice_dead_since = None
+        foreign = adapter.foreign_voice_session()
+        self.log("voice_lost", vsu_session=adapter.last_vsu_session, foreign_session=foreign)
+        self._in_voice = False
+        self._queue(self._leave)
+        self._handle(VoiceLost("voice not connected", foreign_session=foreign))
+
+    def _voice_join_failed(self, adapter: Any, exc: BaseException) -> bool:
+        """Counts voice close 4006 and escalates; True when the failure came with a foreign voice session."""
+        if getattr(exc, "code", None) != 4006:
+            return False
+        if adapter.foreign_voice_session():
+            self.log("foreign_voice_session", vsu_session=adapter.last_vsu_session)
+            return True  # another session of this account holds the voice state: a new gateway would not help
+        self._voice_4006 += 1
+        now = time.monotonic()
+        if (self._voice_4006 >= 2 and self._session_gen is None
+                and (self._last_4006_restart is None or now - self._last_4006_restart >= VOICE_4006_RESTART_MIN_S)):
+            self.log("voice_4006_restart_adapter", count=self._voice_4006)
+            self._voice_4006 = 0
+            self._last_4006_restart = now
+            self._queue(self._drop_adapter)
+            self._queue(self._ensure_adapter)  # fresh IDENTIFY: its snapshot re-evaluates every gate
+        return False
+
+    def _connect_join_failed(self, g: int, adapter: Any, exc: BaseException) -> None:
+        self.log("join_failed", error=repr(exc), code=getattr(exc, "code", None), vsu_session=adapter.last_vsu_session)
+        self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
+        self._voice_join_failed(adapter, exc)
 
     def _queue(self, fn: Callable[..., Any], *args: Any) -> None:
         self._ops.put_nowait((fn, args))
@@ -877,6 +923,10 @@ class Service:
             self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
             return
         join: asyncio.Task | None = None
+        if self._in_voice and not adapter.voice_alive():
+            self.log("prejoined_voice_dead", vsu_session=adapter.last_vsu_session)
+            await self._step(adapter.leave)
+            self._in_voice = False
         if not self._in_voice:
             confirmed = asyncio.Event()
             join = asyncio.create_task(self._join(adapter, on_voice_state=confirmed.set))
@@ -892,7 +942,7 @@ class Service:
                 if confirmed.is_set():
                     self._mark(g, "voice_state_confirmed")
                 elif join.exception() is not None:
-                    self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(join.exception())))
+                    self._connect_join_failed(g, adapter, join.exception())
                     return
             if self._session_gen != g:
                 return
@@ -902,7 +952,7 @@ class Service:
                     try:
                         await join
                     except Exception as exc:
-                        self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
+                        self._connect_join_failed(g, adapter, exc)
                     else:
                         self._mark(g, "voice_connected")
                         self._handle(Joined(g, self._session_id))
@@ -945,6 +995,7 @@ class Service:
     async def _join(self, adapter: Any, **kw: Any) -> None:
         self._session_id = await adapter.join(**kw)
         self._in_voice = True
+        self._voice_4006 = 0
 
     async def _prejoin(self) -> None:
         """JoinVoice: the same join a session would do, done before the target streams."""
@@ -954,8 +1005,13 @@ class Service:
         try:
             await self._join(adapter)
         except Exception as exc:
-            self.log("prejoin_failed", error=repr(exc))  # the next StartConnect joins as usual
-            self._handle(PrejoinFailed(repr(exc)))  # the Supervisor retries the pre-join after a retry delay
+            # the next StartConnect joins as usual
+            self.log("prejoin_failed", error=repr(exc), code=getattr(exc, "code", None),
+                     vsu_session=adapter.last_vsu_session)
+            if self._voice_join_failed(adapter, exc):
+                self._handle(VoiceLost(repr(exc), foreign_session=True))  # retried after the retry cooldown
+            else:
+                self._handle(PrejoinFailed(repr(exc)))  # the Supervisor retries the pre-join after a retry delay
 
     async def _create_output(self, g: int, worker: Any) -> None:
         if self._worker is not worker:

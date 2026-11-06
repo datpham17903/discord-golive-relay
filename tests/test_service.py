@@ -79,6 +79,9 @@ class FakeAdapter:
         self.replies: list[tuple[int, int, str]] = []
         self.snap: GatewaySnapshot | None = None
         self.voice_ids: frozenset[int] = frozenset()
+        self.alive = True
+        self.foreign = False
+        self.last_vsu_session: str | None = None
 
     async def start(self, token: str) -> None:
         self.started = True
@@ -113,6 +116,12 @@ class FakeAdapter:
 
     async def leave(self) -> None:
         self.order.append("leave")
+
+    def voice_alive(self) -> bool:
+        return self.alive
+
+    def foreign_voice_session(self) -> bool:
+        return self.foreign
 
     async def request_pli(self) -> None:
         self.calls.append("pli")
@@ -1342,6 +1351,139 @@ def test_prejoin_failure_is_reported_and_retried(tmp_path, slate, source_gop):
         await wait_until(lambda: a.calls.count("join") == 2, timeout=3.0)
         await wait_until(lambda: env.svc._in_voice)
         assert "prejoin_failed" in env.logs
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+class VoiceClosed(Exception):
+    code = 4006
+
+
+def test_prejoined_dead_voice_leaves_and_rejoins_before_watch(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: env.svc._in_voice)
+        a.alive = False  # the pre-joined parent died (e.g. its voice poller crashed)
+        leave = a.leave
+
+        async def leave_logged():
+            a.calls.append("leave")
+            await leave()
+
+        a.leave = leave_logged
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        seq = [c for c in a.calls if c in ("join", "leave", "watch")]
+        assert seq == ["join", "leave", "join", "watch"]
+        assert "prejoined_voice_dead" in env.logs
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_ticker_reports_voice_lost_after_grace_only(tmp_path, slate, source_gop, monkeypatch):
+    import golive_relay.service as service_mod
+
+    monkeypatch.setattr(service_mod, "VOICE_LOST_GRACE_S", 0.5)
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(30.0,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: env.svc._in_voice)
+        a.alive = False
+        await asyncio.sleep(0.25)
+        assert "voice_lost" not in env.logs and "leave" not in env.order
+        await wait_until(lambda: "voice_lost" in env.logs, timeout=3.0)
+        await wait_until(lambda: "leave" in env.order)
+        await asyncio.sleep(0.6)
+        assert env.logs.count("voice_lost") == 1 and env.order.count("leave") == 1
+        assert env.svc.metrics.snapshot()["counters"]["event.VoiceLost"] == 1
+        assert not env.svc._in_voice and a.calls.count("join") == 1
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def _failing_join(a, fails):
+    real = a.join
+
+    async def join(on_voice_state=None):
+        if fails():
+            a.calls.append("join")
+            raise VoiceClosed("4006")
+        return await real(on_voice_state)
+
+    return join
+
+
+def test_repeated_4006_prejoin_restarts_adapter_once(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.1,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.join = _failing_join(a, lambda: True)
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: len(env.adapters) == 2 and env.adapters[1].started, timeout=3.0)
+        assert a.calls.count("join") == 2 and "close" in a.calls
+        b = env.adapters[1]
+        b.join = _failing_join(b, lambda: True)
+        b.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: b.calls.count("join") >= 3, timeout=3.0)
+        assert len(env.adapters) == 2  # at most one restart per 5 minutes
+        assert [kw["code"] for n, kw in env.log_kw if n == "prejoin_failed"][:2] == [4006, 4006]
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_4006_with_foreign_session_does_not_restart_adapter(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.1,),
+              retry_cooldown_seconds=0.1)
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.foreign, a.last_vsu_session = True, "other-session"
+        a.join = _failing_join(a, lambda: True)
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: a.calls.count("join") >= 3, timeout=3.0)
+        assert len(env.adapters) == 1 and "close" not in a.calls
+        assert "foreign_voice_session" in env.logs
+        assert [kw["vsu_session"] for n, kw in env.log_kw if n == "prejoin_failed"][0] == "other-session"
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
+def test_4006_counter_resets_after_successful_join(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop, prejoin_voice=True, retry_delays_seconds=(0.1,))
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.join = _failing_join(a, lambda: a.calls.count("join") == 0)
+        a.events(GatewaySnapshot(TargetVoice(env.chan, False), None, frozenset({env.target}), True))
+        await wait_until(lambda: env.svc._voice_4006 == 1)
+        await wait_until(lambda: env.svc._in_voice, timeout=3.0)
+        assert env.svc._voice_4006 == 0 and len(env.adapters) == 1
         env.svc.request_shutdown()
         await task
 

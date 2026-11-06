@@ -107,6 +107,7 @@ class DiscordAdapter:
         self._connect_task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._vc: Any = None
+        self.last_vsu_session: str | None = None  # session id of the last own VOICE_STATE_UPDATE seen
         self._voice_state_cb: Callable[[], None] | None = None
         self._sc: Any = None
         self._out: Any = None
@@ -398,11 +399,24 @@ class DiscordAdapter:
             async def on_voice_state_update(self, data: Any) -> None:
                 # observed before the library applies it (spec §12)
                 cid = data.get("channel_id")
-                adapter._emit(RelayVoiceObserved(data.get("session_id"), int(cid) if cid is not None else None))
+                channel_id = int(cid) if cid is not None else None
+                adapter.last_vsu_session = data.get("session_id")
+                adapter.log("relay_voice_state", vsu_session=adapter.last_vsu_session,
+                            gw_session=adapter._gateway_session(), channel_id=channel_id, connected=self.is_connected())
+                adapter._emit(RelayVoiceObserved(data.get("session_id"), channel_id))
                 await super().on_voice_state_update(data)
                 adapter._own_voice_state(self, data)
 
         return RelayParentVoiceClient
+
+    def _gateway_session(self) -> str | None:
+        ws = self._client.ws if self._client is not None else None
+        return ws.session_id if ws is not None else None
+
+    def foreign_voice_session(self) -> bool:
+        """The last own voice state carried a session id other than this gateway session's."""
+        gw = self._gateway_session()
+        return bool(self.last_vsu_session and gw and self.last_vsu_session != gw)
 
     async def join(self, on_voice_state: Callable[[], None] | None = None) -> str | None:
         """Connect the parent voice client; returns its voice session id.
@@ -413,6 +427,9 @@ class DiscordAdapter:
         channel = self._guild_channel()
         if channel is None:
             raise RuntimeError("allowed voice channel not available")
+        stale = channel.guild.voice_client
+        if stale is not None:  # e.g. a dead parent still registered: one voice client per account
+            await stale.disconnect(force=True)
         self._voice_state_cb = on_voice_state
         try:
             self._vc = await channel.connect(
@@ -503,8 +520,14 @@ class DiscordAdapter:
         finally:
             await sc.disconnect(force=True)
 
+    def voice_alive(self) -> bool:
+        return self._vc is not None and self._vc.is_connected()
+
     async def leave(self) -> None:
         vc, self._vc = self._vc, None
+        if vc is None:  # a failed join may have left its voice client registered in the library
+            guild = self._client.get_guild(self.guild_id) if self._client else None
+            vc = guild.voice_client if guild is not None else None
         if vc is not None:
             await vc.disconnect(force=True)
 

@@ -115,6 +115,8 @@ def test_join_reports_voice_state_echo_before_voice_connects() -> None:
     seen: list[str] = []
 
     class Channel:
+        guild = NS(voice_client=None)
+
         async def connect(self, cls, **kw):
             a._own_voice_state(vc, {"channel_id": "99", "session_id": "x"})  # another channel: ignored
             a._own_voice_state(vc, {"channel_id": str(CHAN), "session_id": "sess-1"})
@@ -178,6 +180,8 @@ def test_failed_connect_after_voice_state_echo_clears_voice_client() -> None:
     vc = NS(session_id="sess-1")
 
     class Channel:
+        guild = NS(voice_client=None)
+
         async def connect(self, cls, **kw):
             a._own_voice_state(vc, {"channel_id": str(CHAN), "session_id": "sess-1"})
             raise asyncio.TimeoutError
@@ -224,3 +228,69 @@ def test_explicit_relay_id_mismatch_is_config_invalid() -> None:
     a._client = NS(user=NS(id=99))
     a._on_ready()
     assert any(isinstance(e, ConfigInvalid) for e in out)
+
+
+def test_parent_voice_state_logs_vsu_and_gateway_session() -> None:
+    a, out = make()
+    logs: list[tuple[str, dict]] = []
+    a.log = lambda name, **kw: logs.append((name, kw))
+    a._client = NS(ws=NS(session_id="gw-1"))
+    applied: list = []
+
+    async def voice_state_update(data):
+        applied.append(data)
+
+    vc = a._parent_cls.__new__(a._parent_cls)
+    vc._connection = NS(voice_state_update=voice_state_update, is_connected=lambda: False)
+    data = {"channel_id": str(CHAN), "session_id": "vs-1"}
+    asyncio.run(vc.on_voice_state_update(data))
+    assert applied == [data]  # behaviour unchanged: the library still applies it
+    assert logs == [("relay_voice_state", {"vsu_session": "vs-1", "gw_session": "gw-1", "channel_id": CHAN,
+                                           "connected": False})]
+    assert a.last_vsu_session == "vs-1" and a.foreign_voice_session()
+    assert len(out) == 1  # RelayVoiceObserved still emitted
+
+
+def test_join_disconnects_stale_registered_voice_client_first() -> None:
+    a, _ = make()
+    seen: list[str] = []
+
+    class Stale:
+        async def disconnect(self, force=False):
+            seen.append(f"stale_disconnect force={force}")
+            Channel.guild.voice_client = None
+
+    class Channel:
+        guild = NS(voice_client=Stale())
+
+        async def connect(self, cls, **kw):
+            seen.append("connect" if Channel.guild.voice_client is None else "connect_with_stale")
+            return NS(session_id="sess-2")
+
+    a._guild_channel = lambda: Channel()
+    assert asyncio.run(a.join()) == "sess-2"
+    assert seen == ["stale_disconnect force=True", "connect"]
+
+
+def test_leave_cleans_registered_vc_when_adapter_vc_is_none() -> None:
+    a, _ = make()
+    seen: list[bool] = []
+
+    class Registered:
+        async def disconnect(self, force=False):
+            seen.append(force)
+
+    guild = NS(voice_client=Registered())
+    a._client = NS(get_guild=lambda gid: guild if gid == GUILD else None)
+    assert a._vc is None
+    asyncio.run(a.leave())
+    assert seen == [True]
+
+
+def test_voice_alive_false_when_vc_not_connected() -> None:
+    a, _ = make()
+    assert not a.voice_alive()
+    a._vc = NS(is_connected=lambda: False)
+    assert not a.voice_alive()
+    a._vc = NS(is_connected=lambda: True)
+    assert a.voice_alive()

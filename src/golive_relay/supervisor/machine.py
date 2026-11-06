@@ -21,7 +21,7 @@ from .model import (
     OutputReady, ParticipantsChanged, PrejoinChanged, PrejoinFailed, QuarantineRecord, RebuildPipeline, RelayState,
     RelayVoiceObserved, RequestInputKeyframe, ResetFatal, RoutingChanged, SetFatalLatch, SetQuarantine, SetRejections, ShowSlate, Shutdown,
     SourceProgress, SourceStream, StartConnect, StatusSnapshot, StopReason, StreamEnded, StreamStarted,
-    StreamUpdated, TargetVoice, TargetVoiceChanged, Teardown, Tick, Watching, WorkerFailed,
+    StreamUpdated, TargetVoice, TargetVoiceChanged, Teardown, Tick, VoiceLost, Watching, WorkerFailed,
 )
 from .ownership import OwnershipDetector, OwnershipVerdict
 from .predicate import evaluate_gate
@@ -269,6 +269,14 @@ class Supervisor:
                     self._in_voice = False
                     self._leave_at = None
                     self._prejoin_after = now + self._prejoin_retry.next_delay()
+            case VoiceLost() as e:
+                if self.state in _SESSION:
+                    self._stop(StopReason.CONNECT_FAILED, now, acts, detail="voice lost")
+                elif self._in_voice:
+                    self._in_voice = False
+                    self._leave_at = None
+                    delay = self.cfg.retry_cooldown if e.foreign_session else self._prejoin_retry.next_delay()
+                    self._prejoin_after = now + delay
             case ResetFatal():
                 if self.state is RelayState.FATAL and self.fatal in DURABLE_FATAL:
                     reset = self.fatal is FatalReason.RELAY_REJECTED_BY_SERVER

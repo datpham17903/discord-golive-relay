@@ -1106,3 +1106,29 @@ def test_prejoin_retry_resets_after_confirmed_join():
     sup.handle(RelayVoiceObserved("vs", CH), 6.5)  # the pre-join landed in the main channel
     sup.handle(_ev("PrejoinFailed")("boom"), 7.0)
     assert has(sup.handle(Tick(), 12.0), _join_cls())  # first delay again, not the second
+
+
+def test_voice_lost_idle_clears_in_voice_and_rejoins_after_retry_delay():
+    sup = make(prejoin_voice=True, retry_delays=(5.0, 10.0), retry_cooldown=60.0)
+    assert has(idle_in_channel(sup), _join_cls())
+    acts = sup.handle(_ev("VoiceLost")("not connected"), 1.0)
+    assert not has(acts, _join_cls()) and not has(acts, Teardown)
+    assert not has(sup.handle(Tick(), 5.9), _join_cls())
+    assert has(sup.handle(Tick(), 6.0), _join_cls())
+
+
+def test_voice_lost_in_session_tears_down_with_leave():
+    sup = make(prejoin_voice=True)
+    g, _ = relaying(sup)
+    acts = sup.handle(_ev("VoiceLost")("not connected"), 2.0)
+    assert has(acts, CloseGate)
+    assert has(acts, Teardown, generation=g, leave_voice=True, reason=StopReason.CONNECT_FAILED)
+    assert sup.status(2.0).state is RelayState.BACKOFF
+
+
+def test_voice_lost_foreign_session_uses_cooldown():
+    sup = make(prejoin_voice=True, retry_delays=(5.0, 10.0), retry_cooldown=60.0)
+    assert has(idle_in_channel(sup), _join_cls())
+    sup.handle(_ev("VoiceLost")("4006", foreign_session=True), 1.0)
+    assert not has(sup.handle(Tick(), 60.9), _join_cls())
+    assert has(sup.handle(Tick(), 61.0), _join_cls())

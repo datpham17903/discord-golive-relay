@@ -177,6 +177,14 @@ class PrejoinFailed:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceLost:
+    """The relay's voice connection stayed dead past the grace period (or a join hit a foreign voice session)."""
+
+    detail: str = ""
+    foreign_session: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class ResetFatal:
     pass
 
@@ -332,6 +340,7 @@ Event = (
     | StreamUpdated | StreamEnded | ParticipantsChanged | RelayVoiceObserved | Joined | Watching | FirstFrame
     | OutputReady | ConnectFailed | InboundHealth | OutputHealth | SourceProgress | FreshFrame | WorkerFailed
     | CodecChanged | AuthRejected | ConfigInvalid | Shutdown | RoutingChanged | PrejoinChanged | PrejoinFailed
+    | VoiceLost
 )
 
 

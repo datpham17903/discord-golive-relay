@@ -257,10 +257,10 @@ def test_join_passes_self_mute_and_configured_self_deaf() -> None:
             seen.append(kw)
             return NS(session_id="s")
 
-        a._guild_channel = lambda: NS(connect=connect)
+        a._guild_channel = lambda: NS(connect=connect, guild=NS(voice_client=None))
         asyncio.run(a.join())
         assert seen[0]["self_mute"] is True and seen[0]["self_deaf"] is deaf
     a = DiscordAdapter(cfg, [].append, lambda m: None, lambda *a, **k: None, decodable={"H264"})
-    a._guild_channel = lambda: NS(connect=connect)
+    a._guild_channel = lambda: NS(connect=connect, guild=NS(voice_client=None))
     asyncio.run(a.join())
     assert seen[-1]["self_deaf"] is True
