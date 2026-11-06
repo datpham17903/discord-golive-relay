@@ -6,7 +6,7 @@ import pytest
 from golive_relay.media import bitstream as bs
 
 _ENC = {
-    "H264": ("libx264", {"x264-params": "keyint=30:bframes=0"}),
+    "H264": ("libx264", {"x264-params": "keyint=30:bframes=0:scenecut=0"}),
     "H265": ("libx265", {"x265-params": "keyint=30:bframes=0:repeat-headers=1:scenecut=0"}),
     "AV1": ("libsvtav1", {"preset": "12", "g": "30"}),
     "VP8": ("libvpx", {"g": "30"}),
