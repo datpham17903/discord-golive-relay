@@ -29,7 +29,7 @@ codecs:
   audio_mode: passthrough    # transcode | passthrough; passthrough forwards the target's Opus as-is (its own bitrate, audio_bitrate_kbps unused); transcode re-encodes at audio_bitrate_kbps
 
 quality:
-  mode: fixed                # auto | fixed; fixed always outputs fixed_* (lower-resolution sources are scaled up, which needs a re-encode)
+  mode: auto                 # auto | fixed; auto passes the source through up to max_* (larger sources are scaled down); fixed always outputs fixed_* (other sizes are re-encoded, which costs CPU)
   max_width: 1920            # max_* only used in auto; 1080p60 validated live (G2b, 2026-11-01)
   max_height: 1080
   max_fps: 60
