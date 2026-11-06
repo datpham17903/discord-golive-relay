@@ -56,6 +56,7 @@ class OutputProfile:
     hw_decode: str = "none"  # "none" | "auto" | a hardware device type
     video_mode: str = "transcode"  # "transcode" | "passthrough" (forward eligible H.264 without re-encoding)
     audio_mode: str = "transcode"  # "transcode" | "passthrough" (forward the target's 20 ms Opus packets unchanged)
+    codec_mode: str = "h264"  # "h264" (passthrough only H.264) | "adaptive" (passthrough any codec in CODEC_ORDER)
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,12 +105,13 @@ class StopWorker:
 class EgressVideo:
     generation: int
     epoch: int
-    data: bytes  # Annex B access unit
-    is_idr: bool
+    data: bytes  # Annex B access unit (H.264/H.265) or the codec's own access unit
+    is_idr: bool  # keyframe
     frame_time_ms: float  # from the output schedule
     deadline: float  # monotonic time this AU is due
     source_frame_at: float | None  # monotonic arrival of the source frame it shows
     repeated: bool
+    codec: str = "H264"
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,5 +127,5 @@ class EgressAudio:
 class WorkerEvent:
     generation: int
     epoch: int
-    kind: str  # "first_frame" | "fresh_frame" | "need_keyframe" | "decode_error" | "overflow" | "stats" | "fatal"
+    kind: str  # "first_frame" | "fresh_frame" | "source_codec" | "need_keyframe" | "decode_error" | "overflow" | "stats" | "fatal"
     data: dict = field(default_factory=dict)
