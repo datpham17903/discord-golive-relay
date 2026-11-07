@@ -287,3 +287,25 @@ def test_video_gap_detected_from_sequence_holes() -> None:
     a._video_end.clear()
     a._on_packet(frame(9, 1))
     assert got[-1].gap is False
+
+
+def test_codec_switch_drops_library_receive_state_of_the_old_codec() -> None:
+    got: list = []
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, lambda e: None, got.append, lambda *a, **k: None, decodable={"H264"})
+    keys = [(7, 101), (7, 105), (8, 101)]
+    a._sc = NS(_video_receive_reorder_buffers=dict.fromkeys(keys), _video_depacketizers=dict.fromkeys(keys),
+               _video_frame_rtp_packets=dict.fromkeys(keys))
+
+    def frame(seq, codec, pt, ssrc=7):
+        return NS(user_id=TARGET, media_type="video", ssrc=ssrc, sequence=seq, received_at=None, rtcp_time=None,
+                  codec=codec, payload_type=pt, timestamp=0, payload=b"x", rtp_packets=(NS(sequence=seq),))
+
+    a._on_packet(frame(10, "AV1", 101))
+    a._on_packet(frame(11, "AV1", 101))
+    assert all(set(d) == set(keys) for d in vars(a._sc).values())  # same codec: untouched
+    a._on_packet(frame(12, "H264", 105))
+    assert all(set(d) == {(7, 105), (8, 101)} for d in vars(a._sc).values())
+    assert (7, "AV1") not in a._video_end
+    a._on_packet(frame(500, "AV1", 101))  # returning to AV1 starts fresh: no false gap
+    assert got[-1].gap is False

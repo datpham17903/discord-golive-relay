@@ -125,6 +125,7 @@ class DiscordAdapter:
         self._video_ssrc: int | None = None
         self._last_seq: dict[int, int | None] = {}
         self._video_end: dict[tuple[int, str], int] = {}  # (ssrc, codec) -> last delivered frame's final RTP seq
+        self._video_pt: dict[int, int] = {}  # ssrc -> payload type of the last delivered frame
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
         self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
         self._audio_window = _new_audio_window()
@@ -485,6 +486,7 @@ class DiscordAdapter:
         self._video_ssrc = None
         self._last_seq.clear()
         self._video_end.clear()
+        self._video_pt.clear()
         # Live G2a: STREAM_CREATE is not sent to a non-watcher even inside voice, so watch by key
         # (watch_stream delegates to Stream.watch when the stream is cached).
         self._sc = await self._vc.watch_stream(key, cls=self._watch_cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
@@ -564,6 +566,7 @@ class DiscordAdapter:
     async def stop_watch(self) -> None:
         sc, self._sc = self._sc, None
         self._video_end.clear()
+        self._video_pt.clear()
         if sc is None:
             return
         try:
@@ -606,6 +609,7 @@ class DiscordAdapter:
         rtcp = None if pkt.rtcp_time is None else pkt.rtcp_time - time.time() + now
         video = pkt.media_type == "video"
         if video:
+            self._note_payload_type(pkt)
             msg: IngressVideo | IngressAudio = IngressVideo(
                 generation, epoch, pkt.codec, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload),
                 self._video_gap(pkt),
@@ -623,6 +627,26 @@ class DiscordAdapter:
         if fresh and now - self._last_progress[video] >= PROGRESS_MIN_INTERVAL_S and self._loop is not None:
             self._last_progress[video] = now
             self._loop.call_soon_threadsafe(self._emit, SourceProgress(generation, now, video))
+
+    def _note_payload_type(self, pkt: Any) -> None:
+        """Native thread: on a codec switch, drop the library's receive state of the codec left behind. RTP
+        sequence numbers run on across payload types, so a later return to it would make its reorder buffer
+        wait out every number sent meanwhile (0.5 s), then skip them, and the held frames arrive stale."""
+        pt = getattr(pkt, "payload_type", None)
+        old = self._video_pt.get(pkt.ssrc)
+        if pt is None or old == pt:
+            return
+        self._video_pt[pkt.ssrc] = pt
+        if old is None:
+            return
+        for codec in [c for s, c in self._video_end if s == pkt.ssrc and c != pkt.codec]:
+            del self._video_end[(pkt.ssrc, codec)]
+        sc = self._sc
+        for name in ("_video_receive_reorder_buffers", "_video_depacketizers", "_video_frame_rtp_packets"):
+            state = getattr(sc, name, None)
+            if isinstance(state, dict):
+                for key in [k for k in state if k[0] == pkt.ssrc and k[1] != pt]:
+                    state.pop(key, None)
 
     def _video_gap(self, pkt: Any) -> bool:
         """Native thread: True when RTP sequence numbers are missing between the previous frame and this one."""
