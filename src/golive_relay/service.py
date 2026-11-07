@@ -216,6 +216,7 @@ class Service:
         self._profile: Any = None
         self._canvas: tuple[int, int] | None = None
         self._slate: Any = None
+        self._slate_tasks: set[asyncio.Task] = set()
         self._slates: OrderedDict[tuple, Any] = OrderedDict()  # build_slate inputs -> SlateGop
         self._seen_stream: tuple[str, int] | None = None  # (key, incarnation) last seen by the gate
         self._seen_at = 0.0
@@ -1080,24 +1081,17 @@ class Service:
             w, h = self._canvas
             publish = self.cfg.discord.ingest_publishes
             kbps = p.video_bitrate_kbps or hwaccel.auto_bitrate_kbps(w, h, p.fps)  # 0 = auto
-            steps = [self._get_slate(g, (w, h, p.fps, p.keyframe_interval_s, kbps))]
+            # The slate builds in the background: the output plays without it (a hold freezes until it lands).
+            self._spawn_slate(g, worker, (w, h, p.fps, p.keyframe_interval_s, kbps))
             if publish:
-                steps.append(self._create_ingest_output(g, adapter, p.fps))
-            # Both run to completion, so a failed slate never leaves a create_stream running unowned.
-            results = await asyncio.gather(*steps, return_exceptions=True)
-            for r in results:
-                if isinstance(r, BaseException):
-                    raise r
+                created = await self._create_ingest_output(g, adapter, p.fps)
             if self._worker is not worker:
                 return  # the Teardown already queued ends the output
-            slate = results[0]
-            self._slate = slate
-            self.publisher.set_slate(slate)  # before OutputReady: the gate may open right after it
             codec = "H264"  # the ingest account sends nothing itself when ingest_publishes is false
             if publish:
-                codec = results[1]
+                codec = created
                 if self._adaptive:  # the publisher drops other codecs until the controller swaps it
-                    # The slate build can outlast an op 14 renegotiation: play() needs the codec negotiated now.
+                    # An op 14 renegotiation can land during the create: play() needs the codec negotiated now.
                     codec = adapter.output_codec() or codec
                     self.publisher.set_codec(codec)
                     w, h = self._video_dims()
@@ -1108,6 +1102,25 @@ class Service:
             self._handle(ConnectFailed(g, StopReason.CONNECT_FAILED, True, repr(exc)))
             return
         self._handle(OutputReady(g, codec))
+
+    def _spawn_slate(self, g: int, worker: Any, key: tuple) -> None:
+        task = asyncio.get_running_loop().create_task(self._apply_slate(g, worker, key))
+        self._slate_tasks.add(task)
+        task.add_done_callback(self._slate_tasks.discard)
+
+    async def _apply_slate(self, g: int, worker: Any, key: tuple) -> None:
+        try:
+            slate = await self._get_slate(g, key)
+        except Exception as exc:
+            self.log("slate_failed", generation=g, error=repr(exc))
+            return
+        if slate is None or self._worker is not worker:
+            return  # nothing publishes, or the session ended while it was building
+        self._slate = slate
+        self.publisher.set_slate(slate)
+        for pub in self._out_pubs.values():
+            if pub._source is not None:  # a closed publisher must not send the slate
+                pub.set_slate(slate)
 
     async def _get_slate(self, g: int, key: tuple) -> Any:
         """``key`` is every build_slate input; built slates are reused by later sessions on the same canvas."""
