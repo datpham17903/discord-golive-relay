@@ -2091,11 +2091,19 @@ class AdaptiveAdapter(FakeAdapter):
         super().__init__(*a)
         self.watch_lists: list = []
         self.swaps: list[str] = []
+        self.played: list[str] = []
         self.negotiated = "H265"
 
     async def create_output_adaptive(self, g, fps):
         self.calls.append("create_output_adaptive")
         return "H265"
+
+    def output_codec(self):
+        return self.negotiated
+
+    def play(self, source) -> None:
+        super().play(source)
+        self.played.append(source.video_config.codec)
 
     async def update_watch_codecs(self, names) -> bool:
         self.watch_lists.append(tuple(names))
@@ -2144,6 +2152,28 @@ def test_service_routes_op14_to_controller_and_swaps(tmp_path, slate, source_gop
             {"codec": "H264", "width": CANVAS[0], "height": CANVAS[1], "eligible": True}))
         await wait_until(lambda: ad.swaps[-1:] == ["H264"])
         assert env.svc.publisher.codec == "H264" and env.svc._codec_ctl.effective == "H264"
+        env.svc.request_shutdown()
+        assert await task == 0
+
+    asyncio.run(main())
+
+
+def test_adaptive_play_uses_codec_negotiated_after_create(tmp_path, slate, source_gop):
+    class RenegotiatedAdapter(AdaptiveAdapter):
+        async def create_output_adaptive(self, g, fps):
+            self.calls.append("create_output_adaptive")
+            self.negotiated = "H264"  # op 14 lands while the slate is still building
+            return "AV1"
+
+    env = Env(tmp_path, slate, source_gop, output_codec="adaptive", adapter_cls=RenegotiatedAdapter,
+              worker_cls=AdaptiveWorker)
+
+    async def main():
+        task = await reach_relaying(env)
+        ad = env.adapters[0]
+        await wait_until(lambda: ad.played)
+        assert ad.played[0] == "H264"
+        assert env.svc.publisher.codec == "H264"
         env.svc.request_shutdown()
         assert await task == 0
 

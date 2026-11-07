@@ -190,7 +190,7 @@ class DiscordAdapter:
         elif event in ("stream_update", "stream_unavailable"):
             self._on_stream_update(args[-1])
         elif event == "stream_delete":
-            self._on_stream_delete(args[0])
+            self._on_stream_delete(args[0], args[1] if len(args) > 1 else None)
         elif event == "voice_state_update":
             self._on_voice_state(*args)
         elif event == "message":
@@ -256,8 +256,18 @@ class DiscordAdapter:
         self._stream = self._to_source(stream)
         self._emit(StreamUpdated(self._stream))
 
-    def _on_stream_delete(self, stream: Any) -> None:
+    def _target_streaming(self) -> bool:
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        member = guild.get_member(self.target_id) if guild else None
+        voice = getattr(member, "voice", None)
+        return voice is not None and voice.channel is not None and bool(voice.self_stream)
+
+    def _on_stream_delete(self, stream: Any, reason: Any = None) -> None:
         if not self._is_target_stream(stream) or self._stream is None or self._stream.key != str(stream.key):
+            return
+        # STREAM_DELETE also reflects our own watch ending; the target's real end is a voice state update
+        if self._target_streaming():
+            self.log("stream_delete_ignored", reason=str(reason))
             return
         self._end_stream()
 
@@ -496,6 +506,10 @@ class DiscordAdapter:
         )
         self._out = await self._vc.create_stream(cls=cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
         return self._out.negotiated_video_codec
+
+    def output_codec(self) -> str | None:
+        """The video codec Discord has negotiated for the output right now."""
+        return self._out.negotiated_video_codec if self._out is not None else None
 
     async def update_watch_codecs(self, names: Any) -> bool:
         """Narrow or widen the codecs the target may send (SESSION_UPDATE); False (no-op) when not watching."""

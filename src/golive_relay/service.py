@@ -1097,6 +1097,8 @@ class Service:
             if publish:
                 codec = results[1]
                 if self._adaptive:  # the publisher drops other codecs until the controller swaps it
+                    # The slate build can outlast an op 14 renegotiation: play() needs the codec negotiated now.
+                    codec = adapter.output_codec() or codec
                     self.publisher.set_codec(codec)
                     w, h = self._video_dims()
                 adapter.play(RelayMediaSource(
