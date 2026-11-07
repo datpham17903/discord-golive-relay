@@ -323,7 +323,7 @@ def test_status_details_layout():
     assert "> **1 Alice** `555`" in s
     assert "> Kênh chính <#100> · 👥 **120** người" in s
     assert "### 📶 Relay · 1/2 chạy" in s
-    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 120/99" in s  # 49 + 50 * 1 running relay
+    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 120/99 (tối đa 149 khi bật đủ 2 relay)" in s  # 49 + 50 * 1 running relay of 2
     assert "> 🟢 **Relay1** · 👁 3" in s
     assert "> ⚫ **32** · rảnh" in s
     assert "> 🟡 <#200> ← **Mir1** · đang kết nối" in s
@@ -362,9 +362,9 @@ def test_source_block_ids():
 
 def test_capacity_bar_math_and_clamp():
     s = format_status(routing(), ctx(), _details(viewers=199, relay_running=2, viewer_cap=50, ingest_publishes=True))
-    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 199/199" in s  # 49 + 50 + 2 * 50
+    assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 199/199\n" in s  # 49 + 50 + 2 * 50; every relay runs: no maximum
     s = format_status(routing(), ctx(), _details(viewers=100, relay_running=1, viewer_cap=50, ingest_publishes=True))
-    assert "▰▰▰▰▰▰▱▱▱▱ sức chứa 100/149" in s
+    assert "▰▰▰▰▰▰▱▱▱▱ sức chứa 100/149 (tối đa 199 khi bật đủ 2 relay)" in s
     s = format_status(routing(), ctx(), _details(viewers=5000))
     assert "▰▰▰▰▰▰▰▰▰▰ sức chứa 5000/99" in s
     s = format_status(routing(), ctx(), _details(viewers=0))

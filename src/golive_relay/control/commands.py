@@ -553,8 +553,12 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
     relay_lines: list[str] = []
     if relays:
         relay_title = f"### 📶 Relay · {d.relay_running}/{len(relays)} chạy" + ("" if d.autoscale else " · autoscale tắt")
-        total = (d.viewer_cap - 1) + (d.viewer_cap if d.ingest_publishes else 0) + d.viewer_cap * d.relay_running
-        relay_head.append(f"> {_capacity_bar(d.viewers, total)} sức chứa {d.viewers}/{total}")
+        base = (d.viewer_cap - 1) + (d.viewer_cap if d.ingest_publishes else 0)
+        total = base + d.viewer_cap * d.relay_running
+        line = f"> {_capacity_bar(d.viewers, total)} sức chứa {d.viewers}/{total}"
+        if d.relay_running < len(relays):  # only running relays count; say what all of them would hold
+            line += f" (tối đa {base + d.viewer_cap * len(relays)} khi bật đủ {len(relays)} relay)"
+        relay_head.append(line)
         if d.relay_short_by > 0:
             relay_head.append(f"> ⚠️ thiếu {d.relay_short_by} relay")
         kept = set(d.relay_kept_ids)
