@@ -236,6 +236,7 @@ class Service:
         self._persist_failed = False
         self._last_idr_req = 0.0
         self._last_pli = 0.0
+        self._pli_timer: asyncio.TimerHandle | None = None
         self._last_overflow = 0.0
         self._worker_dead_reported = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -302,6 +303,7 @@ class Service:
         worker, self._worker = self._worker, None
         if worker is not None:
             await asyncio.to_thread(worker.stop)
+        self._cancel_pli_timer()
         adapter, self._adapter = self._adapter, None
         if adapter is not None:
             try:
@@ -420,8 +422,8 @@ class Service:
         if isinstance(event, ChatCommand):
             self._on_chat(event)
             return
-        if isinstance(event, OutPli):  # ingest output: a viewer PLI the library cannot answer
-            self._request_pli()
+        if isinstance(event, OutPli):  # a viewer PLI: the worker answers it for passthrough and transcode alike
+            self._need_idr()
             return
         before = self.sup.state
         now = time.monotonic()
@@ -740,7 +742,7 @@ class Service:
         elif isinstance(event, OutHealth) and not event.ok:
             self.log("output_unhealthy", account=event.account, channel=self.pool.channel_of(event.account))
         elif isinstance(event, OutPli):
-            self._request_pli()
+            self._need_idr()
             return
         elif isinstance(event, OutCodecChanged):
             if self.pool.is_current(event.account, event.generation, event.attempt):
@@ -1170,6 +1172,19 @@ class Service:
         if now - self._last_pli >= PLI_MIN_INTERVAL_S:
             self._last_pli = now
             self._pli()
+        elif self._pli_timer is None:  # inside the rate limit: defer one trailing PLI instead of dropping it
+            self._pli_timer = asyncio.get_running_loop().call_later(
+                self._last_pli + PLI_MIN_INTERVAL_S - now, self._fire_pli)
+
+    def _fire_pli(self) -> None:
+        self._pli_timer = None
+        self._last_pli = time.monotonic()
+        self._pli()
+
+    def _cancel_pli_timer(self) -> None:
+        if self._pli_timer is not None:
+            self._pli_timer.cancel()
+            self._pli_timer = None
 
     # ------------------------------------------------------- adaptive codec
 
@@ -1332,6 +1347,7 @@ class Service:
             await self._start_adapter()
 
     async def _drop_adapter(self) -> None:
+        self._cancel_pli_timer()
         adapter, self._adapter = self._adapter, None
         self._in_voice = False
         if adapter is not None:

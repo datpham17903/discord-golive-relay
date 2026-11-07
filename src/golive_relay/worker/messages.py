@@ -26,6 +26,7 @@ class IngressVideo:
     mono_received: float
     rtcp_time_mono: float | None  # presentation time from SR, mapped to monotonic
     data: bytes
+    gap: bool = False  # the library dropped frame(s) just before this one (sequence hole)
 
 
 @dataclass(frozen=True, slots=True)

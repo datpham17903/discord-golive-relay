@@ -14,7 +14,9 @@ from golive_relay.config import load_config
 from golive_relay.control.state import StateStore
 from golive_relay.media.h264 import is_idr
 from golive_relay.media.slate import build_slate
+from golive_relay import service
 from golive_relay.service import Service
+from golive_relay.supervisor.outputs_model import OutPli
 from golive_relay.supervisor.model import (
     GatewaySnapshot, OpenGate, RelayState, SetRejections, SourceProgress, SourceStream, TargetVoice, TargetVoiceChanged,
 )
@@ -501,6 +503,36 @@ def test_adapter_start_failure_returns_nonzero_and_closes(tmp_path, slate, sourc
     assert asyncio.run(main()) == 1
     assert "adapter_start_failed" in env.logs
     assert "close" in env.adapters[0].calls
+
+
+def test_pli_inside_rate_limit_is_deferred_once(tmp_path, slate, source_gop, monkeypatch):
+    env = Env(tmp_path, slate, source_gop)
+    sent = []
+    monkeypatch.setattr(env.svc, "_pli", lambda: sent.append(1))
+    monkeypatch.setattr(service, "PLI_MIN_INTERVAL_S", 0.05)
+
+    async def main():
+        env.svc._request_pli()
+        env.svc._request_pli()
+        env.svc._request_pli()
+        assert len(sent) == 1 and env.svc._pli_timer is not None
+        await asyncio.sleep(0.15)
+        assert len(sent) == 2 and env.svc._pli_timer is None
+        env.svc._request_pli()
+        env.svc._request_pli()
+        env.svc._cancel_pli_timer()
+        await asyncio.sleep(0.1)
+        assert len(sent) == 3
+
+    asyncio.run(main())
+
+
+def test_out_pli_routes_to_need_idr(tmp_path, slate, source_gop, monkeypatch):
+    env = Env(tmp_path, slate, source_gop)
+    calls = []
+    monkeypatch.setattr(env.svc, "_need_idr", lambda: calls.append(1))
+    env.svc._handle(OutPli(None))
+    assert calls == [1]
 
 
 def test_mandatory_idr_not_rate_limited_by_feedback(tmp_path, slate, source_gop):

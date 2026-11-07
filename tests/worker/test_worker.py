@@ -1084,3 +1084,57 @@ def test_vui_rewrite_only_for_h264(monkeypatch):
     w, _, _ = make_worker(AD)
     feed_codec(w, "H264", gen_codec("H264"), time.monotonic())
     assert calls
+
+
+# ------------------------------------------------------------ ingest gaps and drain loop
+
+
+@pytest.mark.parametrize("profile", [PROFILE, PT])
+def test_gap_frame_is_discarded_and_keyframe_requested(profile, aus240):
+    w, egress, events = make_worker(profile)
+    now = feed(w, aus240[:5], time.monotonic())
+    drain(w, now)
+    assert not w.need_key and not events.events("need_keyframe")
+    before = len(egress.video())
+    stat = "passthrough_frames" if profile is PT else "decoded"
+    n = w.stats[stat]
+    now += 1 / FPS
+    w.handle(IngressVideo(1, 0, "H264", 1, 5 * 3000, None, now, None, aus240[5], gap=True), now)
+    drain(w, now)
+    assert w.stats["gap_frames"] == 1 and w.need_key
+    assert len(events.events("need_keyframe")) == 1
+    assert w.stats[stat] == n and len(egress.video()) == before
+
+
+def test_gap_on_entry_point_is_forwarded_without_keyframe_request(aus240):
+    w, egress, events = make_worker(PT)
+    now = feed(w, aus240[:5], time.monotonic())
+    drain(w, now)
+    before = len(egress.video())
+    now += 1 / FPS
+    w.handle(IngressVideo(1, 0, "H264", 1, 5 * 3000, None, now, None, aus240[0], gap=True), now)
+    drain(w, now + 1)
+    assert w.stats["gap_frames"] == 1 and not w.need_key
+    assert not events.events("need_keyframe")
+    assert len(egress.video()) == before + 1
+
+
+def test_run_never_drops_the_65th_message(monkeypatch):
+    import queue
+
+    q = queue.Queue()
+    for i in range(70):
+        q.put(i)
+    w = Worker(q, None, None)
+    handled, ticks = [], []
+    monkeypatch.setattr(w, "handle", lambda msg, now: (handled.append(msg), True)[1])
+
+    def tick(now):
+        ticks.append(len(handled))
+        if len(handled) >= 70:
+            raise SystemExit
+
+    monkeypatch.setattr(w, "tick", tick)
+    with pytest.raises(SystemExit):
+        w.run()
+    assert handled == list(range(70)) and ticks[0] == 64

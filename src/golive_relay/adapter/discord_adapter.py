@@ -124,6 +124,7 @@ class DiscordAdapter:
         self._watch_args: tuple[int, SourceStream] | None = None
         self._video_ssrc: int | None = None
         self._last_seq: dict[int, int | None] = {}
+        self._video_end: dict[tuple[int, str], int] = {}  # (ssrc, codec) -> last delivered frame's final RTP seq
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
         self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
         self._audio_window = _new_audio_window()
@@ -473,6 +474,7 @@ class DiscordAdapter:
         self._watch_args = (generation, stream)
         self._video_ssrc = None
         self._last_seq.clear()
+        self._video_end.clear()
         # Live G2a: STREAM_CREATE is not sent to a non-watcher even inside voice, so watch by key
         # (watch_stream delegates to Stream.watch when the stream is cached).
         self._sc = await self._vc.watch_stream(key, cls=self._watch_cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
@@ -547,6 +549,7 @@ class DiscordAdapter:
 
     async def stop_watch(self) -> None:
         sc, self._sc = self._sc, None
+        self._video_end.clear()
         if sc is None:
             return
         try:
@@ -590,7 +593,8 @@ class DiscordAdapter:
         video = pkt.media_type == "video"
         if video:
             msg: IngressVideo | IngressAudio = IngressVideo(
-                generation, epoch, pkt.codec, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload)
+                generation, epoch, pkt.codec, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload),
+                self._video_gap(pkt),
             )
             if self._video_ssrc != pkt.ssrc and self._loop is not None:
                 self._video_ssrc = pkt.ssrc
@@ -605,6 +609,23 @@ class DiscordAdapter:
         if fresh and now - self._last_progress[video] >= PROGRESS_MIN_INTERVAL_S and self._loop is not None:
             self._last_progress[video] = now
             self._loop.call_soon_threadsafe(self._emit, SourceProgress(generation, now, video))
+
+    def _video_gap(self, pkt: Any) -> bool:
+        """Native thread: True when RTP sequence numbers are missing between the previous frame and this one."""
+        key = (pkt.ssrc, pkt.codec)
+        prev = self._video_end.get(key)
+        end = pkt.sequence & 0xFFFF if pkt.sequence is not None else None
+        if end is None:
+            return False
+        if prev is None:
+            self._video_end[key] = end
+            return False
+        span = (end - prev) & 0xFFFF
+        if not 0 < span < 0x8000:
+            return False
+        self._video_end[key] = end
+        seqs = {p.sequence & 0xFFFF for p in getattr(pkt, "rtp_packets", ())}
+        return bool(seqs) and span > len(seqs)
 
     def _count_audio(self, ssrc: int, seq: int | None, data: bytes) -> None:
         """Native thread, audio lock held: per-packet counters (no decoding)."""

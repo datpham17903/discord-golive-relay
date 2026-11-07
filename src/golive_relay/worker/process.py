@@ -142,7 +142,7 @@ class Worker:
         self.stats: dict[str, Any] = {
             "frames_out": 0, "idr": 0, "repeats": 0, "decoded": 0, "rate_skipped": 0, "backpressure_skips": 0,
             "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "audio_unsupported": 0, "decode_errors": 0,
-            "stale_ignored": 0, "passthrough_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
+            "stale_ignored": 0, "passthrough_frames": 0, "gap_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
 
     def _reset_epoch(self) -> None:
         self.decoder: Any = None
@@ -258,6 +258,12 @@ class Worker:
                 self.jbuf.clear()  # an access unit is never dropped alone
             self._request_keyframe(reset_decoder=True)
             return
+        if m.gap:  # frames were lost before this one: nothing but an entry point may follow
+            self.stats["gap_frames"] += 1
+            self.need_key = True
+            if not bitstream.is_entry_point(m.codec, m.data):  # an entry point already repairs the stream
+                self.last_key_request = float("-inf")
+                self._emit_need_keyframe()
         adaptive = self.profile.codec_mode == "adaptive"
         if (m.codec == "H264" or adaptive) and self.profile.video_mode == "passthrough":
             if self._passthrough(m, now):
@@ -729,10 +735,12 @@ class Worker:
             except queue.Empty:
                 msg = None
             drained = 0
-            while msg is not None and drained < 64:
+            while msg is not None:
                 if not self.handle(msg, time.monotonic()):
                     return
                 drained += 1
+                if drained >= 64:
+                    break
                 try:
                     msg = self.ingress.get_nowait()
                 except queue.Empty:

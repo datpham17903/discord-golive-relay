@@ -122,8 +122,13 @@ def adaptive_output_stream_client(
             if len(payload) < 4:
                 return
             ssrc = int.from_bytes(payload[:4], "big")
-            if ssrc == self._video_ssrc and not self._video_keyframes.get(ssrc):
+            if ssrc == self._video_ssrc:
                 self.loop.call_soon_threadsafe(on_pli)  # socket thread
+
+        def _send_requested_video_keyframes(self) -> bool:
+            # replaying the cached chain on the shared SSRC would rewind every viewer
+            self._video_keyframe_resend_requests.clear()
+            return False
 
     return AdaptiveOutputStreamClient
 
