@@ -18,6 +18,7 @@ import discord
 from discord.ext import native_voice as nv
 
 from golive_relay.adapter import codecs
+from golive_relay.adapter.twcc import TwccFeedback
 from golive_relay.config import ControlConfig
 from golive_relay.control.commands import ChatCommand
 from golive_relay.media.opus import OPUS_SILENCE, opus_packet_info
@@ -44,6 +45,8 @@ from golive_relay.worker.messages import IngressAudio, IngressVideo
 
 PROGRESS_MIN_INTERVAL_S = 0.25  # 4 per second
 CONNECT_TIMEOUT_S = 15
+TWCC_EXT_ID = 5  # RTP header extension id of the transport-wide sequence number
+TWCC_INTERVAL_S = 0.05
 
 
 def _new_audio_window() -> dict[str, Any]:
@@ -103,11 +106,33 @@ class DiscordAdapter:
         self._network_stats = network_stats
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._self_deaf = self_deaf
-        self._watch_cls = nv.StreamClient.with_config(
+        watch_base = nv.StreamClient.with_config(
             codecs=codecs.adaptive_decode_codecs(decodable) if adaptive
             else codecs.watch_codecs(codecs.advertised(decodable, getattr(modes, "watch_codecs", "auto_decode"))),
             enable_debug_stats=network_stats,
         )
+        adapter = self
+
+        class _TwccWatch(watch_base):  # type: ignore[valid-type, misc]
+            def _decode_decoded_media_packet(self, decoded: Any, *, raw: Any, received_at: Any) -> Any:
+                # Native receive thread: note each packet's transport-wide sequence number for the feedback.
+                try:
+                    for ext in decoded.rtp_extensions:
+                        if ext.id == TWCC_EXT_ID and len(ext.data) >= 2:
+                            adapter._twcc.record(
+                                int.from_bytes(ext.data[:2], "big"),
+                                received_at if received_at else time.perf_counter(),
+                            )
+                            break
+                except Exception as exc:
+                    adapter._twcc_fail("record", exc)
+                return super()._decode_decoded_media_packet(decoded, raw=raw, received_at=received_at)
+
+        self._watch_cls = _TwccWatch
+        self._twcc = TwccFeedback()
+        self._twcc_task: asyncio.Task[Any] | None = None
+        self._twcc_sent = 0
+        self._twcc_failed = False
         self._client: _Client | None = None
         self._connect_task: asyncio.Task[Any] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -487,10 +512,33 @@ class DiscordAdapter:
         self._last_seq.clear()
         self._video_end.clear()
         self._video_pt.clear()
+        self._twcc = TwccFeedback()  # fresh transport-wide sequence state; before connecting so no packet is missed
+        self._twcc_sent = 0
         # Live G2a: STREAM_CREATE is not sent to a non-watcher even inside voice, so watch by key
         # (watch_stream delegates to Stream.watch when the stream is cached).
         self._sc = await self._vc.watch_stream(key, cls=self._watch_cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
         self._sc.listen(self._on_packet)
+        self._twcc_task = asyncio.create_task(self._twcc_loop(self._sc))
+
+    def _twcc_fail(self, what: str, exc: BaseException) -> None:
+        if not self._twcc_failed:  # once per adapter, not per 50 ms tick
+            self._twcc_failed = True
+            self.log("twcc_failed", step=what, error=repr(exc))
+
+    async def _twcc_loop(self, sc: Any) -> None:
+        """Send transport-cc feedback for the watch every TWCC_INTERVAL_S while it lives."""
+        while True:
+            await asyncio.sleep(TWCC_INTERVAL_S)
+            ssrc = self._video_ssrc
+            if ssrc is None or self._sc is not sc:
+                continue
+            try:
+                fb = self._twcc.build(sc._connection.ssrc, ssrc)
+                if fb is not None:
+                    sc._send_udp_packet(sc._get_crypto().encrypt_rtcp(*fb), "RTCP TWCC")
+                    self._twcc_sent += 1
+            except Exception as exc:
+                self._twcc_fail("send", exc)
 
     async def create_output(self, generation: int, fps: int) -> str | None:
         """Create the output Go Live; returns the negotiated video codec."""
@@ -552,6 +600,8 @@ class DiscordAdapter:
             for name, c in (("watch", self._sc), ("output", self._out))
             if c is not None
         }
+        if "watch" in stats:
+            stats["watch"]["twcc_sent"] = self._twcc_sent
         return {k: v for k, v in stats.items() if v}
 
     async def end_output(self) -> None:
@@ -565,6 +615,9 @@ class DiscordAdapter:
 
     async def stop_watch(self) -> None:
         sc, self._sc = self._sc, None
+        task, self._twcc_task = self._twcc_task, None
+        if task is not None:
+            task.cancel()
         self._video_end.clear()
         self._video_pt.clear()
         if sc is None:

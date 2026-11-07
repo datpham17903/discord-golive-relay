@@ -327,3 +327,32 @@ def test_voice_update_self_stream_false_still_ends_stream() -> None:
     after = NS(channel=NS(id=CHAN, voice_states={}), self_stream=False)
     a.handle_dispatch("voice_state_update", NS(id=TARGET), before, after)
     assert a._stream is None
+
+
+def test_twcc_loop_sends_feedback_once_ssrc_known_and_logs_failure_once() -> None:
+    a, _ = make()
+    logs: list = []
+    a.log = lambda name, **kw: logs.append((name, kw))
+    sent: list = []
+    sc = NS(_connection=NS(ssrc=11), _get_crypto=lambda: NS(encrypt_rtcp=lambda h, b: h + b),
+            _send_udp_packet=lambda data, what: sent.append(data))
+    a._sc = sc
+
+    async def run() -> None:
+        import golive_relay.adapter.discord_adapter as m
+        m.TWCC_INTERVAL_S = 0.005
+        a._twcc.record(1, 1.0)
+        task = asyncio.create_task(a._twcc_loop(sc))
+        await asyncio.sleep(0.03)
+        assert not sent  # video SSRC unknown yet
+        a._video_ssrc = 22
+        await asyncio.sleep(0.03)
+        assert len(sent) == 1 and a._twcc_sent == 1
+        sc._send_udp_packet = lambda *x: (_ for _ in ()).throw(OSError("boom"))
+        for i in range(3):
+            a._twcc.record(2 + i, 1.1 + i)
+            await asyncio.sleep(0.02)
+        task.cancel()
+
+    asyncio.run(run())
+    assert [n for n, _ in logs] == ["twcc_failed"]
