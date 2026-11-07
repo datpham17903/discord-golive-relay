@@ -62,6 +62,7 @@ class Publisher:
         self._audio: deque[EgressAudio] = deque()
         self._await_idr = False  # discard source AUs until an IDR with SPS/PPS
         self._last_idr_id: int | None = None  # idr_pic_id of the last sent AU if it was an IDR, else None
+        self._last_idr_from_slate = False  # the pad is only valid after a slate IDR (x264 CABAC vs source SPS/PPS)
         self._last_send: float | None = None
         self._window = _empty_window()
 
@@ -79,6 +80,7 @@ class Publisher:
             self._video.clear()
             self._video_bytes = 0
             self._last_idr_id = None
+            self._last_idr_from_slate = False
             self._slate_iter = None
             self._await_idr = True
         self._on_need_idr()
@@ -192,7 +194,7 @@ class Publisher:
                 self._last_idr_id = None
                 return VideoFrame(au.data, self._paced(au.frame_time_ms)), need
             new_id = idr_pic_id(au.data)
-            if self._last_idr_id is not None and new_id == self._last_idr_id:
+            if self._last_idr_from_slate and self._last_idr_id is not None and new_id == self._last_idr_id:
                 pad = self._slate_p_frame()
                 if pad is None:
                     self._await_idr = True
@@ -204,6 +206,7 @@ class Publisher:
                 self._last_idr_id = None
                 return VideoFrame(pad, self._slate.frame_time_ms), need
             self._last_idr_id = new_id
+            self._last_idr_from_slate = False
             return VideoFrame(au.data, self._paced(au.frame_time_ms)), need
         return None, need
 
@@ -227,6 +230,7 @@ class Publisher:
             self._slate_iter = slate.next_au(self._last_idr_id)
             au = next(self._slate_iter)
         self._last_idr_id = idr_pic_id(au) if is_idr(au) else None
+        self._last_idr_from_slate = self._last_idr_id is not None
         return VideoFrame(au, slate.frame_time_ms)
 
     def next_audio(self) -> bytes:

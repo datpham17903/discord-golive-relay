@@ -142,7 +142,7 @@ class Worker:
         self.stats: dict[str, Any] = {
             "frames_out": 0, "idr": 0, "repeats": 0, "decoded": 0, "rate_skipped": 0, "backpressure_skips": 0,
             "ingress_dropped": 0, "egress_dropped": 0, "audio_dropped": 0, "audio_unsupported": 0, "decode_errors": 0,
-            "stale_ignored": 0, "passthrough_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
+            "stale_ignored": 0, "passthrough_frames": 0, "gap_frames": 0, "enc_n": 0, "enc_sum_ms": 0.0, "enc_max_ms": 0.0}
 
     def _reset_epoch(self) -> None:
         self.decoder: Any = None
@@ -150,7 +150,6 @@ class Worker:
         self.pt_decided = False
         self.pt_codec = ""  # codec of the passthrough lane (adaptive mode)
         self.src_state: tuple[str, int, int, bool] | None = None  # last source_codec announced
-        self.last_pt_idr = float("-inf")
         self.codec = ""
         self.decode_path = ""
         self.hw_idle = 0
@@ -258,6 +257,12 @@ class Worker:
                 self.jbuf.clear()  # an access unit is never dropped alone
             self._request_keyframe(reset_decoder=True)
             return
+        if m.gap:  # frames were lost before this one: nothing but an entry point may follow
+            self.stats["gap_frames"] += 1
+            self.need_key = True
+            if not bitstream.is_entry_point(m.codec, m.data):  # an entry point already repairs the stream
+                self.last_key_request = float("-inf")
+                self._emit_need_keyframe()
         adaptive = self.profile.codec_mode == "adaptive"
         if (m.codec == "H264" or adaptive) and self.profile.video_mode == "passthrough":
             if self._passthrough(m, now):
@@ -391,7 +396,6 @@ class Worker:
         self.pt_active = self.pt_decided = True
         self.need_key = False
         self.last_key_request = float("-inf")
-        self.last_pt_idr = now
         if self.canvas is None:
             self.canvas = dims
             self.announce_fresh = False
@@ -561,16 +565,12 @@ class Worker:
                 self.stats["frames_out"] += 1
                 self.stats["passthrough_frames"] += 1
                 self.stats["idr"] += idr
-                if idr:
-                    self.last_pt_idr = now
             else:
                 self.stats["egress_dropped"] += 1
                 self._pt_resync()
                 if now - self.last_overflow_event >= OVERFLOW_EVENT_INTERVAL_S:
                     self.last_overflow_event = now
                     self._event("overflow", channel="egress_video")
-        if now - self.last_pt_idr >= self.profile.keyframe_interval_s * IDR_INTERVAL_MARGIN:
-            self._emit_need_keyframe()
 
     def _frame_time_ms(self, rtp_s: float) -> float:
         """RTP spacing to the next buffered frame, clamped; never from the previous gap, which would
@@ -729,10 +729,12 @@ class Worker:
             except queue.Empty:
                 msg = None
             drained = 0
-            while msg is not None and drained < 64:
+            while msg is not None:
                 if not self.handle(msg, time.monotonic()):
                     return
                 drained += 1
+                if drained >= 64:
+                    break
                 try:
                     msg = self.ingress.get_nowait()
                 except queue.Empty:

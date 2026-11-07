@@ -50,7 +50,7 @@ def test_source_changed_override_skips_stale_apply() -> None:
     assert obj._video_source_supports_simulcast is True and applied == []
 
 
-def test_pli_hook_only_when_cache_empty() -> None:
+def test_pli_hook_always_forwards_and_never_replays_cache() -> None:
     pli: list = []
     _, obj = make_cls([], pli)
     obj._video_send_pipeline = NS(has_stream=lambda s: True)
@@ -60,13 +60,15 @@ def test_pli_hook_only_when_cache_empty() -> None:
     payload = SSRC.to_bytes(4, "big")
     obj._video_keyframes = {SSRC: [b"kf"]}
     obj._handle_rtcp_pli(payload)
-    assert pli == []  # the cache answers
+    assert pli == [1]  # forwarded even though the cache has a keyframe
     obj._video_keyframes = {}
     obj._handle_rtcp_pli(payload)
-    assert pli == [1]
+    assert pli == [1, 1]
     obj._handle_rtcp_pli((SSRC + 1).to_bytes(4, "big"))  # another ssrc
     obj._handle_rtcp_pli(b"")
-    assert pli == [1]
+    assert pli == [1, 1]
+    assert obj._send_requested_video_keyframes() is False
+    assert obj._video_keyframe_resend_requests == set()
 
 
 class FakeWs:

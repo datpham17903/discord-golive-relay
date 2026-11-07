@@ -99,6 +99,19 @@ def test_adjacency_inserts_slate_p_frame(slate):
     assert e.pub.next_video().data == same
 
 
+def test_source_idr_then_same_id_source_idr_sent_directly(slate):
+    e = Env(slate)
+    e.pub.set_source(1, 1)
+    idr = slate.variants[0][0]
+    e.pub.offer_video(e.au(idr, True))
+    assert e.pub.next_video().data == idr
+    e.pub.offer_video(e.au(slate.variants[0][1], False, late=0.5))  # dropped as late
+    assert e.pub.next_video() is None
+    e.pub.offer_video(e.au(idr, True))
+    out = e.pub.next_video()
+    assert out.data == idr
+
+
 def test_different_idr_id_sent_directly(slate):
     e = Env(slate)
     e.pub.set_source(1, 1)

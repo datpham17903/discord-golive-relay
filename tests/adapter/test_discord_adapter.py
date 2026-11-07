@@ -294,3 +294,36 @@ def test_voice_alive_false_when_vc_not_connected() -> None:
     assert not a.voice_alive()
     a._vc = NS(is_connected=lambda: True)
     assert a.voice_alive()
+
+
+def _stream_adapter(streaming: bool | None):
+    a, out = make()
+    logs: list = []
+    a.log = lambda *x, **k: logs.append((x, k))
+    voice = None if streaming is None else NS(channel=NS(id=CHAN), self_stream=streaming)
+    guild = NS(get_member=lambda uid: NS(voice=voice) if uid == TARGET else None)
+    a._client = NS(get_guild=lambda gid: guild if gid == GUILD else None)
+    key = str(discord.stream.StreamKey.from_guild(guild_id=GUILD, channel_id=CHAN, owner_id=TARGET))
+    a._stream = a._voice_source(CHAN)
+    return a, out, logs, NS(owner_id=TARGET, guild_id=GUILD, key=key)
+
+
+def test_stream_delete_ignored_while_target_self_stream_true() -> None:
+    a, out, logs, stream = _stream_adapter(True)
+    a.handle_dispatch("stream_delete", stream, "user_requested")
+    assert out == [] and a._stream is not None
+    assert logs == [(("stream_delete_ignored",), {"reason": "user_requested"})]
+
+
+def test_stream_delete_honored_when_target_not_streaming() -> None:
+    a, out, _, stream = _stream_adapter(False)
+    a.handle_dispatch("stream_delete", stream, "x")
+    assert len(out) == 1 and a._stream is None
+
+
+def test_voice_update_self_stream_false_still_ends_stream() -> None:
+    a, out, _, _ = _stream_adapter(True)
+    before = NS(channel=NS(id=CHAN, voice_states={}), self_stream=True)
+    after = NS(channel=NS(id=CHAN, voice_states={}), self_stream=False)
+    a.handle_dispatch("voice_state_update", NS(id=TARGET), before, after)
+    assert a._stream is None

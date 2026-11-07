@@ -124,6 +124,8 @@ class DiscordAdapter:
         self._watch_args: tuple[int, SourceStream] | None = None
         self._video_ssrc: int | None = None
         self._last_seq: dict[int, int | None] = {}
+        self._video_end: dict[tuple[int, str], int] = {}  # (ssrc, codec) -> last delivered frame's final RTP seq
+        self._video_pt: dict[int, int] = {}  # ssrc -> payload type of the last delivered frame
         self._last_progress = {True: 0.0, False: 0.0}  # per media type (video?)
         self._audio_lock = threading.Lock()  # counted on the native receive thread, taken by status
         self._audio_window = _new_audio_window()
@@ -189,7 +191,7 @@ class DiscordAdapter:
         elif event in ("stream_update", "stream_unavailable"):
             self._on_stream_update(args[-1])
         elif event == "stream_delete":
-            self._on_stream_delete(args[0])
+            self._on_stream_delete(args[0], args[1] if len(args) > 1 else None)
         elif event == "voice_state_update":
             self._on_voice_state(*args)
         elif event == "message":
@@ -255,8 +257,18 @@ class DiscordAdapter:
         self._stream = self._to_source(stream)
         self._emit(StreamUpdated(self._stream))
 
-    def _on_stream_delete(self, stream: Any) -> None:
+    def _target_streaming(self) -> bool:
+        guild = self._client.get_guild(self.guild_id) if self._client else None
+        member = guild.get_member(self.target_id) if guild else None
+        voice = getattr(member, "voice", None)
+        return voice is not None and voice.channel is not None and bool(voice.self_stream)
+
+    def _on_stream_delete(self, stream: Any, reason: Any = None) -> None:
         if not self._is_target_stream(stream) or self._stream is None or self._stream.key != str(stream.key):
+            return
+        # STREAM_DELETE also reflects our own watch ending; the target's real end is a voice state update
+        if self._target_streaming():
+            self.log("stream_delete_ignored", reason=str(reason))
             return
         self._end_stream()
 
@@ -473,6 +485,8 @@ class DiscordAdapter:
         self._watch_args = (generation, stream)
         self._video_ssrc = None
         self._last_seq.clear()
+        self._video_end.clear()
+        self._video_pt.clear()
         # Live G2a: STREAM_CREATE is not sent to a non-watcher even inside voice, so watch by key
         # (watch_stream delegates to Stream.watch when the stream is cached).
         self._sc = await self._vc.watch_stream(key, cls=self._watch_cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
@@ -494,6 +508,10 @@ class DiscordAdapter:
         )
         self._out = await self._vc.create_stream(cls=cls, reconnect=False, timeout=CONNECT_TIMEOUT_S)
         return self._out.negotiated_video_codec
+
+    def output_codec(self) -> str | None:
+        """The video codec Discord has negotiated for the output right now."""
+        return self._out.negotiated_video_codec if self._out is not None else None
 
     async def update_watch_codecs(self, names: Any) -> bool:
         """Narrow or widen the codecs the target may send (SESSION_UPDATE); False (no-op) when not watching."""
@@ -547,6 +565,8 @@ class DiscordAdapter:
 
     async def stop_watch(self) -> None:
         sc, self._sc = self._sc, None
+        self._video_end.clear()
+        self._video_pt.clear()
         if sc is None:
             return
         try:
@@ -589,8 +609,10 @@ class DiscordAdapter:
         rtcp = None if pkt.rtcp_time is None else pkt.rtcp_time - time.time() + now
         video = pkt.media_type == "video"
         if video:
+            self._note_payload_type(pkt)
             msg: IngressVideo | IngressAudio = IngressVideo(
-                generation, epoch, pkt.codec, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload)
+                generation, epoch, pkt.codec, pkt.ssrc, pkt.timestamp, pkt.sequence, received, rtcp, bytes(pkt.payload),
+                self._video_gap(pkt),
             )
             if self._video_ssrc != pkt.ssrc and self._loop is not None:
                 self._video_ssrc = pkt.ssrc
@@ -605,6 +627,43 @@ class DiscordAdapter:
         if fresh and now - self._last_progress[video] >= PROGRESS_MIN_INTERVAL_S and self._loop is not None:
             self._last_progress[video] = now
             self._loop.call_soon_threadsafe(self._emit, SourceProgress(generation, now, video))
+
+    def _note_payload_type(self, pkt: Any) -> None:
+        """Native thread: on a codec switch, drop the library's receive state of the codec left behind. RTP
+        sequence numbers run on across payload types, so a later return to it would make its reorder buffer
+        wait out every number sent meanwhile (0.5 s), then skip them, and the held frames arrive stale."""
+        pt = getattr(pkt, "payload_type", None)
+        old = self._video_pt.get(pkt.ssrc)
+        if pt is None or old == pt:
+            return
+        self._video_pt[pkt.ssrc] = pt
+        if old is None:
+            return
+        for codec in [c for s, c in self._video_end if s == pkt.ssrc and c != pkt.codec]:
+            del self._video_end[(pkt.ssrc, codec)]
+        sc = self._sc
+        for name in ("_video_receive_reorder_buffers", "_video_depacketizers", "_video_frame_rtp_packets"):
+            state = getattr(sc, name, None)
+            if isinstance(state, dict):
+                for key in [k for k in state if k[0] == pkt.ssrc and k[1] != pt]:
+                    state.pop(key, None)
+
+    def _video_gap(self, pkt: Any) -> bool:
+        """Native thread: True when RTP sequence numbers are missing between the previous frame and this one."""
+        key = (pkt.ssrc, pkt.codec)
+        prev = self._video_end.get(key)
+        end = pkt.sequence & 0xFFFF if pkt.sequence is not None else None
+        if end is None:
+            return False
+        if prev is None:
+            self._video_end[key] = end
+            return False
+        span = (end - prev) & 0xFFFF
+        if not 0 < span < 0x8000:
+            return False
+        self._video_end[key] = end
+        seqs = {p.sequence & 0xFFFF for p in getattr(pkt, "rtp_packets", ())}
+        return bool(seqs) and span > len(seqs)
 
     def _count_audio(self, ssrc: int, seq: int | None, data: bytes) -> None:
         """Native thread, audio lock held: per-packet counters (no decoding)."""

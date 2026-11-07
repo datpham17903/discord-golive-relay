@@ -264,3 +264,48 @@ def test_join_passes_self_mute_and_configured_self_deaf() -> None:
     a._guild_channel = lambda: NS(connect=connect, guild=NS(voice_client=None))
     asyncio.run(a.join())
     assert seen[-1]["self_deaf"] is True
+
+
+def test_video_gap_detected_from_sequence_holes() -> None:
+    got: list = []
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, lambda e: None, got.append, lambda *a, **k: None, decodable={"H264"})
+
+    def frame(seq, n, ssrc=7, codec="H264"):
+        rtp = tuple(NS(sequence=(seq - n + 1 + i) & 0xFFFF) for i in range(n))
+        return NS(user_id=TARGET, media_type="video", ssrc=ssrc, sequence=seq, received_at=None, rtcp_time=None,
+                  codec=codec, timestamp=0, payload=b"x", rtp_packets=rtp)
+
+    seq = [(frame(10, 3), False), (frame(12, 1), True), (frame(14, 2), False), (frame(15, 1), False),
+           (frame(17, 1), True), (frame(16, 1), False),  # late/backward: no gap, state kept
+           (frame(18, 1), False),
+           (frame(3, 1, ssrc=8), False), (frame(5, 1, codec="VP9"), False),  # fresh ssrc / codec state
+           (frame(65535, 1, ssrc=9), False), (frame(1, 1, ssrc=9), True), (frame(2, 1, ssrc=9), False)]  # wraps
+    for p, _ in seq:
+        a._on_packet(p)
+    assert [m.gap for m in got] == [g for _, g in seq]
+    a._video_end.clear()
+    a._on_packet(frame(9, 1))
+    assert got[-1].gap is False
+
+
+def test_codec_switch_drops_library_receive_state_of_the_old_codec() -> None:
+    got: list = []
+    cfg = NS(guild_id="1", target_user_id="3", allowed_voice_channel_id="2", expected_relay_user_id="4")
+    a = DiscordAdapter(cfg, lambda e: None, got.append, lambda *a, **k: None, decodable={"H264"})
+    keys = [(7, 101), (7, 105), (8, 101)]
+    a._sc = NS(_video_receive_reorder_buffers=dict.fromkeys(keys), _video_depacketizers=dict.fromkeys(keys),
+               _video_frame_rtp_packets=dict.fromkeys(keys))
+
+    def frame(seq, codec, pt, ssrc=7):
+        return NS(user_id=TARGET, media_type="video", ssrc=ssrc, sequence=seq, received_at=None, rtcp_time=None,
+                  codec=codec, payload_type=pt, timestamp=0, payload=b"x", rtp_packets=(NS(sequence=seq),))
+
+    a._on_packet(frame(10, "AV1", 101))
+    a._on_packet(frame(11, "AV1", 101))
+    assert all(set(d) == set(keys) for d in vars(a._sc).values())  # same codec: untouched
+    a._on_packet(frame(12, "H264", 105))
+    assert all(set(d) == {(7, 105), (8, 101)} for d in vars(a._sc).values())
+    assert (7, "AV1") not in a._video_end
+    a._on_packet(frame(500, "AV1", 101))  # returning to AV1 starts fresh: no false gap
+    assert got[-1].gap is False
