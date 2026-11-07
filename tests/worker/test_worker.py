@@ -891,12 +891,12 @@ def test_passthrough_egress_full_waits_without_dropping(aus240):
     assert len(egress.video()) == 5 and not w.need_key
 
 
-def test_passthrough_requests_keyframe_when_no_idr_for_interval(aus240):
+def test_passthrough_does_not_request_periodic_keyframe(aus240):
     w, egress, events = make_worker(PT)
     pframes = [a for a in aus240[1:] if not _h264_is_idr(a)][:58]
-    now = feed(w, aus240[:1] + pframes, time.monotonic())  # 1.9 s of P-frames after the IDR (limit 1.7 s)
+    now = feed(w, aus240[:1] + pframes, time.monotonic())  # 1.9 s of P-frames after the IDR (> 1.7 s)
     drain(w, now)
-    assert len(events.events("need_keyframe")) == 1
+    assert not events.events("need_keyframe")
     assert not w.need_key and len(egress.video()) == 59
 
 
