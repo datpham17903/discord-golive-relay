@@ -9,7 +9,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
+from typing import NamedTuple
 
 from discord.ext.native_voice.media import VideoFrame
 
@@ -26,6 +27,7 @@ MAX_EGRESS_BYTES = 8 * 1024 * 1024
 CATCHUP_BACKLOG = 2
 CATCHUP_FACTOR = 0.9
 STALL_S = 0.05  # a gap between sends that a viewer notices as a hitch
+FREEZE_S = 0.25  # a gap between sends that reads as a visible freeze
 MAX_PCM_BLOCKS = 40  # 800 ms: audio is held as long as video sits in the 600 ms jitter buffer
 _SILENCE = bytes(AUDIO_FRAME_BYTES)
 
@@ -33,6 +35,35 @@ _SILENCE = bytes(AUDIO_FRAME_BYTES)
 def _empty_window() -> dict[str, float]:
     return {"sent": 0, "stalls": 0, "max_send_gap_ms": 0.0,
             "audio_played": 0, "audio_held_reads": 0, "audio_late_dropped": 0, "audio_evicted": 0}
+
+
+class SendSnapshot(NamedTuple):
+    """Cumulative, never-reset video send counters."""
+
+    frames: int = 0
+    bytes: int = 0
+    freezes: int = 0
+    frozen_s: float = 0.0
+
+
+def rates(history: Sequence[tuple[float, SendSnapshot]], now: float, current: SendSnapshot,
+          window_s: float) -> tuple[float, float] | None:
+    """(kbps, fps) over the last ``window_s``: ``current`` against the newest sample at least that old, else the
+    oldest sample. None without a sample or a positive time span."""
+    if not history:
+        return None
+    base_t, base = next((h for h in reversed(history) if h[0] <= now - window_s), history[0])
+    dt = now - base_t
+    if dt <= 0:
+        return None
+    return (current.bytes - base.bytes) * 8 / 1000 / dt, (current.frames - base.frames) / dt
+
+
+def freezes_since(history: Sequence[tuple[float, SendSnapshot]], now: float, current: SendSnapshot,
+                  window_s: float) -> int:
+    """Freezes in the last ``window_s``; a history younger than that counts from the publisher's start."""
+    base = next((h[1] for h in reversed(history) if h[0] <= now - window_s), SendSnapshot())
+    return current.freezes - base.freezes
 
 
 class Publisher:
@@ -65,6 +96,7 @@ class Publisher:
         self._last_idr_from_slate = False  # the pad is only valid after a slate IDR (x264 CABAC vs source SPS/PPS)
         self._last_send: float | None = None
         self._window = _empty_window()
+        self._total = SendSnapshot()
 
     # ------------------------------------------------------------ control
 
@@ -137,7 +169,7 @@ class Publisher:
         with self._lock:
             frame, need = self._next_video_locked()
             if frame is not None:
-                self._note_send_locked()
+                self._note_send_locked(len(frame.data))
         if need:
             self._on_need_idr()
         return frame
@@ -147,14 +179,25 @@ class Publisher:
         """Clock time of the last video frame handed to the player."""
         return self._last_send
 
-    def _note_send_locked(self) -> None:
+    def _note_send_locked(self, size: int) -> None:
         now = self._clock()
         self._window["sent"] += 1
+        t = self._total
+        frames, nbytes, freezes, frozen_s = t.frames + 1, t.bytes + size, t.freezes, t.frozen_s
         if self._last_send is not None:
             gap = now - self._last_send
             self._window["stalls"] += gap > STALL_S
+            if gap >= FREEZE_S:
+                freezes += 1
+                frozen_s += gap
             self._window["max_send_gap_ms"] = max(self._window["max_send_gap_ms"], gap * 1000.0)
+        self._total = SendSnapshot(frames, nbytes, freezes, frozen_s)
         self._last_send = now
+
+    def snapshot(self) -> SendSnapshot:
+        """Cumulative send counters; unlike ``take_window`` they are never reset."""
+        with self._lock:
+            return self._total
 
     def take_window(self) -> dict[str, float]:
         """Send counters since the last call: sent, stalls (gaps over 50 ms), max_send_gap_ms, and audio

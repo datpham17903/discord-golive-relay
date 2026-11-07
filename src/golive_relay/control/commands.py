@@ -14,7 +14,7 @@ COMMAND_NAMES = ("status", "mirror", "unmirror", "on", "off", "target", "channel
 DEFAULT_PUBLIC_COMMANDS = frozenset({"status", "mirror", "unmirror"})
 
 _HELP_LINES = (
-    ("status", "• `status` - xem trạng thái hiện tại"),
+    ("status", "• `status` - xem trạng thái hiện tại (`status -v`: thêm bitrate, fps, số lần đứng hình)"),
     ("on", "• `on` / `off` - bật hoặc tắt relay"),
     ("target", "• `target <user_id>` - đổi người được relay"),
     ("channel", "• `channel <channel_id>` - đổi kênh voice chính"),
@@ -46,7 +46,7 @@ _USAGE = {
     "unmirror": "`unmirror` (đang ở kênh voice) hoặc `unmirror <channel_id|all>`",
     "on": "`on`",
     "off": "`off`",
-    "status": "`status`",
+    "status": "`status` hoặc `status -v`",
     "prejoin": "`prejoin <on|off>`",
     "autoscale": "`autoscale <on|off>`",
     "op": "`op list`, `op add <user_id>` hoặc `op remove <user_id>`",
@@ -67,7 +67,7 @@ class ChatCommand:
 
 @dataclass(frozen=True, slots=True)
 class Status:
-    pass
+    verbose: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +180,10 @@ class StatusDetails:
     relay_kept_ids: tuple[int, ...] = ()  # exactly the extra relays counted in relay_kept
     codec: str | None = None  # codec every output carries now (one for the whole chain); None = unknown
     codec_switch: tuple[str, str] | None = None  # (from, to) while the chain is changing codec
+    # `status -v` only; None = not asked. One row per output, uid None = the ingest output:
+    # (uid or None, kbps or None when not playing, fps, freezes in the last 5 min, freezes this session)
+    tech: tuple[tuple[int | None, float | None, float | None, int, int], ...] | None = None
+    gap_frames: int | None = None  # source frames lost this session
 
 
 _CODEC_NAMES = {"AV1": "AV1", "H265": "H.265", "H264": "H.264", "VP8": "VP8", "VP9": "VP9"}
@@ -233,6 +237,8 @@ def parse(text: str, prefix: str, public: frozenset[str] = DEFAULT_PUBLIC_COMMAN
     if len(tokens) == 1:
         return ParseError(help_text(public))
     sub, args = tokens[1].lower(), tokens[2:]
+    if sub == "status" and len(args) == 1 and args[0].lower() in ("-v", "verbose"):
+        return Status(verbose=True)
     if sub in ("status", "on", "off"):
         if args:
             return _usage_error(sub, "**Thừa tham số**")
@@ -476,6 +482,18 @@ def _short(ctx: RoutingContext, uid: int) -> str:
     return sid if len(sid) <= 8 else f"{sid[:4]}…{sid[-4:]}"
 
 
+def _rate(kbps: float) -> str:
+    return f"{kbps / 1000:.1f} Mbps".replace(".", ",") if kbps >= 1000 else f"{kbps:.0f} kbps"
+
+
+def _tech_line(name: str, row: tuple) -> str:
+    _, kbps, fps, recent, session = row
+    if kbps is None:
+        return f"> **{name}** · không phát"
+    return (f"> **{name}** · {_rate(kbps)} · {fps:.0f} fps · đứng hình {recent} lần/5 phút "
+            f"({session} lần cả phiên)")
+
+
 def _capacity_bar(used: int, total: int) -> str:
     filled = 0 if total <= 0 else min(_BAR_CELLS, max(0, used) * _BAR_CELLS // total)
     return "▰" * filled + "▱" * (_BAR_CELLS - filled)
@@ -573,7 +591,19 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
                 line += f" · cố định {_ch(ctx.mirror_fixed[uid])}"
             mirror_lines.append(line)
 
-    def build(nr: int, nm: int, with_public: bool) -> str:
+    tech_head: list[str] = []
+    tech_lines: list[str] = []
+    if d.tech is not None:
+        tech_head.append("### 📊 Kỹ thuật")
+        for row in d.tech:
+            if row[0] is None:
+                tech_head.append(_tech_line("Ingest", row))
+            else:
+                tech_lines.append(_tech_line(_short(ctx, row[0]), row))
+        if d.gap_frames is not None:
+            tech_lines.append(f"> Nguồn: mất {d.gap_frames} frame cả phiên")
+
+    def build(nr: int, nm: int, with_public: bool, nt: int = len(tech_lines)) -> str:
         blocks = ["\n".join(head), "\n".join(source)]
         if relays:
             lines = relay_lines[:nr]
@@ -585,17 +615,24 @@ def format_status(routing: Routing, ctx: RoutingContext, d: StatusDetails, routi
             if nm < len(mirror_lines):
                 lines.append(f"> +{len(mirror_lines) - nm} mirror khác")
             blocks.append("\n".join(["### 🪞 Mirror", *lines]))
+        if tech_head:
+            lines = tech_lines[:nt]
+            if nt < len(tech_lines):
+                lines.append(f"> +{len(tech_lines) - nt} dòng khác")
+            blocks.append("\n".join([*tech_head, *lines]))
         blocks.append(_footer(d, with_public))
         return "\n\n".join(blocks)
 
-    nr, nm = len(relay_lines), len(mirror_lines)
-    out = build(nr, nm, True)
+    nr, nm, nt = len(relay_lines), len(mirror_lines), len(tech_lines)
+    out = build(nr, nm, True, nt)
     if len(out) >= _MAX_LEN:
-        out = build(nr, nm, False)
-    while len(out) >= _MAX_LEN and (nr or nm):
-        if nr >= nm:
+        out = build(nr, nm, False, nt)
+    while len(out) >= _MAX_LEN and (nr or nm or nt):
+        if nt >= nr and nt >= nm:
+            nt -= 1
+        elif nr >= nm:
             nr -= 1
         else:
             nm -= 1
-        out = build(nr, nm, False)
+        out = build(nr, nm, False, nt)
     return out[: _MAX_LEN - 1]

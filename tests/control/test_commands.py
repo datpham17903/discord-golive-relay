@@ -615,3 +615,30 @@ def test_status_single_codec_line():
 def test_status_switch_arrow():
     s = format_status(routing({200: O1}), ctx(), _details(codec="H265", codec_switch=("H265", "H264")))
     assert "> Codec: H.265 → H.264 (đang chuyển)" in s
+
+
+def test_parse_status_verbose():
+    assert parse("!relay status -v", P) == Status(verbose=True)
+    assert parse("!relay STATUS Verbose", P) == Status(verbose=True)
+    assert isinstance(parse("!relay status -x", P), ParseError)
+    assert isinstance(parse("!relay status -v extra", P), ParseError)
+    assert "status -v" in HELP
+
+
+def test_status_verbose_section():
+    tech = ((None, 1300.0, 60.0, 0, 2), (R1, 800.0, 30.0, 1, 1), (O1, None, None, 0, 0))
+    s = format_status(routing({200: O1}), ctx(), _details(tech=tech, gap_frames=3))
+    assert "### 📊 Kỹ thuật" in s
+    assert "> **Ingest** · 1,3 Mbps · 60 fps · đứng hình 0 lần/5 phút (2 lần cả phiên)" in s
+    assert "· 800 kbps · 30 fps · đứng hình 1 lần/5 phút (1 lần cả phiên)" in s
+    assert "không phát" in s
+    assert "> Nguồn: mất 3 frame cả phiên" in s
+    assert "Kỹ thuật" not in format_status(routing(), ctx(), _details())
+
+
+def test_status_verbose_survives_trimming():
+    many = tuple((1000 + i, 5000.0, 60.0, 0, 0) for i in range(60))
+    accounts = tuple((1000 + i, "relay", 100, "live", 5.0, 1, None) for i in range(60))
+    s = format_status(routing(), ctx(), _details(tech=((None, 1300.0, 60.0, 0, 0), *many), accounts=accounts, gap_frames=1))
+    assert len(s) < 2000
+    assert "### 📊 Kỹ thuật" in s and "> **Ingest** · 1,3 Mbps" in s
