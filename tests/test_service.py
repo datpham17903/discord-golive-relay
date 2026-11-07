@@ -659,6 +659,23 @@ def test_chat_rejection_and_status_reply_without_state_change(tmp_path, slate, s
     asyncio.run(main())
 
 
+def test_chat_status_verbose_adds_technical_section_without_consuming_window(tmp_path, slate, source_gop):
+    env = Env(tmp_path, slate, source_gop)
+
+    async def main():
+        task = await reach_relaying(env)
+        a = env.adapters[0]
+        chat(env, "!relay status -v", 1)
+        await wait_until(lambda: len(a.replies) == 1)
+        assert a.replies[0][2].startswith("# 📡")
+        assert "### 📊 Kỹ thuật" in a.replies[0][2] and "> Nguồn: mất" in a.replies[0][2]
+        assert env.svc._status_details(0.0).tech is None
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
+
+
 def test_chat_off_reuses_enable_path(tmp_path, slate, source_gop):
     env = Env(tmp_path, slate, source_gop)
 

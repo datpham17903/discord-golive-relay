@@ -335,3 +335,28 @@ def test_set_codec_clears_queue_and_awaits_entry(slate):
     assert e.pub.next_video() is None  # non-entry discarded
     e.pub.offer_video(e.au(slate.variants[0][0], True))
     assert e.pub.next_video().data == slate.variants[0][0]
+
+
+def test_snapshot_counts_frames_bytes_and_freezes_and_is_not_reset(slate):
+    from golive_relay.media.publisher import SendSnapshot, freezes_since, rates
+
+    e = Env(slate)
+    e.pub.set_source(1, 1)
+    size = 0
+    for i, gap in enumerate((0.0, 0.016, 0.3, 0.016)):
+        e.now += gap
+        au = slate.variants[0][0] if i == 0 else slate.variants[0][1]
+        size += len(au)
+        e.pub.offer_video(e.au(au, i == 0))
+        assert e.pub.next_video() is not None
+    e.pub.take_window()
+    snap = e.pub.snapshot()
+    assert (snap.frames, snap.bytes, snap.freezes) == (4, size, 1)
+    assert snap.frozen_s == pytest.approx(0.3)
+    hist = [(0.0, SendSnapshot()), (5.0, SendSnapshot(10, 1000, 0, 0.0))]
+    cur = SendSnapshot(20, 3000, 2, 0.6)
+    kbps, fps = rates(hist, 10.0, cur, 10.0)
+    assert (kbps, fps) == pytest.approx((2.4, 2.0))
+    assert rates([], 10.0, cur, 10.0) is None
+    assert freezes_since(hist, 10.0, cur, 300.0) == 2
+    assert freezes_since(hist, 10.0, cur, 5.0) == 2

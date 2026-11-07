@@ -13,7 +13,7 @@ import os
 import signal
 import sys
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from typing import Any
@@ -32,7 +32,7 @@ from golive_relay.control.lock import InstanceLocks
 from golive_relay.control.server import ControlServer
 from golive_relay.control.state import PersistedState, StateCorrupt, StateStore, account_view, set_account
 from golive_relay.media import hwaccel
-from golive_relay.media.publisher import Publisher
+from golive_relay.media.publisher import Publisher, freezes_since, rates
 from golive_relay.media.slate import build_slate
 from golive_relay.media.source import RelayMediaSource
 from golive_relay.obs import JsonLogger, Metrics, write_status
@@ -61,6 +61,10 @@ TICK_S = 0.1
 PUMP_S = 0.01
 STATE_POLL_S = 0.25
 STATUS_S = 1.0
+SEND_SAMPLE_S = 1.0  # `status -v` send-counter sampling
+SEND_HISTORY = 400  # ~6 min of samples
+RATE_WINDOW_S = 10.0
+FREEZE_WINDOW_S = 300.0
 DRAIN_TIMEOUT_S = 15.0
 PLI_MIN_INTERVAL_S = 0.5
 OVERFLOW_MIN_INTERVAL_S = 1.0
@@ -194,6 +198,11 @@ class Service:
             self.pool.set_relay_target(0, time.monotonic())  # no session yet: nothing to start or stop
         self._chat_ops = frozenset(st.chat_operator_ids)  # added by `op add`; config owners are not in here
         self._session_since: float | None = None  # gate first opened in the current session
+        # per publisher ("ingest" or account id): recent cumulative send samples for `status -v`, and the
+        # freeze count when the current session started
+        self._send_hist: dict[Any, deque] = {}
+        self._send_base: dict[Any, int] = {}
+        self._next_send_sample = 0.0
         self._out_since: dict[int, float] = {}  # account -> first OutSetLive of its current run
         self._last_watch_ms: float | None = None  # watch_sent_from_seen_ms of the last logged session
         self._audio_ok = False  # non-silent target audio in the last status window
@@ -344,6 +353,7 @@ class Service:
             self._pool_event(OutTick())
             self._codec_event(cc.Tick())
             self._check_codec_stall(now)
+            self._sample_sends(now)
             self._scale_relays(now)  # OutTick above stops extra relays whose Go Live stayed without viewers
             self._check_voice(now)
             if now >= next_poll:
@@ -528,7 +538,8 @@ class Service:
             if isinstance(cmd, ParseError):
                 outcome, text = "parse_error", cmd.text
             elif isinstance(cmd, Status):
-                outcome, text = "status", format_status(old, ctx, self._status_details(time.monotonic()),
+                now = time.monotonic()
+                outcome, text = "status", format_status(old, ctx, self._status_details(now, cmd.verbose),
                                                         routing_error=self._routing_error)
             elif isinstance(cmd, SetEnabled):
                 self._set_enabled(cmd.on)
@@ -676,6 +687,7 @@ class Service:
                     self._codec_event(cc.Live())
                     if self._session_since is None:
                         self._session_since = time.monotonic()
+                        self._send_base = {k: p.snapshot().freezes for k, p in self._send_pubs().items()}
                     self._mark(g, "open_gate")
                     self._log_timing(g, "open")
                 case ApplyRouting(routing=r):
@@ -706,6 +718,8 @@ class Service:
                     self._pool_event(SessionEnded(g, reason, reason in INCARNATION_ENDED))
                     self._session_gen = None
                     self._session_since = None
+                    self._send_base = {}
+                    self.metrics.gauge("worker.gap_frames", 0)  # cumulative per worker: the next session starts at 0
                     # the ingest output is only ever ended by this Teardown (_teardown), so the fresh controller drops "ingest"
                     self._codec_ctl = self._new_codec_ctl()
                     self._src_dims = None
@@ -1495,7 +1509,37 @@ class Service:
             for a in self.pool.set_relay_target(want, now):
                 self._pool_action(a)
 
-    def _status_details(self, now: float) -> StatusDetails:
+    def _send_pubs(self) -> dict[Any, Publisher]:
+        pubs: dict[Any, Publisher] = dict(self._out_pubs)
+        if self.cfg.discord.ingest_publishes:
+            pubs["ingest"] = self.publisher
+        return pubs
+
+    def _sample_sends(self, now: float) -> None:
+        if now < self._next_send_sample:
+            return
+        self._next_send_sample = now + SEND_SAMPLE_S
+        for key, pub in self._send_pubs().items():
+            self._send_hist.setdefault(key, deque(maxlen=SEND_HISTORY)).append((now, pub.snapshot()))
+
+    def _tech_rows(self, now: float) -> tuple[tuple[int | None, float | None, float | None, int, int], ...]:
+        live = {row["account"] for row in self.pool.status(now) if row["state"] == OutputState.LIVE.value}
+        rows = []
+        for key, pub in self._send_pubs().items():
+            uid = None if key == "ingest" else key
+            if uid is not None and uid not in live:
+                rows.append((uid, None, None, 0, 0))
+                continue
+            cur, hist = pub.snapshot(), self._send_hist.get(key, ())
+            rate = rates(hist, now, cur, RATE_WINDOW_S)
+            session = cur.freezes - self._send_base.get(key, cur.freezes)
+            recent = freezes_since(hist, now, cur, FREEZE_WINDOW_S)
+            if self._session_since is not None:  # the window must not reach back into an earlier session
+                recent = min(recent, session)
+            rows.append((uid, *(rate or (None, None)), recent, session))
+        return tuple(rows)
+
+    def _status_details(self, now: float, verbose: bool = False) -> StatusDetails:
         relay = self.pool.relay_summary()
         roles = {a.user_id: a.role for a in self.cfg.output_accounts()}
         w, h, fps = self.cfg.profile_key()
@@ -1532,6 +1576,9 @@ class Service:
             fatal_reason=None if self.sup.fatal is None else self.sup.fatal.value,
             codec=self._codec_ctl.effective if self._adaptive else "H264",
             codec_switch=self._codec_ctl.switching if self._adaptive else None,
+            tech=self._tech_rows(now) if verbose else None,
+            gap_frames=int(self.metrics.snapshot()["gauges"].get("worker.gap_frames", 0))
+            if verbose and self._session_since is not None else None,
         )
 
     def _write_status(self) -> None:
