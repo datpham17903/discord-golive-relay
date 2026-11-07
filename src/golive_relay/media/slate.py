@@ -11,7 +11,7 @@ import av
 from golive_relay.media.h264 import idr_pic_id, is_idr
 
 _VARIANTS = 2  # x264 alternates idr_pic_id 0/1, so more variants only repeat ids
-_MAX_GOP_S = 2.0
+_MAX_GOP_S = 1.0  # the publisher needs only each variant's IDR and one P-frame
 
 
 @dataclass(slots=True)
@@ -50,7 +50,7 @@ def build_slate(width: int, height: int, fps: int, keyframe_interval_s: float, b
     enc.time_base = Fraction(1, fps)
     enc.framerate = Fraction(fps, 1)
     enc.bit_rate = bitrate_kbps * 1000
-    enc.options = {"tune": "zerolatency", "bf": "0", "rc-lookahead": "0", "forced-idr": "1",
+    enc.options = {"preset": "ultrafast", "tune": "zerolatency", "bf": "0", "rc-lookahead": "0", "forced-idr": "1",
                    "threads": "1", "scenecut": "0",
                    "x264-params": f"keyint={gop_len}:min-keyint={gop_len}"}
     enc.open()

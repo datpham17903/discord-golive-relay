@@ -992,15 +992,14 @@ def timings(env) -> list[dict]:
     return [kw for name, kw in env.log_kw if name == "session_timing"]
 
 
-def test_slate_builds_concurrently_with_create_output(tmp_path, slate, source_gop):
+def test_output_plays_before_slate_finishes_and_late_slate_is_applied(tmp_path, slate, source_gop):
     import threading
 
     env = Env(tmp_path, slate, source_gop)
-    created = threading.Event()
-    overlap: list[bool] = []
+    release = threading.Event()
 
     def builder(*a):
-        overlap.append(created.wait(2.0))  # sequential (slate, then create) would time out here
+        release.wait(5.0)  # the slate build outlasts the whole output creation
         return slate
 
     env.svc._slate_builder = builder
@@ -1009,23 +1008,46 @@ def test_slate_builds_concurrently_with_create_output(tmp_path, slate, source_go
         task = asyncio.create_task(env.svc.run("tok"))
         await wait_until(lambda: env.adapters and env.adapters[0].started)
         a = env.adapters[0]
-        real = a.create_output
-
-        async def create(g, fps):
-            created.set()
-            return await real(g, fps)
-
-        a.create_output = create
         a.events(env.snapshot())
         await wait_until(lambda: "watch" in a.calls)
         a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
         await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
-        assert env.svc.publisher._slate is slate  # set before OutputReady opened the gate
+        assert "play" in a.calls and env.svc.publisher._slate is None
+        release.set()
+        await wait_until(lambda: env.svc.publisher._slate is slate)
+        assert env.svc._slate is slate
         env.svc.request_shutdown()
         await task
 
     asyncio.run(main())
-    assert overlap == [True]
+
+
+def test_stale_slate_is_ignored_after_teardown(tmp_path, slate, source_gop):
+    import threading
+
+    env = Env(tmp_path, slate, source_gop)
+    release = threading.Event()
+    env.svc._slate_builder = lambda *a: release.wait(5.0) and slate
+
+    async def main():
+        task = asyncio.create_task(env.svc.run("tok"))
+        await wait_until(lambda: env.adapters and env.adapters[0].started)
+        a = env.adapters[0]
+        a.events(env.snapshot())
+        await wait_until(lambda: "watch" in a.calls)
+        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
+        await wait_until(lambda: env.svc.sup.state is RelayState.RELAYING)
+        from golive_relay.supervisor.model import StreamEnded
+        a.events(StreamEnded("key-1", 1))
+        await wait_until(lambda: env.svc.sup.state is RelayState.IDLE)
+        await wait_until(lambda: "end_output" in env.order)
+        release.set()
+        await wait_until(lambda: not env.svc._slate_tasks)
+        assert env.svc._slate is None and env.svc.publisher._slate is None
+        env.svc.request_shutdown()
+        await task
+
+    asyncio.run(main())
 
 
 def test_slate_is_cached_across_sessions(tmp_path, slate, source_gop):
@@ -1037,6 +1059,7 @@ def test_slate_is_cached_across_sessions(tmp_path, slate, source_gop):
 
     async def main():
         task = await reach_relaying(env)
+        await wait_until(lambda: not env.svc._slate_tasks)
         a = env.adapters[0]
         a.events(StreamEnded("key-1", 1))
         await wait_until(lambda: env.svc.sup.state is RelayState.IDLE)
@@ -1049,11 +1072,9 @@ def test_slate_is_cached_across_sessions(tmp_path, slate, source_gop):
 
     asyncio.run(main())
     assert len(built) == 1
-    t = [kw for kw in timings(env) if kw["outcome"] == "open"]
-    assert [kw["slate_cached"] for kw in t] == [False, True]
 
 
-def test_slate_failure_surfaces_and_created_output_is_ended(tmp_path, slate, source_gop):
+def test_slate_failure_is_logged_and_does_not_fail_the_session(tmp_path, slate, source_gop):
     env = Env(tmp_path, slate, source_gop)
 
     def boom(*a):
@@ -1062,21 +1083,13 @@ def test_slate_failure_surfaces_and_created_output_is_ended(tmp_path, slate, sou
     env.svc._slate_builder = boom
 
     async def main():
-        task = asyncio.create_task(env.svc.run("tok"))
-        await wait_until(lambda: env.adapters and env.adapters[0].started)
-        a = env.adapters[0]
-        a.events(env.snapshot())
-        await wait_until(lambda: "watch" in a.calls)
-        a.events(SourceProgress(env.svc.sup.generation, time.monotonic(), True))
-        await wait_until(lambda: env.svc.sup.state is RelayState.BACKOFF)
-        await wait_until(lambda: "end_output" in env.order)
-        assert "create_output" in a.calls and "play" not in a.calls
+        task = await reach_relaying(env)
+        await wait_until(lambda: any(n == "slate_failed" for n, _ in env.log_kw))
+        assert "play" in env.adapters[0].calls and env.svc.sup.state is RelayState.RELAYING
         env.svc.request_shutdown()
         await task
 
     asyncio.run(main())
-    t = timings(env)
-    assert t and t[0]["outcome"] == "connect_failed" and "watching_from_seen_ms" in t[0]
 
 
 def test_slate_skipped_when_nothing_publishes(tmp_path, slate, source_gop):
@@ -1135,10 +1148,9 @@ def test_session_timing_logged_once_at_open(tmp_path, slate, source_gop):
     for k in ("start_from_seen_ms", "watch_sent_from_seen_ms", "watching_from_seen_ms", "voice_connected_ms",
               "voice_state_confirmed_ms", "voice_state_confirmed_from_seen_ms", "voice_connected_from_seen_ms",
               "start_from_gate_ready_ms", "gate_ready_from_seen_ms", "worker_started_ms", "watch_sent_ms",
-              "watching_ms", "first_video_packet_ms", "first_frame_ms", "slate_ready_ms", "slate_ms",
+              "watching_ms", "first_video_packet_ms", "first_frame_ms",
               "output_created_ms", "output_create_ms", "open_gate_ms"):
         assert isinstance(t[0][k], int) and t[0][k] >= 0, k
-    assert t[0]["slate_cached"] is False
 
 
 def test_prejoin_joins_before_stream_then_only_watches(tmp_path, slate, source_gop):

@@ -33,7 +33,7 @@ def test_every_variant_decodes_with_fresh_decoder(slate):
 def test_gop_duration_within_limit(slate):
     assert slate.frame_time_ms == pytest.approx(1000 / 15)
     for v in slate.variants:
-        assert len(v) * slate.frame_time_ms <= 2000
+        assert len(v) * slate.frame_time_ms <= 1000 + 1e-6
 
 
 def test_next_au_picks_different_id(slate):
